@@ -39,7 +39,7 @@ import { isUuid } from "./provider-rows.ts";
  * clean end. */
 export type RelatedTitles = {
   items: CatalogDetail[];
-  ranking: "tags" | "jev";
+  ranking: "tags" | "jev" | "provider";
   canRank: boolean;
   /** Configured capability, independent of whether this request reranked. */
   canRefine?: boolean;
@@ -113,6 +113,26 @@ export async function relatedTitles(
           message: "The source title is no longer on its provider.",
         },
       ],
+    };
+  }
+  if (reference.provider === "tmdb") {
+    const settled = await Promise.allSettled(
+      source.related.map(getCatalogDetail),
+    );
+    return {
+      items: settled.flatMap((r) =>
+        r.status === "fulfilled" &&
+        r.value &&
+        !isHiddenTitle(r.value, hiddenTags)
+          ? [r.value]
+          : [],
+      ),
+      ranking: "provider",
+      canRank: false,
+      canRefine: false,
+      errors: settled.flatMap((r) =>
+        r.status === "rejected" ? [toSourceError("tmdb", r.reason)] : [],
+      ),
     };
   }
   // Bounded, real seed tags. Without any provider-published tag there is no

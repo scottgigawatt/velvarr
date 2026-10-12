@@ -132,6 +132,18 @@ export default function VelvarrApp() {
     setPhase("app");
   }, []);
 
+  useEffect(() => {
+    const refreshProviders = () => {
+      void api<{ providers: ProviderStatus }>("/api/me").then(
+        (me) => setProviders(me.providers),
+        () => {},
+      );
+    };
+    window.addEventListener("velvarr:providers-changed", refreshProviders);
+    return () =>
+      window.removeEventListener("velvarr:providers-changed", refreshProviders);
+  }, []);
+
   const enterAppSafe = useCallback(() => {
     // This tab just swapped the cookie (login or setup completion); other
     // tabs must drop the previous account's reads and re-boot.

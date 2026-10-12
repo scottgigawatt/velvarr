@@ -921,7 +921,7 @@ test("v1 database migrates in place preserving config, accounts, sessions, and g
     raw.prepare("PRAGMA user_version").get() as { user_version: number }
   ).user_version;
   raw.close();
-  assert.equal(version, 11, "v1 database must migrate to schema 11");
+  assert.equal(version, 12, "v1 database must migrate to schema 12");
   // A v1 database never contained the removal tables (current migration 5
   // creates none), so nothing here can assert about them; the schema-10 test
   // below owns the claim that migration 11 drops them.
@@ -1090,8 +1090,8 @@ test("a schema-10 database migrates to 11: every removal object is dropped, rows
   );
   assert.equal(
     versionRow.user_version,
-    11,
-    "schema 10 database must migrate to schema 11",
+    12,
+    "schema 10 database must migrate to schema 12",
   );
   assert.ok(
     grantRow !== null &&

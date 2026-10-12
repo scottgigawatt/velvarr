@@ -57,6 +57,8 @@ export type BrowseType = "all" | "movie" | "scene";
 
 export type BrowseQuery = {
   type: BrowseType;
+  movieSource?: "tpdb" | "tmdb";
+  adultOnly?: boolean;
   q?: string;
   include: CatalogTagSelection[];
   exclude: CatalogTagSelection[];
@@ -216,6 +218,21 @@ export function parseBrowseQuery(params: URLSearchParams): BrowseQuery {
   );
   return {
     type: type ?? "all",
+    ...(params.has("movieSource")
+      ? {
+          movieSource: parseEnum(
+            params.get("movieSource"),
+            ["tpdb", "tmdb"],
+            "movieSource",
+          ),
+        }
+      : {}),
+    ...(params.has("adultOnly")
+      ? {
+          adultOnly:
+            parseEnum(params.get("adultOnly"), ["0", "1"], "adultOnly") === "1",
+        }
+      : {}),
     ...(q !== undefined && q !== "" ? { q } : {}),
     include: parseSelections(params, "include"),
     // Both lists accept labels with no provider id: an include label is a
@@ -842,6 +859,39 @@ export async function browseTitles(
   hiddenTags: CatalogTagSelection[],
   starredPerformerIds: string[] = [],
 ): Promise<BrowsePage> {
+  if (query.movieSource === "tmdb" && query.type !== "scene") {
+    if (
+      query.type !== "movie" ||
+      query.performerTpdb ||
+      query.performerStashdb ||
+      query.studioTpdb ||
+      query.studioStashdb ||
+      query.performerStarred ||
+      query.date ||
+      query.include.length ||
+      query.exclude.length
+    )
+      throw invalidQuery(
+        "TMDB movie search supports title, year, and adult-only filters. Clear the other filters first.",
+      );
+    if (query.sort && query.sort !== "relevance" && query.sort !== "recency")
+      throw invalidQuery("TMDB supports relevance or release recency.");
+    const result = await searchVisibleCatalog(
+      {
+        provider: "tmdb",
+        kind: "movie",
+        query: query.q,
+        year: query.year,
+        adultOnly: query.adultOnly,
+        sort: query.sort,
+        direction: query.direction,
+        page: query.page,
+        perPage: query.perPage,
+      },
+      hiddenTags,
+    );
+    return { ...result, errors: [] };
+  }
   const plan = planBrowseSides(query);
   if (query.performerStarred === true && starredPerformerIds.length === 0) {
     // Starred but the account follows no StashDB-side performer: nothing can

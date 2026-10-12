@@ -7,6 +7,7 @@ import type {
   ShelfError,
 } from "../../../../lib/contracts.ts";
 import {
+  listRequests,
   getAcquisitionByReference,
   getContentPreferences,
   hasAuthoritativeAbsence,
@@ -45,12 +46,21 @@ export async function availability(
   idRaw: string,
 ): Promise<Response> {
   const media = parseMediaReference(providerRaw, kindRaw, idRaw);
-  const acquisition = getAcquisitionByReference(media);
+  const mine = listRequests(ctx.account).find(
+    (r) =>
+      r.accountId === ctx.account.id &&
+      r.decision === "approved" &&
+      r.media.provider === media.provider &&
+      r.media.kind === media.kind &&
+      r.media.id === media.id,
+  );
+  const acquisition = getAcquisitionByReference(media, mine?.targetInstanceId);
   const verdict = await resolvePlaybackAccess(
     ctx.config,
     ctx.token,
     ctx.account,
     {
+      targetInstanceId: acquisition?.instanceId,
       provider: media.provider,
       kind: media.kind,
       id: media.id,

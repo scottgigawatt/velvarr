@@ -12,25 +12,30 @@ import {
 import { browseSortsFor } from "../src/lib/sorts.ts";
 import { parseBrowseQuery, planBrowseSides } from "../src/server/browse.ts";
 
-test("BROWSE_KEYS is the 16 canonical browse keys, performerStarred included", () => {
-  assert.deepEqual([...BROWSE_KEYS].sort(), [
-    "date",
-    "date_operation",
-    "direction",
-    "exclude",
-    "include",
-    "perPage",
-    "performerStarred",
-    "performerStashdb",
-    "performerTpdb",
-    "q",
-    "sort",
-    "studioMode",
-    "studioStashdb",
-    "studioTpdb",
-    "type",
-    "year",
-  ]);
+test("BROWSE_KEYS includes source and adult filters alongside existing browse keys", () => {
+  assert.deepEqual(
+    [...BROWSE_KEYS].sort(),
+    [
+      "date",
+      "date_operation",
+      "direction",
+      "exclude",
+      "include",
+      "perPage",
+      "performerStarred",
+      "performerStashdb",
+      "performerTpdb",
+      "q",
+      "sort",
+      "studioMode",
+      "studioStashdb",
+      "studioTpdb",
+      "type",
+      "movieSource",
+      "adultOnly",
+      "year",
+    ].sort(),
+  );
   assert.ok(BROWSE_KEYS.includes("performerStarred"));
 });
 
@@ -38,22 +43,27 @@ test("clearBrowseKeys nulls every key; keep spares exactly the named keys", () =
   const all = clearBrowseKeys();
   for (const key of BROWSE_KEYS) assert.equal(all[key], null);
   const kept = clearBrowseKeys(["type", "perPage"]);
-  assert.deepEqual(Object.keys(kept).sort(), [
-    "date",
-    "date_operation",
-    "direction",
-    "exclude",
-    "include",
-    "performerStarred",
-    "performerStashdb",
-    "performerTpdb",
-    "q",
-    "sort",
-    "studioMode",
-    "studioStashdb",
-    "studioTpdb",
-    "year",
-  ]);
+  assert.deepEqual(
+    Object.keys(kept).sort(),
+    [
+      "date",
+      "date_operation",
+      "direction",
+      "exclude",
+      "include",
+      "performerStarred",
+      "performerStashdb",
+      "performerTpdb",
+      "q",
+      "sort",
+      "studioMode",
+      "studioStashdb",
+      "studioTpdb",
+      "year",
+      "movieSource",
+      "adultOnly",
+    ].sort(),
+  );
   // Callers spread extras after: the extra wins.
   assert.equal({ ...clearBrowseKeys(), type: "scene" }.type, "scene");
 });

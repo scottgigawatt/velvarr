@@ -3732,3 +3732,26 @@ test("resolvePlaybackAccess keeps proven rejections, outages, and auth deaths di
     },
   );
 });
+
+test("TMDB numeric playback IDs cannot match another provider's identical number", async () => {
+  const entries = avEntries();
+  await withFixture(avHandler({ entries }), async (fx) => {
+    const matched = await resolvePlaybackAccess(
+      avConfig(fx.origin, [LIB_A]),
+      TOKEN,
+      account([LIB_A]),
+      { provider: "tmdb", kind: "movie", id: "6789" },
+    );
+    assert.equal(matched.outcome, "available");
+  });
+  entries[0]!.item.ProviderIds = { Tvdb: "6789" };
+  await withFixture(avHandler({ entries }), async (fx) => {
+    const unmatched = await resolvePlaybackAccess(
+      avConfig(fx.origin, [LIB_A]),
+      TOKEN,
+      account([LIB_A]),
+      { provider: "tmdb", kind: "movie", id: "6789" },
+    );
+    assert.equal(unmatched.outcome, "missing");
+  });
+});

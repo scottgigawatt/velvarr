@@ -207,6 +207,46 @@ export function catalogSearchQuery(url: URL): CatalogSearchQuery {
   const kindRaw = params.get("kind");
   if (kindRaw === null)
     throw new AppError(400, "invalid_query", "kind is required.");
+  if (provider === "tmdb") {
+    if (kindRaw !== "movie")
+      throw new AppError(400, "invalid_query", "TMDB supports movies only.");
+    const sort = params.get("sort");
+    if (sort !== null && sort !== "relevance" && sort !== "recency")
+      throw new AppError(
+        400,
+        "invalid_query",
+        "TMDB supports relevance and recency only.",
+      );
+    const direction = params.get("direction");
+    if (direction !== null && direction !== "asc" && direction !== "desc")
+      throw new AppError(400, "invalid_query", "Invalid TMDB sort direction.");
+    const adultOnly = params.get("adultOnly");
+    if (adultOnly !== null && adultOnly !== "0" && adultOnly !== "1")
+      throw new AppError(400, "invalid_query", "adultOnly must be 0 or 1.");
+    if (
+      ["performer", "studio", "tags", "date", "date_operation"].some((k) =>
+        params.has(k),
+      )
+    )
+      throw new AppError(
+        400,
+        "invalid_query",
+        "TMDB movie search supports title, year, and adult classification only.",
+      );
+    return {
+      provider: "tmdb",
+      kind: "movie",
+      query: params.get("q") ?? undefined,
+      year: params.has("year") ? Number(params.get("year")) : undefined,
+      page: params.has("page") ? Number(params.get("page")) : undefined,
+      perPage: params.has("perPage")
+        ? Number(params.get("perPage"))
+        : undefined,
+      sort: sort ?? undefined,
+      direction: direction ?? undefined,
+      adultOnly: adultOnly === "1",
+    };
+  }
   if (provider === "stashdb") {
     // The overload types stashdb kinds as "scene" | "performer" | "studio":
     // StashDB has no movie entity, and parseCatalogKind already rejects
@@ -563,7 +603,9 @@ export async function catalogDetail(
           (r.decision === "pending" || r.decision === "approved"),
       ) ?? null)
     : null;
-  const acquisition = media ? getAcquisitionByReference(media) : null;
+  const acquisition = media
+    ? getAcquisitionByReference(media, mine?.targetInstanceId)
+    : null;
   // Performers take the async path: an explicit provider URL wins, then a
   // shared third-party profile link (identity URL match) can resolve the
   // counterpart, which may search the other provider. Only a performer none

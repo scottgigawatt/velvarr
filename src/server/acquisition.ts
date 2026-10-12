@@ -1,3 +1,4 @@
+import { targetConfig } from "./whisparr-targets.ts";
 // Durable delivery/reconciliation worker over the landed storage and Whisparr
 // interfaces. The loop holds no user sessions and never imports route code:
 // every decision comes from persisted acquisition state, current stored
@@ -287,7 +288,7 @@ async function reconcileUncertain(
   // the last requester withdrew or was disabled, and withdrawUndispatched
   // only removes unsent/blocked rows. A fresh add would deliver media nobody
   // asked for any more — record it blocked instead of dispatching.
-  if (!storage.hasEligibleRequester(record.media)) {
+  if (!storage.hasEligibleRequester(record.media, record.instanceId)) {
     storage.recordAcquisitionObservation(
       record.id,
       {
@@ -362,6 +363,7 @@ async function processOne(
   config: IntegrationConfig | null,
   summary: WorkSummary,
 ): Promise<void> {
+  if (config) config = targetConfig(config, item.media, item.instanceId);
   // Local gates before any claim or network call: disabled delivery and
   // inadmissible requesters leave work honestly blocked (reason persisted,
   // state untouched) instead of looping against Whisparr or faking success.
@@ -373,7 +375,10 @@ async function processOne(
     summary.blocked++;
     return;
   }
-  if (item.state === "unsent" && !storage.hasEligibleRequester(item.media)) {
+  if (
+    item.state === "unsent" &&
+    !storage.hasEligibleRequester(item.media, item.instanceId)
+  ) {
     storage.recordAcquisitionObservation(item.id, {
       unavailable: true,
       reason: "no eligible requester remains for this acquisition",

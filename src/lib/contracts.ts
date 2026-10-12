@@ -4,7 +4,7 @@
 
 export type Role = "admin" | "moderator" | "requester";
 
-export type CatalogProvider = "tpdb" | "stashdb";
+export type CatalogProvider = "tpdb" | "stashdb" | "tmdb";
 
 export type MediaKind = "movie" | "scene";
 
@@ -128,7 +128,7 @@ export function isBrowseableTagSelection(t: CatalogTagSelection): boolean {
   );
 }
 
-/** Provider-scoped external identity. `id` is the provider's external UUID,
+/** Provider-scoped external identity. `id` is the provider's native ID (UUID or positive TMDB integer),
  * never the application-owned catalog record id. */
 export type CatalogReference = {
   provider: CatalogProvider;
@@ -143,24 +143,21 @@ export type MediaReference = {
   id: string;
 };
 
-/** Whisparr routes exactly one metadata source per item type: TPDB for
- * movies, StashDB for scenes. A TPDB scene has no lookup path upstream
- * (`/api/v3/movie/lookup/tpdb` is the movie endpoint, and `term=stash:<id>`
- * only matches StashDB ids), so it can be browsed but never acquired.
- * Checked before a request is filed, not discovered by a worker an hour
- * later. */
+/** Movies use their TPDB or TMDB identity; scenes use StashDB. TPDB scene
+ * wrapper IDs have no acquisition lookup upstream and are never delivered. */
 export function isDeliverableMedia(ref: {
   provider: CatalogProvider;
   kind: CatalogKind;
 }): boolean {
   return (
-    (ref.kind === "movie" && ref.provider === "tpdb") ||
+    (ref.kind === "movie" &&
+      (ref.provider === "tpdb" || ref.provider === "tmdb")) ||
     (ref.kind === "scene" && ref.provider === "stashdb")
   );
 }
 
 export const UNDELIVERABLE_REASON =
-  "Whisparr can acquire TPDB movies and StashDB scenes only — it has no metadata source for this identity.";
+  "Whisparr can acquire TPDB or TMDB movies and StashDB scenes only — it has no metadata source for this identity.";
 
 export type ExternalLink = { url: string; label?: string };
 
@@ -206,6 +203,8 @@ export type CatalogDetail = {
   reference: CatalogReference;
   title: string;
   description?: string;
+  /** TMDB classification; absence is unknown, not a non-adult verdict. */
+  adult?: boolean;
   /** ISO calendar date (YYYY-MM-DD) when the provider supplies one. */
   releaseDate?: string;
   durationSeconds?: number;
@@ -299,6 +298,8 @@ export type RequestRecord = {
   /** Unix milliseconds. */
   createdAt: number;
   decidedAt: number | null;
+  /** Approval pins delivery to this logical connection. */
+  targetInstanceId?: string;
 };
 
 export type RequestAcquisition = {
@@ -312,6 +313,7 @@ export type RequestAcquisition = {
 
 /** GET /api/requests row: the record plus the facts only that list carries. */
 export type RequestListItem = RequestRecord & {
+  targetName?: string;
   /** Display name of the requesting account; present only for staff viewers. */
   requestedBy?: string;
   /** The requester's account id, same staff-only visibility: the staff avatar
@@ -381,7 +383,7 @@ export interface FacetItem {
 export interface Shelf {
   id: string;
   title: string;
-  source: "tpdb" | "stashdb" | "jellyfin" | "velvarr";
+  source: "tpdb" | "stashdb" | "tmdb" | "jellyfin" | "velvarr";
   /** Honest one-line provenance, e.g. trending is a StashDB-only signal. */
   description?: string;
   browse?: { view: string; params: Record<string, string> };
@@ -514,6 +516,27 @@ export type WhisparrPathMapping = {
   jellyfinPrefix: string;
 };
 
+export type WhisparrConnection = {
+  instanceId?: string;
+  name: string;
+  url: string;
+  apiKey: string;
+  movieProvider: "tpdb" | "tmdb" | "none";
+  sceneDefault: boolean;
+  delivery?: WhisparrDelivery;
+  sceneDelivery?: WhisparrDelivery;
+  pathMappings?: WhisparrPathMapping[];
+};
+
+/** TMDB identities are positive decimal integers; UUID providers retain their native IDs. */
+export function isCatalogId(provider: CatalogProvider, id: string): boolean {
+  return provider === "tmdb"
+    ? /^[1-9][0-9]*$/.test(id) &&
+        Number.isSafeInteger(Number(id)) &&
+        Number(id) <= 2147483647
+    : UUID_RE.test(id);
+}
+
 export type JudgmentProvider = "typesafe" | "ollama";
 
 export type IntegrationConfig = {
@@ -534,9 +557,11 @@ export type IntegrationConfig = {
     delivery?: WhisparrDelivery;
     pathMappings?: WhisparrPathMapping[];
   };
+  whisparrInstances?: WhisparrConnection[];
   /** Stored metadata-provider credentials (admin UI). Absent or empty
    * fields fall back to the environment variables. */
   providers?: {
+    tmdbReadToken?: string;
     tpdbApiToken?: string;
     stashdbApiKey?: string;
     /** TypeSafe credentials; used only when TypeSafe is selected. */
@@ -627,6 +652,7 @@ export type SessionGrant = {
 };
 
 export type ProviderStatus = {
+  tmdb?: "not_configured" | "not_verified";
   tpdb: "not_configured" | "not_verified";
   stashdb: "not_configured" | "not_verified";
 };

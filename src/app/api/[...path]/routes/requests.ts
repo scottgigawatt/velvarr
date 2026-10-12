@@ -1,3 +1,4 @@
+import { whisparrConnections } from "../../../../server/whisparr-targets.ts";
 import {
   readJson,
   requireId,
@@ -65,16 +66,38 @@ export function listRequestItems(ctx: AuthContext): RequestListItem[] {
       ? { ...r, requestedBy: acc.name, requestedById: acc.id }
       : r;
     if (item.decision !== "approved") return item;
-    const a = getAcquisitionByReference(item.media);
+    const targetName =
+      ctx.config.whisparrInstances !== undefined && item.targetInstanceId
+        ? (whisparrConnections(ctx.config).find(
+            (c) => c.instanceId === item.targetInstanceId,
+          )?.name ?? "Retired connection")
+        : undefined;
+    const a = getAcquisitionByReference(item.media, item.targetInstanceId);
     return {
       ...item,
+      ...(targetName ? { targetName } : {}),
       acquisition: acquisitionView(a),
     };
   });
 }
 
 export async function listRequestsRoute(ctx: AuthContext): Promise<Response> {
-  return json({ requests: listRequestItems(ctx) });
+  const staff =
+    ctx.account.role === "admin" || ctx.account.role === "moderator";
+  return json({
+    requests: listRequestItems(ctx),
+    ...(staff
+      ? {
+          sceneTargets: whisparrConnections(ctx.config)
+            .filter((c) => c.sceneDelivery !== undefined)
+            .map((c) => ({
+              id: c.instanceId,
+              name: c.name,
+              default: c.sceneDefault,
+            })),
+        }
+      : {}),
+  });
 }
 
 export async function decideRequestRoute(
@@ -82,11 +105,22 @@ export async function decideRequestRoute(
   ctx: AuthContext,
   id: string,
 ): Promise<Response> {
-  const decision = (await readJson(request)).decision;
+  const body = await readJson(request);
+  const decision = body.decision;
+  if (
+    body.sceneTargetId !== undefined &&
+    typeof body.sceneTargetId !== "string"
+  )
+    throw new AppError(400, "invalid_target", "Invalid scene target.");
   const requestId = requireId(id);
   if (decision === "approved" || decision === "declined") {
     return json({
-      request: decideRequest(ctx.account, requestId, decision),
+      request: decideRequest(
+        ctx.account,
+        requestId,
+        decision,
+        body.sceneTargetId as string | undefined,
+      ),
     });
   }
   if (decision === "cancelled") {

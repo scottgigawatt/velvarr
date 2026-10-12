@@ -119,6 +119,8 @@ export function identityLinkKey(url: string): string | undefined {
  * and scenes are never linked across providers. Returns exactly one of
  * linked / unlinkedReason. */
 export function crossProviderLink(detail: CatalogDetail): CrossProviderLink {
+  if (detail.reference.provider === "tmdb")
+    return { unlinkedReason: "TMDB movies keep their own provider identity." };
   const kind = detail.reference.kind;
   const fromTpdb = detail.reference.provider === "tpdb";
   if (kind === "performer") {

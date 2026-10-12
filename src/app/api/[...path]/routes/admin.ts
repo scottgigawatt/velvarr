@@ -1,3 +1,4 @@
+import { whisparrConnections } from "../../../../server/whisparr-targets.ts";
 import {
   readJson,
   fieldUrl,
@@ -17,6 +18,7 @@ import type {
 } from "../../../../lib/contracts.ts";
 import {
   countRequestsByAccount,
+  getConfig,
   getAccount,
   importAccounts,
   listAccounts,
@@ -55,8 +57,12 @@ export function integrationsShape(config: IntegrationConfig) {
           pathMappings: config.whisparr.pathMappings ?? [],
         }
       : null,
+    ...(config.whisparrInstances !== undefined
+      ? { whisparrInstances: connectionShapes(config) }
+      : {}),
     judgment: judgmentConfiguration(config.providers),
     providers: {
+      tmdb: providerShape(config.providers?.tmdbReadToken, "TMDB_READ_TOKEN"),
       tpdb: providerShape(config.providers?.tpdbApiToken, "TPDB_API_TOKEN"),
       stashdb: providerShape(
         config.providers?.stashdbApiKey,
@@ -173,6 +179,7 @@ export function nextProviderCredentials(
   existing: IntegrationConfig["providers"],
   body: Record<string, unknown>,
 ): IntegrationConfig["providers"] {
+  const tmdbReadToken = optionalText(body, "tmdbReadToken", 2048);
   const tpdbApiToken = optionalText(body, "tpdbApiToken", 1024);
   const stashdbApiKey = optionalText(body, "stashdbApiKey", 512);
   const typesafeApiKey = optionalText(body, "typesafeApiKey", 512);
@@ -195,6 +202,7 @@ export function nextProviderCredentials(
     throw new AppError(400, "invalid_field", "Invalid Ollama model name.");
   }
   if (
+    tmdbReadToken === undefined &&
     tpdbApiToken === undefined &&
     stashdbApiKey === undefined &&
     typesafeApiKey === undefined &&
@@ -205,6 +213,12 @@ export function nextProviderCredentials(
     return existing;
   }
   const providers: NonNullable<IntegrationConfig["providers"]> = {
+    tmdbReadToken:
+      tmdbReadToken === undefined
+        ? existing?.tmdbReadToken
+        : tmdbReadToken === ""
+          ? undefined
+          : tmdbReadToken.trim(),
     judgmentProvider:
       judgmentProvider === undefined
         ? existing?.judgmentProvider
@@ -243,6 +257,7 @@ export function nextProviderCredentials(
           : typesafeApiKey.trim(),
   };
   if (
+    providers.tmdbReadToken === undefined &&
     providers.tpdbApiToken === undefined &&
     providers.stashdbApiKey === undefined &&
     providers.typesafeApiKey === undefined &&
@@ -439,6 +454,7 @@ export async function adminUpdateIntegrations(
     bodyKeys.length > 0 &&
     bodyKeys.every((k) =>
       [
+        "tmdbReadToken",
         "tpdbApiToken",
         "stashdbApiKey",
         "typesafeApiKey",
@@ -450,6 +466,8 @@ export async function adminUpdateIntegrations(
   ) {
     const providers = nextProviderCredentials(ctx.config.providers, body);
     const patched: IntegrationConfig = {
+      ...ctx.config,
+      providers,
       jellyfin: ctx.config.jellyfin,
       ...(ctx.config.whisparr ? { whisparr: ctx.config.whisparr } : {}),
       ...(providers ? { providers } : {}),
@@ -458,9 +476,23 @@ export async function adminUpdateIntegrations(
     return json(integrationsShape(patched));
   }
   const jellyfin = await nextJellyfin(ctx.config.jellyfin, body);
+  if (
+    ctx.config.whisparrInstances !== undefined &&
+    ["whisparrUrl", "whisparrApiKey", "delivery", "pathMappings"].some(
+      (k) => k in body,
+    )
+  )
+    throw new AppError(
+      409,
+      "use_connections",
+      "Edit Whisparr using the individual connections settings.",
+    );
   const whisparr = nextWhisparr(ctx.config.whisparr, body);
   const providers = nextProviderCredentials(ctx.config.providers, body);
   const config: IntegrationConfig = {
+    ...ctx.config,
+    whisparr,
+    providers,
     jellyfin,
     ...(whisparr ? { whisparr } : {}),
     ...(providers ? { providers } : {}),
@@ -471,7 +503,12 @@ export async function adminUpdateIntegrations(
 
 export async function adminWhisparr(ctx: AuthContext): Promise<Response> {
   try {
-    return json(await getWhisparrStatus(ctx.config));
+    return json(
+      await getWhisparrStatus({
+        ...ctx.config,
+        whisparr: whisparrConnections(ctx.config)[0],
+      }),
+    );
   } catch (err) {
     // Upstream rejection or outage is status information, never a dead
     // Velvarr session: an HTTP 401 here would fire the client's global
@@ -506,7 +543,96 @@ export async function adminProviders(_ctx: AuthContext): Promise<Response> {
     getProviderStatus("tpdb"),
     getProviderStatus("stashdb"),
   ]);
-  return json({ providers: [tpdb, stashdb] });
+  const tmdb = await getProviderStatus("tmdb");
+  return json({ providers: [tpdb, stashdb, tmdb] });
+}
+
+function connectionShapes(config: IntegrationConfig) {
+  return whisparrConnections(config).map(({ apiKey, ...c }) => ({
+    ...c,
+    apiKeyConfigured: Boolean(apiKey),
+  }));
+}
+
+export async function updateWhisparrConnections(
+  ctx: AuthContext,
+  request: Request,
+): Promise<Response> {
+  const body = await readJson(request);
+  if (!Array.isArray(body.connections) || body.connections.length > 8)
+    throw new AppError(
+      400,
+      "invalid_field",
+      "connections must be an array of up to eight connections.",
+    );
+  const existing = whisparrConnections(ctx.config);
+  const connections: NonNullable<IntegrationConfig["whisparrInstances"]> =
+    body.connections.map((raw) => {
+      if (!raw || typeof raw !== "object" || Array.isArray(raw))
+        throw new AppError(
+          400,
+          "invalid_field",
+          "Invalid Whisparr connection.",
+        );
+      const r = raw as Record<string, unknown>;
+      const url = validateBaseUrl(optionalText(r, "url", 2048) || "");
+      const previous = existing.find(
+        (c) => c.instanceId === r.instanceId && c.url === url,
+      );
+      const supplied = optionalText(r, "apiKey", 512)?.trim();
+      const apiKey = supplied || previous?.apiKey;
+      if (!apiKey)
+        throw new AppError(
+          400,
+          "invalid_field",
+          "An API key is required for every new or moved connection.",
+        );
+      if (
+        r.movieProvider !== "tpdb" &&
+        r.movieProvider !== "tmdb" &&
+        r.movieProvider !== "none"
+      )
+        throw new AppError(
+          400,
+          "invalid_field",
+          "Invalid movie provider assignment.",
+        );
+      if (typeof r.sceneDefault !== "boolean")
+        throw new AppError(
+          400,
+          "invalid_field",
+          "sceneDefault must be a boolean.",
+        );
+      return {
+        name: (optionalText(r, "name", 80) || "").trim(),
+        url,
+        apiKey,
+        movieProvider: r.movieProvider,
+        sceneDefault: r.sceneDefault,
+        instanceId: previous?.instanceId,
+        delivery: parseDelivery(r.delivery),
+        sceneDelivery: parseDelivery(r.sceneDelivery),
+        pathMappings: parsePathMappings(r.pathMappings),
+      };
+    });
+  for (const c of connections) {
+    const enabled = [c.delivery, c.sceneDelivery].filter((d) => d?.enabled);
+    if (enabled.length) {
+      const status = await getWhisparrStatus({ ...ctx.config, whisparr: c });
+      for (const d of enabled)
+        if (
+          !status.rootFolders?.some((r) => r.path === d!.rootFolderPath) ||
+          !status.profiles?.some((p) => p.id === d!.qualityProfileId)
+        )
+          throw new AppError(
+            400,
+            "invalid_delivery",
+            "Select a root folder and quality profile that exist on this Whisparr connection.",
+          );
+    }
+  }
+  saveConfig({ ...ctx.config, whisparrInstances: connections });
+  return json({ connections: connectionShapes(getConfig()!) });
 }
 
 import type { RouteDef } from "../admission.ts";
@@ -529,6 +655,37 @@ export const routes: RouteDef[] = [
     segments: ["admin", "integrations"],
     auth: "admin",
     run: async (ctx) => json(integrationsShape(ctx.config)),
+  },
+  {
+    method: "GET",
+    segments: ["admin", "whisparr", "connections"],
+    auth: "admin",
+    run: async (ctx) => json({ connections: connectionShapes(ctx.config) }),
+  },
+  {
+    method: "PATCH",
+    segments: ["admin", "whisparr", "connections"],
+    auth: "admin",
+    run: async (ctx, request) => updateWhisparrConnections(ctx, request),
+  },
+  {
+    method: "GET",
+    segments: ["admin", "whisparr", "connections", ":id"],
+    auth: "admin",
+    run: async (ctx, _request, p) => {
+      const connection = whisparrConnections(ctx.config).find(
+        (c) => c.instanceId === p.id,
+      );
+      if (!connection)
+        throw new AppError(
+          404,
+          "target_not_found",
+          "Whisparr connection not found.",
+        );
+      return json(
+        await getWhisparrStatus({ ...ctx.config, whisparr: connection }),
+      );
+    },
   },
   {
     method: "GET",

@@ -1,3 +1,4 @@
+import { isCatalogId } from "../../../lib/contracts.ts";
 import type {
   CatalogKind,
   CatalogProvider,
@@ -135,7 +136,7 @@ export const PROVIDER_UUID =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 export function parseCatalogProvider(raw: string | null): CatalogProvider {
-  if (raw === "tpdb" || raw === "stashdb") return raw;
+  if (raw === "tpdb" || raw === "stashdb" || raw === "tmdb") return raw;
   throw new AppError(400, "invalid_reference", "Unknown catalog provider.");
 }
 // Two signatures only: the stashdb narrowing one (its call site narrows the
@@ -152,6 +153,14 @@ export function parseCatalogKind(
   provider: CatalogProvider,
   raw: string,
 ): CatalogKind {
+  if (provider === "tmdb") {
+    if (raw === "movie") return raw;
+    throw new AppError(
+      400,
+      "invalid_reference",
+      "TMDB supports movies only in Velvarr.",
+    );
+  }
   if (provider === "tpdb") {
     if (
       raw === "movie" ||
@@ -181,7 +190,7 @@ export function parseCatalogReference(
 ): CatalogReference {
   const provider = parseCatalogProvider(providerRaw);
   const kind = parseCatalogKind(provider, kindRaw);
-  if (!PROVIDER_UUID.test(idRaw)) {
+  if (!isCatalogId(provider, idRaw)) {
     throw new AppError(
       400,
       "invalid_reference",
@@ -226,10 +235,12 @@ export function mediaFromBody(body: Record<string, unknown>): MediaReference {
   }
   const m = media as Record<string, unknown>;
   if (
-    (m.provider !== "tpdb" && m.provider !== "stashdb") ||
+    (m.provider !== "tpdb" &&
+      m.provider !== "stashdb" &&
+      m.provider !== "tmdb") ||
     (m.kind !== "movie" && m.kind !== "scene") ||
     typeof m.id !== "string" ||
-    !PROVIDER_UUID.test(m.id)
+    !isCatalogId(m.provider, m.id)
   ) {
     throw new AppError(400, "invalid_field", "Invalid media reference.");
   }
