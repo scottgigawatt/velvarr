@@ -1471,6 +1471,7 @@ test("session requirement and honest provider status", async () => {
   assert.deepEqual(body.providers, {
     tpdb: "not_configured",
     stashdb: "not_configured",
+    tmdb: "not_configured",
   });
 });
 

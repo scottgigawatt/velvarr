@@ -18,6 +18,8 @@ export type BrowseType = "all" | "movie" | "scene";
 
 export const BROWSE_KEYS = [
   "type",
+  "movieSource",
+  "adultOnly",
   "q",
   "include",
   "exclude",

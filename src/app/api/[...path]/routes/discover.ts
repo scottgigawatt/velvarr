@@ -499,7 +499,7 @@ export async function discoveryFacets(
   }
   const { hiddenTags } = getContentPreferences(ctx.account.id);
   if (kind === "genres") {
-    const providers: CatalogProvider[] = ["tpdb", "stashdb"];
+    const providers: ("tpdb" | "stashdb")[] = ["tpdb", "stashdb"];
     const settled = await Promise.allSettled(
       providers.map((p) => listCatalogTags(p)),
     );

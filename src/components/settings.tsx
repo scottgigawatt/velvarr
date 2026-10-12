@@ -1,4 +1,5 @@
 "use client";
+import { WhisparrConnections } from "./whisparr-connections.tsx";
 
 /*
  * Admin settings page: integration forms, Jellyfin/Whisparr status cards
@@ -42,6 +43,7 @@ interface JellyfinStatus {
   error?: { code: string; message: string };
 }
 interface IntegrationsInfo {
+  whisparrInstances?: unknown[];
   jellyfin: {
     url: string;
     externalUrl: string;
@@ -105,6 +107,7 @@ export function SettingsView() {
             <WhisparrCard onForbidden={forbid} />
           </div>
           <IntegrationsForm onForbidden={forbid} />
+          <WhisparrConnections />
         </div>
       </div>
       <div hidden={section !== "metadata"}>
@@ -173,6 +176,11 @@ function IntegrationsForm({ onForbidden }: { onForbidden: () => void }) {
   }, [onForbidden]);
 
   useEffect(load, [load]);
+  useEffect(() => {
+    window.addEventListener("velvarr:connections-changed", load);
+    return () =>
+      window.removeEventListener("velvarr:connections-changed", load);
+  }, [load]);
 
   // Select choices; the currently stored value is always offered so a stale
   // status can never silently change what will be saved.
@@ -210,7 +218,7 @@ function IntegrationsForm({ onForbidden }: { onForbidden: () => void }) {
       setError("Jellyfin URL and external URL are required.");
       return;
     }
-    if (!hasUrl && whisparrApiKey.trim() !== "") {
+    if (!info?.whisparrInstances && !hasUrl && whisparrApiKey.trim() !== "") {
       setError(
         "A Whisparr API key needs the Whisparr URL — the URL is the connection, the key authenticates it.",
       );
@@ -218,6 +226,7 @@ function IntegrationsForm({ onForbidden }: { onForbidden: () => void }) {
     }
     const profile = Number(effectiveProfile);
     if (
+      !info?.whisparrInstances &&
       hasUrl &&
       (deliveryEnabled || info?.whisparr?.delivery) &&
       (!Number.isInteger(profile) || profile < 1)
@@ -225,11 +234,16 @@ function IntegrationsForm({ onForbidden }: { onForbidden: () => void }) {
       setError("Choose a quality profile (a positive whole number).");
       return;
     }
-    if (hasUrl && deliveryEnabled && !effectiveRoot.trim()) {
+    if (
+      !info?.whisparrInstances &&
+      hasUrl &&
+      deliveryEnabled &&
+      !effectiveRoot.trim()
+    ) {
       setError("A root folder is required while delivery is enabled.");
       return;
     }
-    if (hasUrl && halfMappings.length > 0) {
+    if (!info?.whisparrInstances && hasUrl && halfMappings.length > 0) {
       setError(
         "Each path mapping needs both a Whisparr prefix and a Jellyfin prefix.",
       );
@@ -243,30 +257,34 @@ function IntegrationsForm({ onForbidden }: { onForbidden: () => void }) {
           jellyfinUrl: jellyfinUrl.trim(),
           jellyfinExternalUrl: externalUrl.trim(),
           ...(jellyfinApiKey ? { jellyfinApiKey } : {}),
-          whisparrUrl: whisparrUrl.trim(),
-          ...(whisparrApiKey ? { whisparrApiKey } : {}),
-          // Delivery travels only when it exists on either side: enabled now,
-          // or previously configured (an omitted key would drop it wholesale).
-          // A first-time save with delivery off stores none — profiles and
-          // roots can be chosen after the connection probe succeeds.
-          ...(hasUrl && (deliveryEnabled || info?.whisparr?.delivery)
+          ...(!info?.whisparrInstances
             ? {
-                delivery: {
-                  enabled: deliveryEnabled,
-                  rootFolderPath: effectiveRoot.trim(),
-                  qualityProfileId: profile,
-                  searchOnAdd,
-                },
-                pathMappings: mappings
-                  .filter(
-                    (m) =>
-                      m.whisparrPrefix.trim() !== "" &&
-                      m.jellyfinPrefix.trim() !== "",
-                  )
-                  .map((m) => ({
-                    whisparrPrefix: m.whisparrPrefix.trim(),
-                    jellyfinPrefix: m.jellyfinPrefix.trim(),
-                  })),
+                whisparrUrl: whisparrUrl.trim(),
+                ...(whisparrApiKey ? { whisparrApiKey } : {}),
+                // Delivery travels only when it exists on either side: enabled now,
+                // or previously configured (an omitted key would drop it wholesale).
+                // A first-time save with delivery off stores none — profiles and
+                // roots can be chosen after the connection probe succeeds.
+                ...(hasUrl && (deliveryEnabled || info?.whisparr?.delivery)
+                  ? {
+                      delivery: {
+                        enabled: deliveryEnabled,
+                        rootFolderPath: effectiveRoot.trim(),
+                        qualityProfileId: profile,
+                        searchOnAdd,
+                      },
+                      pathMappings: mappings
+                        .filter(
+                          (m) =>
+                            m.whisparrPrefix.trim() !== "" &&
+                            m.jellyfinPrefix.trim() !== "",
+                        )
+                        .map((m) => ({
+                          whisparrPrefix: m.whisparrPrefix.trim(),
+                          jellyfinPrefix: m.jellyfinPrefix.trim(),
+                        })),
+                    }
+                  : {}),
               }
             : {}),
         }),
@@ -274,6 +292,7 @@ function IntegrationsForm({ onForbidden }: { onForbidden: () => void }) {
       setJellyfinApiKey("");
       setWhisparrApiKey("");
       setSaved("Integrations updated.");
+      window.dispatchEvent(new Event("velvarr:connections-changed"));
       load();
     } catch (err) {
       if (err instanceof ApiError && err.status === 403) onForbidden();
@@ -366,7 +385,7 @@ function IntegrationsForm({ onForbidden }: { onForbidden: () => void }) {
             onChange={(e) => setJellyfinApiKey(e.target.value)}
           />
         </div>
-        <div>
+        <div hidden={Boolean(info.whisparrInstances)}>
           <label className="label" htmlFor="int-w-url">
             Whisparr URL (blank removes it, with delivery settings)
           </label>
@@ -380,7 +399,7 @@ function IntegrationsForm({ onForbidden }: { onForbidden: () => void }) {
             onChange={(e) => setWhisparrUrl(e.target.value)}
           />
         </div>
-        <div>
+        <div hidden={Boolean(info.whisparrInstances)}>
           <label className="label" htmlFor="int-w-key">
             Whisparr API key
           </label>
@@ -399,8 +418,10 @@ function IntegrationsForm({ onForbidden }: { onForbidden: () => void }) {
           />
         </div>
       </div>
-
-      <fieldset className="mt-4 border-t border-edge pt-4">
+      <fieldset
+        hidden={Boolean(info.whisparrInstances)}
+        className="mt-4 border-t border-edge pt-4"
+      >
         <legend className="label">Whisparr delivery</legend>
         <p className="mt-1 text-sm text-muted">
           With delivery disabled, approved requests are held inside Velvarr —
@@ -497,7 +518,10 @@ function IntegrationsForm({ onForbidden }: { onForbidden: () => void }) {
         </div>
       </fieldset>
 
-      <fieldset className="mt-4 border-t border-edge pt-4">
+      <fieldset
+        hidden={Boolean(info.whisparrInstances)}
+        className="mt-4 border-t border-edge pt-4"
+      >
         <legend className="label">Path mappings (Whisparr → Jellyfin)</legend>
         <p className="mt-1 text-sm text-muted">
           Prefix pairs that line Whisparr download paths up with Jellyfin
@@ -573,7 +597,6 @@ function IntegrationsForm({ onForbidden }: { onForbidden: () => void }) {
           Add mapping
         </button>
       </fieldset>
-
       <button type="submit" className="btn btn-accent mt-4" disabled={pending}>
         {pending ? "Saving…" : "Save integrations"}
       </button>
@@ -769,9 +792,9 @@ type ProviderConfigRow = {
 
 // Shape returned by GET /api/admin/providers (ProviderVerification).
 type ProviderCheckRow =
-  | { provider: "tpdb" | "stashdb"; configured: false }
+  | { provider: "tpdb" | "stashdb" | "tmdb"; configured: false }
   | {
-      provider: "tpdb" | "stashdb";
+      provider: "tpdb" | "stashdb" | "tmdb";
       configured: true;
       verified: true;
       account: string;
@@ -782,11 +805,13 @@ function ProvidersCard({ providers }: { providers: ProviderStatus | null }) {
   const [error, setError] = useState<string | null>(null);
   const [forbidden, setForbidden] = useState(false);
   const [shape, setShape] = useState<{
+    tmdb: ProviderConfigRow;
     tpdb: ProviderConfigRow;
     stashdb: ProviderConfigRow;
     typesafe: ProviderConfigRow;
   } | null>(null);
   const [shapeError, setShapeError] = useState<string | null>(null);
+  const [tmdbToken, setTmdbToken] = useState("");
   const [tpdbToken, setTpdbToken] = useState("");
   const [stashdbKey, setStashdbKey] = useState("");
   const [typesafeKey, setTypesafeKey] = useState("");
@@ -808,6 +833,7 @@ function ProvidersCard({ providers }: { providers: ProviderStatus | null }) {
   const loadShape = useCallback(() => {
     api<{
       providers: {
+        tmdb: ProviderConfigRow;
         tpdb: ProviderConfigRow;
         stashdb: ProviderConfigRow;
         typesafe: ProviderConfigRow;
@@ -835,6 +861,8 @@ function ProvidersCard({ providers }: { providers: ProviderStatus | null }) {
         method: "PATCH",
         body: JSON.stringify(body),
       });
+      window.dispatchEvent(new Event("velvarr:providers-changed"));
+      setTmdbToken("");
       setTpdbToken("");
       setStashdbKey("");
       setTypesafeKey("");
@@ -850,6 +878,7 @@ function ProvidersCard({ providers }: { providers: ProviderStatus | null }) {
 
   const save = () => {
     const body: Record<string, string> = {};
+    if (tmdbToken.trim() !== "") body.tmdbReadToken = tmdbToken.trim();
     if (tpdbToken.trim() !== "") body.tpdbApiToken = tpdbToken.trim();
     if (stashdbKey.trim() !== "") body.stashdbApiKey = stashdbKey.trim();
     if (typesafeKey.trim() !== "") body.typesafeApiKey = typesafeKey.trim();
@@ -857,6 +886,13 @@ function ProvidersCard({ providers }: { providers: ProviderStatus | null }) {
   };
 
   const rows = [
+    {
+      id: "tmdb" as const,
+      name: "TMDB",
+      value: tmdbToken,
+      field: "tmdbReadToken" as const,
+      setValue: setTmdbToken,
+    },
     {
       id: "tpdb" as const,
       name: "TPDB",
@@ -946,7 +982,12 @@ function ProvidersCard({ providers }: { providers: ProviderStatus | null }) {
             return (
               <div key={field}>
                 <label className="label" htmlFor={`provider-${id}`}>
-                  {name} {id === "tpdb" ? "API token" : "API key"}
+                  {name}{" "}
+                  {id === "tmdb"
+                    ? "API read access token"
+                    : id === "tpdb"
+                      ? "API token"
+                      : "API key"}
                   {id === "typesafe" ? " (optional)" : ""}
                 </label>
                 <div className="flex flex-wrap items-center gap-2">

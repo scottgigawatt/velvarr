@@ -1,3 +1,4 @@
+import { whisparrTarget } from "./whisparr-targets.ts";
 // Jellyfin integration. Every user-visible query (libraries, items, images,
 // playback info) runs under the caller's own Jellyfin user token; the
 // integration API key is used only for the administrator user inventory.
@@ -981,6 +982,7 @@ export async function getUserImage(
  * ({provider, kind, id}) is valid as-is; the remaining fields are optional
  * enrichment from the acquisition record. */
 type PlaybackHints = {
+  targetInstanceId?: string;
   provider: CatalogProvider;
   kind: MediaKind;
   /** External provider UUID (TPDB movie/scene id, StashDB scene id). */
@@ -1032,6 +1034,11 @@ function providerIdMatches(
   candidate: CandidateItem,
   hints: PlaybackHints,
 ): boolean {
+  if (hints.provider === "tmdb") {
+    return Object.entries(candidate.dto.ProviderIds ?? {}).some(
+      ([key, value]) => key.toLowerCase() === "tmdb" && value === hints.id,
+    );
+  }
   if (candidate.providerValues.includes(hints.id.trim().toLowerCase())) {
     return true;
   }
@@ -1519,9 +1526,16 @@ async function resolveFromSweep(
     sweepAt = at;
     const pool = await items;
     const candidates = pool.items;
-    const mapped = hints.whisparrPath
-      ? mappedPrefix(hints.whisparrPath, config.whisparr?.pathMappings)
-      : undefined;
+    const target = whisparrTarget(
+      config,
+      { provider: hints.provider, kind: hints.kind, id: hints.id },
+      hints.targetInstanceId,
+    );
+    // A retired destination supplies no current path mapping; exact provider IDs can still prove playback.
+    const mapped =
+      hints.whisparrPath && (config.whisparrInstances === undefined || target)
+        ? mappedPrefix(hints.whisparrPath, target?.pathMappings)
+        : undefined;
     const exact = candidates.filter(
       (c) =>
         providerIdMatches(c, hints) ||

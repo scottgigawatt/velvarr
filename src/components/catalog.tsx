@@ -191,7 +191,9 @@ function SortSelect({
   disabled,
   onSort,
   onDirection,
+  options,
 }: {
+  options?: readonly SortKey[];
   id: string;
   type: "all" | "movie" | "scene";
   sort: string;
@@ -202,7 +204,7 @@ function SortSelect({
   onSort: (v: string) => void;
   onDirection: (v: "asc" | "desc") => void;
 }) {
-  const sorts = browseSortsFor(type);
+  const sorts = options ?? browseSortsFor(type);
   if (sorts.length === 0) return null;
   return (
     <div>
@@ -575,7 +577,7 @@ function PerformerPicker({
                 type="button"
                 className="cat-picker-row"
                 onClick={() => {
-                  seedPerformerPick(side, performer);
+                  seedPerformerPick(side as "tpdb" | "stashdb", performer);
                   onPick(side, performer.reference.id, performer.title);
                   setTerm("");
                 }}
@@ -668,6 +670,8 @@ function parseTags(v: string | null): CatalogTagSelection[] {
  * dateOperation. The caller appends `&page=${n}`: pages are component
  * state under endless scroll. An outage is an error, never an empty page. */
 function browsePath(f: {
+  movieSource?: "tpdb" | "tmdb";
+  adultOnly?: boolean;
   type: "all" | "movie" | "scene";
   q: string;
   include: CatalogTagSelection[];
@@ -705,6 +709,9 @@ function browsePath(f: {
     qs.set("sort", f.sort);
     if (f.direction) qs.set("direction", f.direction);
   }
+  if (f.movieSource === "tmdb" && f.type === "movie")
+    qs.set("movieSource", "tmdb");
+  if (f.adultOnly && f.type === "movie") qs.set("adultOnly", "1");
   qs.set("perPage", String(f.perPage));
   return `/api/browse?${qs.toString()}`;
 }
@@ -751,9 +758,10 @@ export function useBrowseTo(): (filter: BrowseFilter) => void {
         // facet of its own (chips carry the labels).
         name: null,
         type:
-          filter.param === "year" || filter.provider === "tpdb"
+          filter.param === "year" || filter.provider !== "stashdb"
             ? "movie"
             : "scene",
+        movieSource: filter.provider === "tmdb" ? "tmdb" : null,
         provider: null,
         moviePage: null,
         scenePage: null,
@@ -808,6 +816,8 @@ export function TitlesView() {
   const typeRaw = params.get("type");
   // Anything that is not movie/scene reads as the `all` default.
   const type = typeRaw === "movie" || typeRaw === "scene" ? typeRaw : "all";
+  const movieSource = params.get("movieSource") === "tmdb" ? "tmdb" : "tpdb";
+  const adultOnly = params.get("adultOnly") === "1";
   const q = params.get("q") ?? "";
   const include = parseTags(params.get("include"));
   const exclude = parseTags(params.get("exclude"));
@@ -828,7 +838,12 @@ export function TitlesView() {
   // default — visible in the select, never sent upstream for a 400. A
   // direction rides only on sorts that take one: a stale direction next to
   // TPDB relevance would 400 the search.
-  const sorts = browseSortsFor(type);
+  const sorts =
+    movieSource === "tmdb" && type === "movie"
+      ? q
+        ? (["relevance"] as const)
+        : (["recency"] as const)
+      : browseSortsFor(type);
   const sortRaw = params.get("sort") ?? "";
   const sort = (sorts as readonly string[]).includes(sortRaw) ? sortRaw : "";
   const dirRaw = params.get("direction") ?? "";
@@ -892,6 +907,8 @@ export function TitlesView() {
     () =>
       browsePath({
         type,
+        movieSource,
+        adultOnly,
         q,
         include,
         exclude,
@@ -910,6 +927,8 @@ export function TitlesView() {
       }),
     [
       type,
+      movieSource,
+      adultOnly,
       q,
       include,
       exclude,
@@ -1021,9 +1040,15 @@ export function TitlesView() {
       // switch. One clamp: a TPDB performer filmography only composes on
       // the Scenes tab, so moving off it drops the filters that route
       // refuses (typePatch's tpdbPerformer branch).
-      setP(typePatch(t, sortRaw, dirRaw, performerTpdb !== ""), {
-        push: true,
-      });
+      setP(
+        {
+          ...typePatch(t, sortRaw, dirRaw, performerTpdb !== ""),
+          ...(t !== "movie" ? { movieSource: null, adultOnly: null } : {}),
+        },
+        {
+          push: true,
+        },
+      );
     },
     [setP, sortRaw, dirRaw, performerTpdb],
   );
@@ -1144,34 +1169,39 @@ export function TitlesView() {
 
   // An active studio/tag id without a captured name stays an id — never a
   // fake label (see filterName).
-  const filterCount = countActiveFilters({
-    q,
-    year,
-    date,
-    performerTpdb,
-    performerStashdb,
-    performerStarred,
-    studioTpdb,
-    studioStashdb,
-    studioMode,
-    sort,
-    include,
-    exclude,
-  });
+  const filterCount =
+    countActiveFilters({
+      q,
+      year,
+      date,
+      performerTpdb,
+      performerStashdb,
+      performerStarred,
+      studioTpdb,
+      studioStashdb,
+      studioMode,
+      sort,
+      include,
+      exclude,
+    }) +
+    (type === "movie" && movieSource === "tmdb" ? 1 : 0) +
+    (type === "movie" && adultOnly ? 1 : 0);
 
   // `name` is display-only (never queried) — a forged label can misname the
   // heading but never change results.
   const heading = params.get("name") || "Titles";
   const typeSummary =
     type === "movie"
-      ? "TPDB movies"
+      ? movieSource === "tmdb"
+        ? "TMDB movies"
+        : "TPDB movies"
       : type === "scene"
         ? "StashDB scenes"
         : "TPDB movies and StashDB scenes";
 
   const notConfigured =
-    type === "movie" && providers?.tpdb === "not_configured"
-      ? "tpdb"
+    type === "movie" && providers?.[movieSource] === "not_configured"
+      ? movieSource
       : type === "scene" && providers?.stashdb === "not_configured"
         ? "stashdb"
         : null;
@@ -1180,6 +1210,27 @@ export function TitlesView() {
   const retry = () => setReload((n) => n + 1);
 
   const chips: ReactNode[] = [];
+  if (type === "movie" && movieSource === "tmdb")
+    chips.push(
+      <FilterChip
+        key="source"
+        label="TMDB movies"
+        onRemove={() =>
+          setP(
+            { movieSource: null, adultOnly: null, sort: null, direction: null },
+            { push: true },
+          )
+        }
+      />,
+    );
+  if (type === "movie" && adultOnly)
+    chips.push(
+      <FilterChip
+        key="adult"
+        label="Adult-flagged only"
+        onRemove={() => setP({ adultOnly: null }, { push: true })}
+      />,
+    );
   if (q) {
     chips.push(
       <FilterChip key="q" label={`“${q}”`} onRemove={() => onQ("")} />,
@@ -1341,6 +1392,7 @@ export function TitlesView() {
             {/* TPDB filmography refuses search and order only where the
                 TPDB side runs; the Scenes tab runs her StashDB side. */}
             <SortSelect
+              options={sorts}
               id="titles-sort"
               type={type}
               sort={sort}
@@ -1465,6 +1517,53 @@ export function TitlesView() {
         count={filterCount}
         onClear={clearFilters}
       >
+        {type === "movie" && (
+          <div className="mb-4 space-y-3">
+            <label className="label" htmlFor="movie-source">
+              Movie metadata
+            </label>
+            <select
+              id="movie-source"
+              className="input"
+              value={movieSource}
+              onChange={(e) =>
+                setP(
+                  {
+                    ...clearBrowseKeys(["type", "perPage"]),
+                    movieSource: e.target.value,
+                  },
+                  { push: true },
+                )
+              }
+            >
+              <option value="tpdb">TPDB</option>
+              <option value="tmdb">TMDB</option>
+            </select>
+            {movieSource === "tmdb" && (
+              <label className="flex items-center gap-2 text-sm">
+                <input
+                  type="checkbox"
+                  className="check"
+                  checked={adultOnly}
+                  onChange={(e) =>
+                    setP(
+                      { adultOnly: e.target.checked ? "1" : null },
+                      { push: true },
+                    )
+                  }
+                />
+                Adult-flagged only
+              </label>
+            )}
+            {movieSource === "tmdb" && (
+              <p className="text-sm text-muted">
+                Full movie catalog by default, including adult titles.
+                Adult-only uses TMDB’s classification and can omit misclassified
+                movies.
+              </p>
+            )}
+          </div>
+        )}
         <SearchBox
           id="titles-q"
           label="Title search"
@@ -1472,49 +1571,55 @@ export function TitlesView() {
           onCommit={onQ}
           disabled={performerTpdb !== "" && type !== "scene"}
         />
-        <TagPicker
-          id="titles-include"
-          label="Include tags"
-          selected={include}
-          onChange={onInclude}
-          allowFreeText
-          description="Titles must carry every selected tag (AND): a provider tag matches exactly, and a typed term keeps titles carrying any tag whose name contains it (case and separators ignored)."
-        />
-        <TagPicker
-          id="titles-exclude"
-          label="Exclude tags"
-          selected={exclude}
-          onChange={onExclude}
-          allowFreeText
-          description="Titles carrying any of these tags are left out — exclusions win over includes, and a tag also covers the ones that contain it as a word (Anal drops Anal Creampie, never Analingus)."
-        />
-        <PerformerPicker
-          id="titles-performer"
-          starred={performerStarred}
-          onStarred={onStarred}
-          onPick={(side, performerId) =>
-            side === "tpdb"
-              ? onPerformerTpdb(performerId)
-              : onPerformerStashdb(performerId)
-          }
-        />
+        {movieSource !== "tmdb" && (
+          <>
+            <TagPicker
+              id="titles-include"
+              label="Include tags"
+              selected={include}
+              onChange={onInclude}
+              allowFreeText
+              description="Titles must carry every selected tag (AND): a provider tag matches exactly, and a typed term keeps titles carrying any tag whose name contains it (case and separators ignored)."
+            />
+            <TagPicker
+              id="titles-exclude"
+              label="Exclude tags"
+              selected={exclude}
+              onChange={onExclude}
+              allowFreeText
+              description="Titles carrying any of these tags are left out — exclusions win over includes, and a tag also covers the ones that contain it as a word (Anal drops Anal Creampie, never Analingus)."
+            />
+            <PerformerPicker
+              id="titles-performer"
+              starred={performerStarred}
+              onStarred={onStarred}
+              onPick={(side, performerId) =>
+                side === "tpdb"
+                  ? onPerformerTpdb(performerId)
+                  : onPerformerStashdb(performerId)
+              }
+            />
+          </>
+        )}
         <YearBox
           id="titles-year"
           value={year}
           onCommit={onYear}
           disabled={performerTpdb !== "" && type !== "scene"}
         />
-        <DateCutoff
-          id="titles-date"
-          date={date}
-          operation={dateOperation}
-          disabled={performerTpdb !== "" && type !== "scene"}
-          onCommit={onDate}
-        />
+        {movieSource !== "tmdb" && (
+          <DateCutoff
+            id="titles-date"
+            date={date}
+            operation={dateOperation}
+            disabled={performerTpdb !== "" && type !== "scene"}
+            onCommit={onDate}
+          />
+        )}
         {/* Year and the date cutoff are TPDB-movie criteria; while either is
             set only TPDB qualifies, and the note says so — never silently
             ignored. */}
-        {(year !== "" || date !== "") && (
+        {movieSource !== "tmdb" && (year !== "" || date !== "") && (
           <p className="cat-note">
             Year and release date apply to TPDB movies — while set, StashDB
             scenes are left out.

@@ -66,6 +66,7 @@ bun run dev     # http://127.0.0.1:6699
 | `VELVARR_ALLOW_HTTP`         | no               | `1` allows plain HTTP for private/Docker-network addresses on the LAN.               |
 | `VELVARR_DISCORD_WEBHOOK_URL`| no               | Private Discord webhook for notifications; https only.                               |
 | `VELVARR_DISCORD_DETAIL`     | no               | `1` includes titles in notifications; off by default, messages stay identity-only.   |
+| `TMDB_READ_TOKEN` | no | Optional TMDB API read access token for movie metadata; a stored token takes precedence. |
 | `TYPESAFE_API_KEY`           | no               | TypeSafe key for AI-assisted matching when TypeSafe is selected; a stored key takes precedence. |
 | `VELVARR_JUDGMENT_PROVIDER` | no | `typesafe` (default) or `ollama`; stored AI-assisted matching settings take precedence. |
 | `OLLAMA_BASE_URL` | no | Ollama API root; default `http://localhost:11434`. |
@@ -88,6 +89,25 @@ For Velvarr running natively on the same machine, use `http://localhost:11434`. 
 Alternatively, set `VELVARR_JUDGMENT_PROVIDER=ollama`, `OLLAMA_BASE_URL`, and `OLLAMA_MODEL` in the runtime environment. **Use environment settings** clears the stored selection, URL, and model. Existing TypeSafe deployments retain their behavior until Ollama is explicitly selected.
 
 The existing matching rules remain unchanged: AI can flag a possible title match for administrator review, never mark it available or grant playback. Local tag suggestions use bounded batches because decision models limit the number of choices; large tag lists can require multiple inference calls. Related-title ranking only reorders existing candidates. Models have different accuracy and latency, so test representative naming variants and mismatches before choosing one.
+
+## TMDB movies and multiple Whisparr connections
+
+TMDB is an optional movie source. Scenes still use StashDB. Add an **API read access token** from [TMDB account settings](https://www.themoviedb.org/settings/api) under **Settings → Metadata providers**, or set `TMDB_READ_TOKEN`. TMDB requires attribution and compliance with its [API terms](https://developer.themoviedb.org/docs/faq). The app's **Credits** dialog includes its official logo and required notice.
+
+In **Titles → Movies → Filters**, choose **TMDB**. Title searches use TMDB's paginated movie search with adult results included; without a title, browsing uses release recency. **Adult-flagged only** is optional and off by default because incorrectly classified titles would otherwise disappear. It filters bounded provider pages without fetching individual movie details. Sparse searches can ask you to narrow the title or year instead of pretending there are no results. TMDB supports title, year, and its adult classification here; TPDB's performer, studio, tag, and duration filters remain on TPDB. TMDB cast entries link to the source, and recommendations are provider-published. Velvarr does not merge TPDB and TMDB movies by title.
+
+Use **Settings → Connections → Whisparr connections → Configure connections** to assign a movie provider and separate movie/scene roots and quality profiles to each instance. For a two-instance layout:
+
+| Connection | Movie provider | Movie root inside Whisparr | Scene root inside Whisparr | Default for scenes |
+| --- | --- | --- | --- | --- |
+| Main | TPDB | `/data/movies` | `/data/scenes` | Yes |
+| Alternate | TMDB | `/data/movies` | `/data/scenes` | No |
+
+The two containers can use identical internal paths while mounting different host directories. Configure **path mappings separately on each connection**, using the paths Jellyfin actually reports, such as Main `/data/movies` → `/library/main-movies` and Alternate `/data/movies` → `/library/alternate-movies`. Map scenes separately too. Velvarr does not manage Whisparr's import or recycle directories.
+
+Movies route by metadata source. Scene requests use the default instance; staff can choose another scene destination while approving a pending request. Approval pins the destination. Changing assignments later affects new approvals; moving or removing a connection retains its history and does not replay its old work against a different endpoint. API keys stay encrypted and never appear in settings responses. **Check saved connection** lists the instance's roots and quality profile IDs; enabled delivery requires those values to exist on that instance.
+
+Existing single-instance configurations remain usable. When adopting the connection list, Main retains its existing connection identity, credentials, roots, path mappings, and approved work. Review its scene root before enabling scene delivery, since the original single-instance settings used one root for both kinds. Back up the data directory and keep its secret key before upgrading; the schema migration preserves history, claims, and observations, but an older image cannot open the new schema.
 
 ## Large Whisparr libraries
 

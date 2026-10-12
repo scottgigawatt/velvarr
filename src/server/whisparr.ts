@@ -1,3 +1,5 @@
+import { targetConfig, whisparrConnections } from "./whisparr-targets.ts";
+import { isCatalogId, type CatalogProvider } from "../lib/contracts.ts";
 // Whisparr integration. Reads (status, resolution, adoption, observation) are
 // always allowed. Writes are exclusively the delivery add path and are gated
 // on config.whisparr.delivery being present, enabled, and fully specified;
@@ -166,6 +168,11 @@ function requireMediaReference(ref: MediaReference): {
   if (!ref || !isDeliverableMedia(ref)) {
     throw new AppError(400, "invalid_reference", UNDELIVERABLE_REASON);
   }
+  if (ref.provider === "tmdb") {
+    if (!isCatalogId("tmdb", ref.id))
+      throw new AppError(400, "invalid_id", "Invalid TMDB movie ID.");
+    return { kind: ref.kind, id: ref.id };
+  }
   return { kind: ref.kind, id: canonicalProviderId(ref.id) };
 }
 
@@ -245,15 +252,34 @@ function progressOf(r: QueueRecordDto): AcquisitionProgress {
  * item routes to exactly one metadata source. */
 function identityOf(
   dto: MovieResourceDto,
-): { itemType: MediaKind; identity: string } | null {
+): { itemType: MediaKind; identity: string; provider: CatalogProvider } | null {
   const tpdbId = asString(dto.tpdbId);
   const foreignId = asString(dto.foreignId)?.toLowerCase() ?? "";
   let itemType: MediaKind;
   let identity: string;
+  let provider: CatalogProvider;
+  if (
+    /^[1-9][0-9]*$/.test(foreignId) ||
+    (Number.isSafeInteger(dto.tmdbId) &&
+      Number(dto.tmdbId) > 0 &&
+      !foreignId.startsWith("tpdbid:") &&
+      !tpdbId)
+  ) {
+    const tmdb = String(dto.tmdbId);
+    if (
+      !isCatalogId("tmdb", tmdb) ||
+      (foreignId && foreignId !== tmdb) ||
+      (dto.itemType && String(dto.itemType).toLowerCase() !== "movie")
+    )
+      return null;
+    return { itemType: "movie", identity: tmdb, provider: "tmdb" };
+  }
   if (tpdbId !== undefined || foreignId.startsWith("tpdbid:")) {
     itemType = "movie";
+    provider = "tpdb";
     identity = tpdbId ?? foreignId.slice("tpdbid:".length);
   } else {
+    provider = "stashdb";
     const stashId = asString(dto.stashId);
     if (stashId !== undefined) {
       itemType = "scene";
@@ -276,7 +302,7 @@ function identityOf(
   if ((declared === "movie" || declared === "scene") && declared !== itemType) {
     return null;
   }
-  return { itemType, identity };
+  return { itemType, identity, provider };
 }
 
 // --- resolution (lookup) ---
@@ -320,7 +346,7 @@ function matchesByPaths(
       ),
     );
     if (!matches) continue;
-    const provider = routed.itemType === "movie" ? "tpdb" : "stashdb";
+    const provider = routed.provider;
     const key = `${provider}:${routed.itemType}:${routed.identity.toLowerCase()}`;
     distinct.set(key, {
       provider,
@@ -328,6 +354,21 @@ function matchesByPaths(
       id: routed.identity,
     });
   }
+  return [...distinct.values()];
+}
+
+async function connectionPathMatches(
+  config: IntegrationConfig,
+  paths: string[],
+): Promise<MediaReference[]> {
+  const matches = await Promise.all(
+    whisparrConnections(config)
+      .filter((c) => c.url && c.apiKey)
+      .map(async (c) => matchesByPaths(await cachedMovieList(c), c, paths)),
+  );
+  const distinct = new Map(
+    matches.flat().map((r) => [`${r.provider}:${r.kind}:${r.id}`, r]),
+  );
   return [...distinct.values()];
 }
 
@@ -342,10 +383,8 @@ export async function findWhisparrItemByPath(
   jellyfinPaths: string[],
 ): Promise<MediaReference | null> {
   if (jellyfinPaths.length === 0) return null;
-  const whisparr = config?.whisparr;
-  if (!whisparr?.url || !whisparr.apiKey) return null;
-  const dtos = await cachedMovieList(whisparr);
-  const matches = matchesByPaths(dtos, whisparr, jellyfinPaths);
+  if (whisparrConnections(config).length === 0) return null;
+  const matches = await connectionPathMatches(config, jellyfinPaths);
   if (matches.length > 1) {
     throw new AppError(
       409,
@@ -358,10 +397,10 @@ export async function findWhisparrItemByPath(
 
 // --- movie-list cache for list enrichment ---
 
-// ponytail: in-memory, 30 s TTL, 4-server FIFO cap; a persisted index only
+// ponytail: in-memory, 30 s TTL, 8-server FIFO cap; a persisted index only
 // if one fetch per window still hurts.
 const MOVIE_LIST_TTL_MS = 30_000;
-const MOVIE_LIST_CACHE_MAX = 4;
+const MOVIE_LIST_CACHE_MAX = 8;
 const DEFAULT_MOVIE_LIST_LIMIT_MIB = 64;
 const MAX_MOVIE_LIST_LIMIT_MIB = 256;
 
@@ -457,10 +496,8 @@ async function cachedMovieList(
  * read overlaps Jellyfin instead of trailing it; a slow or down Whisparr is
  * bounded by the enrichment ceiling in jellyfin.ts, never by this call. */
 export function prefetchWhisparrMovieList(config: IntegrationConfig): void {
-  const whisparr = config?.whisparr;
-  if (!whisparr?.url || !whisparr.apiKey) return;
-  // Prefetch is best-effort; awaited enrichment still reports configuration and upstream errors.
-  void cachedMovieList(whisparr).catch(() => {});
+  for (const c of whisparrConnections(config))
+    if (c.url && c.apiKey) void cachedMovieList(c).catch(() => {});
 }
 
 /** One Whisparr sweep for a whole list of Jellyfin items: a single
@@ -474,15 +511,23 @@ export async function resolveIdentitiesByPath(
   config: IntegrationConfig,
   entries: { id: string; paths: string[] }[],
 ): Promise<Map<string, MediaReference>> {
-  const whisparr = config?.whisparr;
-  if (!whisparr?.url || !whisparr.apiKey) return new Map();
   const usable = entries.filter((e) => e.paths.length > 0);
-  if (usable.length === 0) return new Map();
-  const dtos = await cachedMovieList(whisparr);
   const resolved = new Map<string, MediaReference>();
+  if (usable.length === 0) return resolved;
+  const sources = await Promise.all(
+    whisparrConnections(config).map(async (connection) => ({
+      connection,
+      dtos: await cachedMovieList(connection),
+    })),
+  );
   for (const entry of usable) {
-    const matches = matchesByPaths(dtos, whisparr, entry.paths);
-    if (matches.length === 1) resolved.set(entry.id, matches[0]!);
+    const matches = sources.flatMap((s) =>
+      matchesByPaths(s.dtos, s.connection, entry.paths),
+    );
+    const distinct = new Map(
+      matches.map((r) => [`${r.provider}:${r.kind}:${r.id}`, r]),
+    );
+    if (distinct.size === 1) resolved.set(entry.id, [...distinct.values()][0]!);
   }
   return resolved;
 }
@@ -493,12 +538,14 @@ function assertResolved(
   dtos: MovieResourceDto[],
   kind: MediaKind,
   id: string,
+  provider: CatalogProvider,
 ): MovieResourceDto {
   const matches = dtos.filter((dto) => {
     const routed = identityOf(dto);
     return (
       routed !== null &&
       routed.itemType === kind &&
+      routed.provider === provider &&
       routed.identity.toLowerCase() === id
     );
   });
@@ -520,13 +567,16 @@ export async function resolveWhisparrItem(
   config: IntegrationConfig,
   ref: MediaReference,
 ): Promise<WhisparrResolved> {
+  config = targetConfig(config, ref);
   const whisparr = requireWhisparr(config);
   const { kind, id } = requireMediaReference(ref);
   const dto =
     kind === "movie"
       ? await requestJson<unknown>(
           whisparr.url,
-          `/api/v3/movie/lookup/tpdb?tpdbId=${encodeURIComponent(id)}`,
+          ref.provider === "tmdb"
+            ? `/api/v3/movie/lookup/tmdb?tmdbId=${id}`
+            : `/api/v3/movie/lookup/tpdb?tpdbId=${encodeURIComponent(id)}`,
           whisparr.apiKey,
           { service: "whisparr" },
         )
@@ -536,7 +586,7 @@ export async function resolveWhisparrItem(
           whisparr.apiKey,
           { service: "whisparr" },
         );
-  const match = assertResolved(asMovieResources(dto), kind, id);
+  const match = assertResolved(asMovieResources(dto), kind, id, ref.provider);
   const title = asString(match.title)?.trim();
   if (!title) {
     throw new AppError(
@@ -560,7 +610,7 @@ export async function resolveWhisparrItem(
 interface WhisparrMoviePayload {
   title: string;
   foreignId: string;
-  tmdbId: 0;
+  tmdbId: number;
   tpdbId?: string;
   rootFolderPath: string;
   qualityProfileId: number;
@@ -577,7 +627,7 @@ export function buildMoviePayload(
   title: string,
   delivery: WhisparrDeliveryTarget,
 ): WhisparrMoviePayload {
-  const { kind, id } = requireMediaReference(ref);
+  const { id } = requireMediaReference(ref);
   const cleanTitle =
     typeof title === "string" ? title.trim().slice(0, 300) : "";
   if (!cleanTitle) {
@@ -585,9 +635,9 @@ export function buildMoviePayload(
   }
   return {
     title: cleanTitle,
-    foreignId: kind === "movie" ? `tpdbId:${id}` : id,
-    tmdbId: 0,
-    ...(kind === "movie" ? { tpdbId: id } : {}),
+    foreignId: ref.provider === "tpdb" ? `tpdbId:${id}` : id,
+    tmdbId: ref.provider === "tmdb" ? Number(id) : 0,
+    ...(ref.provider === "tpdb" ? { tpdbId: id } : {}),
     rootFolderPath: delivery.rootFolderPath,
     qualityProfileId: delivery.qualityProfileId,
     monitored: true,
@@ -638,7 +688,10 @@ function mapStoredItem(dto: MovieResourceDto): WhisparrItem {
   return {
     whisparrId: id as number,
     itemType: routed.itemType,
-    identity: canonicalProviderId(routed.identity),
+    identity:
+      routed.provider === "tmdb"
+        ? routed.identity
+        : canonicalProviderId(routed.identity),
     title: asString(dto.title)?.trim(),
     monitored: dto.monitored === true,
     path,
@@ -653,9 +706,15 @@ export async function findWhisparrItem(
   config: IntegrationConfig,
   ref: MediaReference,
 ): Promise<WhisparrItem | null> {
+  config = targetConfig(config, ref);
   const whisparr = requireWhisparr(config);
   const { kind, id } = requireMediaReference(ref);
-  const field = kind === "movie" ? "tpdbId" : "stashId";
+  const field =
+    ref.provider === "tmdb"
+      ? "tmdbId"
+      : ref.provider === "tpdb"
+        ? "tpdbId"
+        : "stashId";
   const rows = await requestJson<unknown>(
     whisparr.url,
     `/api/v3/movie?${field}=${encodeURIComponent(id)}`,
@@ -674,6 +733,7 @@ export async function findWhisparrItem(
     return (
       routed !== null &&
       routed.itemType === kind &&
+      routed.provider === ref.provider &&
       routed.identity.toLowerCase() === id
     );
   });
@@ -714,6 +774,7 @@ export async function observeWhisparrItem(
   config: IntegrationConfig,
   ref: MediaReference,
 ): Promise<WhisparrObservation> {
+  config = targetConfig(config, ref);
   const item = await findWhisparrItem(config, ref);
   if (item === null) return { found: false };
   if (item.hasFile) return { found: true, state: "imported", item };
@@ -780,6 +841,7 @@ export async function deliverToWhisparr(
   config: IntegrationConfig,
   ref: MediaReference,
 ): Promise<WhisparrDeliveryResult> {
+  config = targetConfig(config, ref);
   const whisparr = requireWhisparr(config);
   const { id } = requireMediaReference(ref);
   // Explicit blocked condition — throws AppError delivery_disabled.
@@ -843,7 +905,10 @@ export async function deliverToWhisparr(
   if (
     routed !== null &&
     routed.itemType === ref.kind &&
-    canonicalProviderId(routed.identity) === id &&
+    routed.provider === ref.provider &&
+    (routed.provider === "tmdb"
+      ? routed.identity
+      : canonicalProviderId(routed.identity)) === id &&
     Number.isInteger(echoedId) &&
     (echoedId as number) > 0
   ) {

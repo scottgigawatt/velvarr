@@ -1,3 +1,4 @@
+import { searchTmdb, detailTmdb, type TmdbQuery } from "./tmdb.ts";
 // Metadata provider catalog reads: TPDB (movies, scenes, performers) and
 // StashDB (scenes, performers). Strictly read-only; returns validated
 // CatalogDetail records and paged search results. No provider payload or
@@ -141,7 +142,8 @@ function recordTagPair(id: string, numeric: number): void {
 }
 
 function isCacheable(service: Service, method: string, body: unknown): boolean {
-  if (service !== "tpdb" && service !== "stashdb") return false;
+  if (service !== "tpdb" && service !== "stashdb" && service !== "tmdb")
+    return false;
   if (method === "GET") return true;
   // StashDB GraphQL reads arrive as POSTs; never cache a mutation. The
   // substring check can only over-reject (a read whose variables mention
@@ -192,7 +194,9 @@ export async function requestJson<T>(
   const ttl = options.cacheTtlMs ?? META_CACHE_TTL_MS;
   // ttl only governs fresh-hit refresh; 0 means "always revalidate", and the
   // stale-on-error fallback still applies.
-  const cacheable = isCacheable(service, method, options.body);
+  const cacheable =
+    isCacheable(service, method, options.body) &&
+    !(service === "tmdb" && path === "/3/authentication");
   const key = cacheable
     ? `${service} ${method} ${baseUrl}${path} ${tokenTag(token)} ${JSON.stringify(options.body ?? null)}`
     : "";
@@ -242,6 +246,29 @@ function credential(provider: "tpdb" | "stashdb"): string | undefined {
       ? (stored?.tpdbApiToken ?? process.env.TPDB_API_TOKEN)
       : (stored?.stashdbApiKey ?? process.env.STASHDB_API_KEY);
   return typeof value === "string" && value.trim() !== "" ? value : undefined;
+}
+
+export function tmdbConfigured(): boolean {
+  return Boolean(
+    getConfig()?.providers?.tmdbReadToken ?? process.env.TMDB_READ_TOKEN,
+  );
+}
+
+export function tmdbGet<T>(path: string): Promise<T> {
+  const token =
+    getConfig()?.providers?.tmdbReadToken ?? process.env.TMDB_READ_TOKEN;
+  if (!token)
+    throw new AppError(
+      503,
+      "provider_not_configured",
+      "TMDB API read token is not configured.",
+    );
+  return requestJson<T>(
+    process.env.TMDB_BASE_URL || "https://api.themoviedb.org",
+    path,
+    token,
+    { service: "tmdb" },
+  );
 }
 
 function tpdbGet<T>(path: string): Promise<T> {
@@ -413,9 +440,9 @@ export async function fetchProviderArtwork(
 // --- public interface ---
 
 export type ProviderVerification =
-  | { provider: "tpdb" | "stashdb"; configured: false }
+  | { provider: CatalogProvider; configured: false }
   | {
-      provider: "tpdb" | "stashdb";
+      provider: CatalogProvider;
       configured: true;
       verified: true;
       account: string;
@@ -425,9 +452,24 @@ export type ProviderVerification =
  * Not-configured is returned, never faked; outages and auth failures throw
  * AppError so callers never confuse them with an empty catalog. */
 export async function getProviderStatus(
-  provider: "tpdb" | "stashdb",
+  provider: CatalogProvider,
 ): Promise<ProviderVerification> {
   try {
+    if (provider === "tmdb") {
+      const result = await tmdbGet<{ success?: boolean }>("/3/authentication");
+      if (result.success !== true)
+        throw new AppError(
+          502,
+          "upstream_bad_response",
+          "TMDB token verification failed.",
+        );
+      return {
+        provider,
+        configured: true,
+        verified: true,
+        account: "API read token",
+      };
+    }
     if (provider === "tpdb") {
       const res = await tpdbGet<{ data?: { name?: unknown } }>("/user");
       const name = cleanString(res?.data?.name, 120);
@@ -506,6 +548,25 @@ export function resolveSort(
     );
   }
   const spec = sortSpec(provider, kind, sort);
+  if (provider === "tmdb") {
+    if (
+      !spec ||
+      kind !== "movie" ||
+      (sort === "relevance" && direction !== undefined)
+    )
+      throw new AppError(
+        400,
+        "invalid_search",
+        "Unsupported TMDB movie order.",
+      );
+    return sort === "relevance"
+      ? { key: sort, upstream: "relevance" }
+      : {
+          key: sort,
+          direction: direction ?? "desc",
+          upstream: `primary_release_date.${direction ?? "desc"}`,
+        };
+  }
   if (provider === "tpdb") {
     if (spec === undefined) {
       throw new AppError(
@@ -579,6 +640,7 @@ const STASHDB_SCENE_ORDER: Partial<Record<CatalogSortKey, string>> = {
  * resolveSort to each provider's real orders — unsupported combinations
  * throw. Studio and performer searches take no filters. */
 export type CatalogSearchQuery =
+  | TmdbQuery
   | {
       provider: "tpdb";
       kind: "movie";
@@ -740,7 +802,7 @@ function shiftIsoDate(date: string, days: number): string {
 }
 
 export interface CatalogSearchPage {
-  provider: "tpdb" | "stashdb";
+  provider: CatalogProvider;
   kind: "movie" | "scene" | "performer" | "studio";
   page: number;
   perPage: number;
@@ -985,6 +1047,7 @@ function tpdbQuery(base: Record<string, string | number | undefined>): string {
 export async function searchCatalog(
   query: CatalogSearchQuery,
 ): Promise<CatalogSearchPage> {
+  if (query.provider === "tmdb") return searchTmdb(tmdbGet, query);
   // StashDB performer and studio searches are the genuinely unpaged shapes:
   // searchPerformers/searchStudio take no page arguments and cap rows. They
   // are dispatched before the paging defaults so every remaining query
@@ -1384,6 +1447,7 @@ export async function searchCatalog(
 export async function getCatalogDetail(
   reference: CatalogReference,
 ): Promise<CatalogDetail | null> {
+  if (reference?.provider === "tmdb") return detailTmdb(tmdbGet, reference);
   const provider = reference?.provider;
   const kind = reference?.kind;
   const id = reference?.id;
@@ -1513,6 +1577,12 @@ export async function searchCatalogTags(
   provider: CatalogProvider,
   term: string,
 ): Promise<{ id: string; name: string }[]> {
+  if (provider === "tmdb")
+    throw new AppError(
+      400,
+      "unsupported_catalog",
+      "TMDB genre browsing is not exposed as a tag catalog.",
+    );
   const q = cleanQueryTerm(term);
   if (q === undefined) {
     throw new AppError(
@@ -1565,6 +1635,12 @@ export async function searchCatalogTags(
 export async function listCatalogTags(
   provider: CatalogProvider,
 ): Promise<{ id: string; name: string }[]> {
+  if (provider === "tmdb")
+    throw new AppError(
+      400,
+      "unsupported_catalog",
+      "TMDB genre browsing is not exposed as a tag catalog.",
+    );
   if (provider === "tpdb") {
     const body = await tpdbGet<TpdbListBody>(
       `/tags${tpdbQuery({ per_page: MAX.tags })}`,
@@ -1800,6 +1876,7 @@ export async function tagCounterpart(
   from: CatalogProvider,
   name: string,
 ): Promise<TagReference | undefined> {
+  if (from === "tmdb") return undefined;
   const target = normalizeFacetName(name);
   if (target === "") return undefined; // an empty label identifies nothing
   const other: CatalogProvider = from === "tpdb" ? "stashdb" : "tpdb";

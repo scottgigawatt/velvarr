@@ -37,10 +37,12 @@ export function errorReason(e: unknown): string {
   return e instanceof AppError ? `${e.code}: ${reason}` : reason;
 }
 
-export type Service = "jellyfin" | "whisparr" | "tpdb" | "stashdb";
+export type Service = "jellyfin" | "whisparr" | "tpdb" | "stashdb" | "tmdb";
 
 function serviceName(service: Service): string {
   switch (service) {
+    case "tmdb":
+      return "TMDB";
     case "whisparr":
       return "Whisparr";
     case "tpdb":
@@ -175,13 +177,14 @@ async function send(
   const cleanToken = validateToken(token);
   const headers: Record<string, string> = { Accept: accept };
   if (service === "whisparr") headers["X-Api-Key"] = cleanToken;
-  else if (service === "tpdb" || service === "stashdb") {
+  else if (service === "tpdb" || service === "stashdb" || service === "tmdb") {
     // Metadata providers: Bearer for TPDB, ApiKey for StashDB. An empty
     // token means no credential header at all, which is how allowlisted
     // provider artwork is fetched. (Jellyfin's empty-token case below keeps
     // its own token-less AUTH_BASE semantics.)
     if (cleanToken !== "") {
-      if (service === "tpdb") headers.Authorization = `Bearer ${cleanToken}`;
+      if (service === "tpdb" || service === "tmdb")
+        headers.Authorization = `Bearer ${cleanToken}`;
       else headers.ApiKey = cleanToken;
     }
   } else {

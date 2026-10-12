@@ -20,7 +20,7 @@ import {
   useApiGet,
   useParamsSetter,
 } from "./shared";
-import { isDeliverableMedia } from "../lib/contracts";
+import { isCatalogId, isDeliverableMedia } from "../lib/contracts";
 import type {
   CatalogDetail,
   CatalogDetailResponse,
@@ -91,10 +91,20 @@ function restoreScroll(key: string) {
 export function detailTarget(params: URLSearchParams): DetailTarget | null {
   const providerRaw = params.get("provider");
   const provider =
-    providerRaw === "tpdb" || providerRaw === "stashdb" ? providerRaw : null;
+    providerRaw === "tpdb" ||
+    providerRaw === "stashdb" ||
+    providerRaw === "tmdb"
+      ? providerRaw
+      : null;
   const kind = kindStrict(params.get("kind"));
   const id = params.get("id");
-  if (!provider || !kind || !id) return null;
+  if (
+    !provider ||
+    !kind ||
+    !id ||
+    (provider === "tmdb" && (kind !== "movie" || !isCatalogId("tmdb", id)))
+  )
+    return null;
   return { provider, kind, id };
 }
 
@@ -772,7 +782,7 @@ export function RelatedTitles({
   const [reload, setReload] = useState(0);
   const { data, error, loading } = useApiGet<{
     items: CatalogDetail[];
-    ranking: "tags" | "jev";
+    ranking: "tags" | "jev" | "provider";
     canRank: boolean;
     canRefine?: boolean;
     errors: { provider: CatalogProvider; code: string; message: string }[];
@@ -793,7 +803,9 @@ export function RelatedTitles({
       <p className="cat-note">
         {data?.ranking === "jev"
           ? "AI reranked the same provider candidates by metadata similarity — it never adds titles."
-          : "Matched by shared provider tags; a title with no tags has no candidates."}
+          : data?.ranking === "provider"
+            ? "Recommendations published by TMDB; identities remain separate from TPDB movies."
+            : "Matched by shared provider tags; a title with no tags has no candidates."}
       </p>
       {error !== null ? (
         <p className="cat-note" role="alert">
@@ -824,7 +836,11 @@ export function RelatedTitles({
           </button>
         </p>
       ) : data.items.length === 0 ? (
-        <p className="cat-note">No shared tags — nothing similar yet.</p>
+        <p className="cat-note">
+          {target.provider === "tmdb"
+            ? "TMDB returned no recommendations for this movie."
+            : "No shared tags — nothing similar yet."}
+        </p>
       ) : (
         <div className="poster-grid mt-3">
           {data.items.map((it) =>

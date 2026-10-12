@@ -23,7 +23,11 @@ export function tagMatches(
   mode: "exact" | "family" | "substring",
 ): boolean {
   const nativeId =
-    detail.reference.provider === "tpdb" ? sel.tpdb : sel.stashdb;
+    detail.reference.provider === "tmdb"
+      ? undefined
+      : detail.reference.provider === "tpdb"
+        ? sel.tpdb
+        : sel.stashdb;
   if (nativeId !== undefined && detail.tags.some((t) => t.id === nativeId)) {
     return true;
   }

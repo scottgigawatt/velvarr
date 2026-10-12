@@ -103,19 +103,23 @@ function RequestCard({
   providers,
   onDecide,
   rowError,
+  sceneTargets,
 }: {
   record: RequestListItem;
   canApprove: boolean;
   canDecline: boolean;
   canCancel: boolean;
   busy: boolean;
+  sceneTargets: { id: string; name: string; default: boolean }[];
   providers: ProviderStatus | null;
   onDecide: (
     record: RequestRecord,
     decision: "approved" | "declined" | "cancelled",
+    sceneTargetId?: string,
   ) => void;
   rowError: { id: string; message: string } | null;
 }) {
+  const [sceneTargetId, setSceneTargetId] = useState("");
   const summary = useCatalogSummary(r.media, providers);
   const acquisition = r.acquisition ?? null;
   const phase = acquisition ? acquisitionPhase(acquisition) : null;
@@ -210,6 +214,12 @@ function RequestCard({
             </dd>
           </>
         )}
+        {r.targetName && (
+          <>
+            <dt>Destination</dt>
+            <dd>{r.targetName}</dd>
+          </>
+        )}
         {acquisition && (
           <>
             <dt>Acquisition</dt>
@@ -218,12 +228,31 @@ function RequestCard({
         )}
       </dl>
       <div className="request-card-actions flex flex-wrap gap-2 sm:flex-col sm:items-end">
+        {canApprove && r.media.kind === "scene" && sceneTargets.length > 1 && (
+          <label className="label">
+            Scene destination
+            <select
+              className="input"
+              value={sceneTargetId}
+              disabled={busy}
+              onChange={(e) => setSceneTargetId(e.target.value)}
+            >
+              <option value="">Default connection</option>
+              {sceneTargets.map((t) => (
+                <option key={t.id} value={t.id}>
+                  {t.name}
+                  {t.default ? " (default)" : ""}
+                </option>
+              ))}
+            </select>
+          </label>
+        )}
         {canApprove && (
           <button
             type="button"
             className="btn btn-accent"
             disabled={busy}
-            onClick={() => onDecide(r, "approved")}
+            onClick={() => onDecide(r, "approved", sceneTargetId || undefined)}
           >
             Approve
           </button>
@@ -274,10 +303,10 @@ export function RequestsView() {
   const { account, providers } = useSession();
   const params = useSearchParams();
   const setP = useParamsSetter();
-  const { data, error, reload } = useApiGet<{ requests: Row[] }>(
-    "/api/requests",
-    [],
-  );
+  const { data, error, reload } = useApiGet<{
+    requests: Row[];
+    sceneTargets?: { id: string; name: string; default: boolean }[];
+  }>("/api/requests", []);
   const rows = data === null ? null : data.requests;
   const type = oneOf(params.get("type"), REQUEST_TYPES, "all");
   const status = oneOf(params.get("status"), REQUEST_STATUSES, "all");
@@ -323,6 +352,7 @@ export function RequestsView() {
     (
       record: RequestRecord,
       decision: "approved" | "declined" | "cancelled",
+      sceneTargetId?: string,
     ) => {
       if (busyRef.current) return; // belt for same-tick double clicks
       busyRef.current = true;
@@ -330,7 +360,10 @@ export function RequestsView() {
       setRowError(null);
       api<{ request: RequestRecord }>(`/api/requests/${record.id}`, {
         method: "PATCH",
-        body: JSON.stringify({ decision }),
+        body: JSON.stringify({
+          decision,
+          ...(sceneTargetId ? { sceneTargetId } : {}),
+        }),
       })
         .then(() => {
           setAnnouncement(`Request ${decision}.`);
@@ -428,6 +461,7 @@ export function RequestsView() {
                 const pending = r.decision === "pending";
                 return (
                   <RequestCard
+                    sceneTargets={data?.sceneTargets ?? []}
                     key={r.id}
                     record={r}
                     providers={providers}

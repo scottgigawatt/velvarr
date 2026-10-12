@@ -1,3 +1,5 @@
+import { isCatalogId } from "../lib/contracts.ts";
+import { whisparrConnections, whisparrTarget } from "./whisparr-targets.ts";
 import {
   createCipheriv,
   createDecipheriv,
@@ -40,7 +42,7 @@ import { DISCOVER_SHELVES, normalizeFacetName } from "../lib/contracts.ts";
 
 // Schema identity: application_id spells 'VLVR', user_version is the schema version.
 const APP_ID = 0x564c5652;
-const SCHEMA_VERSION = 11;
+const SCHEMA_VERSION = 12;
 // ponytail: fixed 7-day session TTL; make it an env knob only if an operator asks.
 const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const BUSY_TIMEOUT_MS = 5000;
@@ -51,7 +53,7 @@ const RECHECK_DELAY_MS = 60_000;
 // ponytail: fixed 10-minute staleness ceiling — ten missed 60s recheck passes
 // before a fact counts as aged; retune only alongside RECHECK_DELAY_MS.
 const STALE_OBSERVATION_MS = 10 * 60_000;
-const PROVIDERS: readonly CatalogProvider[] = ["tpdb", "stashdb"];
+const PROVIDERS: readonly CatalogProvider[] = ["tpdb", "stashdb", "tmdb"];
 const MEDIA_KINDS: readonly MediaKind[] = ["movie", "scene"];
 const CATALOG_KINDS: readonly CatalogKind[] = [
   "movie",
@@ -104,6 +106,7 @@ type RequestRow = {
   decision: string;
   created_at: number;
   decided_at: number | null;
+  target_instance_id: string | null;
 };
 type PerformerFollowRow = {
   id: string;
@@ -359,6 +362,74 @@ const MIGRATIONS: Record<number, string> = {
     DROP TABLE IF EXISTS removal_audit;
     DROP TABLE IF EXISTS removal_executions;
     DROP TABLE IF EXISTS removal_requests;
+  `,
+  12: `
+    -- Rebuild provider constraints without discarding claims, history, or observations.
+    CREATE TABLE catalog_identities_new (
+      id TEXT PRIMARY KEY,
+      provider TEXT NOT NULL CHECK (provider IN ('tpdb', 'stashdb', 'tmdb')),
+      kind TEXT NOT NULL CHECK (kind IN ('movie', 'scene', 'performer', 'studio')),
+      external_id TEXT NOT NULL,
+      title TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
+    INSERT INTO catalog_identities_new (id, provider, kind, external_id, title, created_at, updated_at) SELECT id, provider, kind, external_id, title, created_at, updated_at FROM catalog_identities;
+    DROP TABLE catalog_identities;
+    ALTER TABLE catalog_identities_new RENAME TO catalog_identities;
+    CREATE TABLE requests_new (
+      id TEXT PRIMARY KEY,
+      account_id TEXT NOT NULL REFERENCES accounts (id) ON DELETE CASCADE,
+      provider TEXT NOT NULL CHECK (provider IN ('tpdb', 'stashdb', 'tmdb')),
+      kind TEXT NOT NULL CHECK (kind IN ('movie', 'scene')),
+      external_id TEXT NOT NULL,
+      decision TEXT NOT NULL
+        CHECK (decision IN ('pending', 'approved', 'declined', 'cancelled')),
+      created_at INTEGER NOT NULL,
+      decided_at INTEGER
+    );
+    INSERT INTO requests_new (id, account_id, provider, kind, external_id, decision, created_at, decided_at) SELECT id, account_id, provider, kind, external_id, decision, created_at, decided_at FROM requests;
+    DROP TABLE requests;
+    ALTER TABLE requests_new RENAME TO requests;
+    CREATE TABLE acquisitions_new (
+      id TEXT PRIMARY KEY,
+      instance_id TEXT NOT NULL,
+      provider TEXT NOT NULL CHECK (provider IN ('tpdb', 'stashdb', 'tmdb')),
+      kind TEXT NOT NULL CHECK (kind IN ('movie', 'scene')),
+      external_id TEXT NOT NULL,
+      state TEXT NOT NULL CHECK (
+        state IN (
+          'unsent', 'submitting', 'uncertain', 'monitoring',
+          'downloading', 'imported', 'failed', 'blocked'
+        )
+      ),
+      claim_token TEXT,
+      attempt_token TEXT,
+      claimed_at INTEGER,
+      attempt_at INTEGER,
+      due_at INTEGER,
+      submitted_at INTEGER,
+      last_observed_at INTEGER,
+      last_error_at INTEGER,
+      last_error TEXT,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      whisparr_id INTEGER,
+      whisparr_path TEXT,
+      whisparr_title TEXT,
+      whisparr_monitored INTEGER,
+      whisparr_progress INTEGER,
+      whisparr_timeleft TEXT
+    );
+    INSERT INTO acquisitions_new (id, instance_id, provider, kind, external_id, state, claim_token, attempt_token, claimed_at, attempt_at, due_at, submitted_at, last_observed_at, last_error_at, last_error, created_at, updated_at, whisparr_id, whisparr_path, whisparr_title, whisparr_monitored, whisparr_progress, whisparr_timeleft) SELECT id, instance_id, provider, kind, external_id, state, claim_token, attempt_token, claimed_at, attempt_at, due_at, submitted_at, last_observed_at, last_error_at, last_error, created_at, updated_at, whisparr_id, whisparr_path, whisparr_title, whisparr_monitored, whisparr_progress, whisparr_timeleft FROM acquisitions;
+    DROP TABLE acquisitions;
+    ALTER TABLE acquisitions_new RENAME TO acquisitions;
+    CREATE UNIQUE INDEX catalog_identities_ref ON catalog_identities (provider, kind, external_id);
+    CREATE UNIQUE INDEX requests_active_intent ON requests (account_id, provider, kind, external_id) WHERE decision IN ('pending', 'approved');
+    CREATE UNIQUE INDEX acquisitions_identity ON acquisitions (instance_id, provider, kind, external_id);
+    CREATE INDEX acquisitions_due ON acquisitions (due_at);
+    ALTER TABLE requests ADD COLUMN target_instance_id TEXT;
+    CREATE INDEX requests_target ON requests (target_instance_id, provider, kind, external_id);
   `,
 };
 
@@ -734,7 +805,8 @@ function validCatalogRef(
     PROVIDERS.includes(r.provider) &&
     kinds.includes(r.kind) &&
     typeof r.id === "string" &&
-    UUID_RE.test(r.id)
+    isCatalogId(r.provider, r.id) &&
+    (r.provider !== "tmdb" || r.kind === "movie")
   );
 }
 
@@ -878,6 +950,44 @@ function assertConfigShape(config: IntegrationConfig): void {
       );
     }
   }
+  if (config.whisparrInstances !== undefined) {
+    const connections = config.whisparrInstances;
+    if (
+      !Array.isArray(connections) ||
+      connections.length > 8 ||
+      new Set(connections.map((c) => c.url)).size !== connections.length ||
+      connections.filter((c) => c.sceneDefault).length > 1 ||
+      (connections.some((c) => c.sceneDelivery) &&
+        connections.filter((c) => c.sceneDefault).length !== 1) ||
+      ["tpdb", "tmdb"].some(
+        (p) => connections.filter((c) => c.movieProvider === p).length > 1,
+      )
+    )
+      throw new AppError(
+        400,
+        "invalid_config",
+        "Whisparr connections need unique endpoints and one target per movie provider or scene default.",
+      );
+    for (const c of connections) {
+      if (
+        !c ||
+        !nonemptyString(c.name, 80) ||
+        !["tpdb", "tmdb", "none"].includes(c.movieProvider) ||
+        typeof c.sceneDefault !== "boolean"
+      )
+        throw new AppError(
+          400,
+          "invalid_config",
+          "Invalid Whisparr connection.",
+        );
+      assertConfigShape({ jellyfin: config.jellyfin, whisparr: c });
+      if (c.sceneDelivery)
+        assertConfigShape({
+          jellyfin: config.jellyfin,
+          whisparr: { ...c, delivery: c.sceneDelivery },
+        });
+    }
+  }
   if (config.providers !== undefined) {
     const p = config.providers;
     const credentialOk = (v: unknown, max: number) =>
@@ -889,6 +999,7 @@ function assertConfigShape(config: IntegrationConfig): void {
     if (
       typeof p !== "object" ||
       p === null ||
+      !credentialOk(p.tmdbReadToken, 2048) ||
       !credentialOk(p.tpdbApiToken, 1024) ||
       !credentialOk(p.stashdbApiKey, 512) ||
       (p.judgmentProvider !== undefined &&
@@ -919,6 +1030,21 @@ function resolveWhisparrIdentity(
   current: IntegrationConfig | null,
   next: IntegrationConfig,
 ): IntegrationConfig {
+  if (next.whisparrInstances !== undefined) {
+    const previous = whisparrConnections(current);
+    const whisparrInstances = next.whisparrInstances.map((c) => {
+      const old = previous.find((p) => p.url === c.url);
+      if (old?.instanceId && c.instanceId && old.instanceId !== c.instanceId)
+        throw new AppError(
+          409,
+          "instance_mismatch",
+          "Cannot change an existing connection identity.",
+        );
+      // A moved or newly added endpoint cannot borrow a retired connection's identity.
+      return { ...c, instanceId: old?.instanceId ?? randomUUID() };
+    });
+    return { ...next, whisparrInstances };
+  }
   if (!next.whisparr) return next;
   const cur = current?.whisparr;
   let instanceId = next.whisparr.instanceId;
@@ -962,6 +1088,58 @@ export function getConfig(): IntegrationConfig | null {
   return JSON.parse(decryptString(loadKey(), row.data)) as IntegrationConfig;
 }
 
+/** Pin upgraded approvals once, retaining existing work on its original connection. */
+function backfillTargets(
+  config: IntegrationConfig,
+  previous: IntegrationConfig | null,
+): void {
+  const now = Date.now();
+  for (const row of S().listAllRequests.all() as RequestRow[]) {
+    if (row.decision !== "approved") continue;
+    const media = rowToRequest(row).media;
+    const instanceId =
+      row.target_instance_id ??
+      (previous?.whisparrInstances === undefined
+        ? previous?.whisparr?.instanceId
+        : undefined);
+    if (instanceId)
+      open()
+        .prepare(
+          "UPDATE requests SET target_instance_id = ? WHERE id = ? AND target_instance_id IS NULL",
+        )
+        .run(instanceId, row.id);
+    const target = whisparrTarget(config, media, instanceId);
+    if (!target?.instanceId) continue;
+    open()
+      .prepare(
+        "UPDATE requests SET target_instance_id = ? WHERE id = ? AND target_instance_id IS NULL",
+      )
+      .run(target.instanceId, row.id);
+    const enabled = (
+      media.kind === "scene" ? target.sceneDelivery : target.delivery
+    )?.enabled;
+    const state = enabled ? "unsent" : "blocked";
+    S().insertAcquisition.run(
+      randomUUID(),
+      target.instanceId,
+      row.provider,
+      row.kind,
+      row.external_id,
+      state,
+      enabled ? now : null,
+      now,
+      now,
+    );
+    // Re-enable only this kind's blocked work, never a sibling root or retired endpoint.
+    if (enabled)
+      open()
+        .prepare(
+          "UPDATE acquisitions SET state = 'unsent', due_at = ?, updated_at = ? WHERE instance_id = ? AND kind = ? AND state = 'blocked' AND attempt_token IS NULL AND claim_token IS NULL AND submitted_at IS NULL",
+        )
+        .run(now, now, target.instanceId, media.kind);
+  }
+}
+
 export function saveConfig(config: IntegrationConfig): void {
   assertConfigShape(config);
   const d = open();
@@ -987,7 +1165,9 @@ export function saveConfig(config: IntegrationConfig): void {
     const resolved = resolveWhisparrIdentity(current, config);
     const whisparr = resolved.whisparr;
     const instanceId = whisparr?.instanceId;
-    if (whisparr && instanceId) {
+    if (resolved.whisparrInstances !== undefined) {
+      backfillTargets(resolved, current);
+    } else if (whisparr && instanceId) {
       const now = Date.now();
       if (
         whisparr.delivery?.enabled === true &&
@@ -1293,6 +1473,9 @@ function rowToRequest(row: RequestRow): RequestRecord {
     decision: row.decision as RequestDecision,
     createdAt: row.created_at,
     decidedAt: row.decided_at,
+    ...(row.target_instance_id
+      ? { targetInstanceId: row.target_instance_id }
+      : {}),
   };
 }
 
@@ -1378,6 +1561,10 @@ function isUniqueConflict(e: unknown, columns: readonly string[]): boolean {
 export function initializeStorage(): void {
   const d = open();
   const config = getConfig();
+  if (config?.whisparrInstances !== undefined) {
+    inTransaction(d, () => backfillTargets(config, config));
+    return;
+  }
   const whisparr = config?.whisparr;
   if (!config || !whisparr) return;
   if (!whisparr.instanceId) saveConfig(config);
@@ -1689,6 +1876,7 @@ export function getPerformerLink(
 }
 
 const PROVIDER_LABELS: Record<CatalogProvider, string> = {
+  tmdb: "TMDB",
   tpdb: "TPDB",
   stashdb: "StashDB",
 };
@@ -2064,7 +2252,23 @@ export function getRequest(id: string, viewer: Account): RequestRecord {
 /** Admission re-read for the delivery loop: an approved request only
  * dispatches while at least one requester account is still present and
  * enabled. One indexed query instead of a full history scan. */
-export function hasEligibleRequester(media: MediaReference): boolean {
+export function hasEligibleRequester(
+  media: MediaReference,
+  instanceId?: string,
+): boolean {
+  if (getConfig()?.whisparrInstances !== undefined) {
+    const result = open()
+      .prepare(
+        "SELECT EXISTS (SELECT 1 FROM requests r JOIN accounts a ON a.id = r.account_id AND a.enabled = 1 WHERE r.provider = ? AND r.kind = ? AND r.external_id = ? AND r.decision = 'approved' AND r.target_instance_id = ?) AS eligible",
+      )
+      .get(
+        media.provider,
+        media.kind,
+        media.id,
+        instanceId ?? whisparrTarget(getConfig(), media)?.instanceId ?? "",
+      ) as { eligible: number };
+    return result.eligible === 1;
+  }
   const row = S().hasEligibleRequester.get(
     media.provider,
     media.kind,
@@ -2079,6 +2283,7 @@ export function decideRequest(
   actor: Account,
   requestId: string,
   decision: "approved" | "declined",
+  sceneTargetId?: string,
 ): RequestRecord {
   const elevated = actor.role === "admin" || actor.role === "moderator";
   // The autoApprove grant is exactly permission to approve one's own request.
@@ -2108,10 +2313,51 @@ export function decideRequest(
         "the auto-approve grant only covers your own requests",
       );
     }
+    const config = getConfig();
+    if (
+      sceneTargetId !== undefined &&
+      (!elevated ||
+        row.kind !== "scene" ||
+        decision !== "approved" ||
+        !whisparrConnections(config).some(
+          (c) =>
+            c.instanceId === sceneTargetId && c.sceneDelivery !== undefined,
+        ))
+    )
+      throw new AppError(
+        400,
+        "invalid_target",
+        "Only staff approving a scene can select a configured scene destination.",
+      );
+    const target = whisparrTarget(
+      config,
+      rowToRequest(row).media,
+      sceneTargetId,
+    );
+    if (
+      decision === "approved" &&
+      (config?.whisparrInstances !== undefined || row.provider === "tmdb") &&
+      !target?.instanceId
+    )
+      throw new AppError(
+        409,
+        "target_not_configured",
+        "Configure a Whisparr destination before approving this request.",
+      );
     const now = Date.now();
+    if (decision === "approved" && target?.instanceId)
+      open()
+        .prepare("UPDATE requests SET target_instance_id = ? WHERE id = ?")
+        .run(target.instanceId, requestId);
     S().decideRequest.run(decision, now, requestId);
     if (decision === "approved") {
-      const whisparr = getConfig()?.whisparr;
+      const whisparr = target
+        ? {
+            ...target,
+            delivery:
+              row.kind === "scene" ? target.sceneDelivery : target.delivery,
+          }
+        : config?.whisparr;
       if (whisparr && !whisparr.instanceId) {
         // An approval that enqueues nothing is a silent no-op; refuse instead.
         // initializeStorage backfills this identity for upgraded installs.
@@ -2173,14 +2419,28 @@ export function cancelRequest(
     S().cancelOwnRequest.run(Date.now(), requestId);
     // Last-withdrawal suppression: only undispatched work, only when no
     // other active intent remains for this identity.
-    const instance = getConfig()?.whisparr?.instanceId;
+    const instance =
+      row.target_instance_id ?? getConfig()?.whisparr?.instanceId;
     if (instance !== undefined) {
-      const active = S().countActiveRequestsExcept.get(
-        row.provider,
-        row.kind,
-        row.external_id,
-        requestId,
-      ) as { n: number };
+      const active =
+        getConfig()?.whisparrInstances !== undefined
+          ? (open()
+              .prepare(
+                "SELECT COUNT(*) AS n FROM requests WHERE provider = ? AND kind = ? AND external_id = ? AND target_instance_id = ? AND decision IN ('pending', 'approved') AND id != ?",
+              )
+              .get(
+                row.provider,
+                row.kind,
+                row.external_id,
+                instance,
+                requestId,
+              ) as { n: number })
+          : (S().countActiveRequestsExcept.get(
+              row.provider,
+              row.kind,
+              row.external_id,
+              requestId,
+            ) as { n: number });
       if (active.n === 0) {
         const shared = S().getAcquisitionByIdentity.get(
           instance,
@@ -2202,7 +2462,7 @@ export function getAcquisitionByReference(
   instanceId?: string,
 ): AcquisitionRecord | null {
   assertMediaReference(media);
-  const instance = instanceId ?? getConfig()?.whisparr?.instanceId;
+  const instance = instanceId ?? whisparrTarget(getConfig(), media)?.instanceId;
   if (!instance) return null;
   const row = S().getAcquisitionByIdentity.get(
     instance,
@@ -2226,16 +2486,22 @@ export function listDueAcquisitions(
   now: number,
   limit = 20,
 ): AcquisitionRecord[] {
-  const instanceId = getConfig()?.whisparr?.instanceId;
-  if (!instanceId) return [];
-  return (
-    S().listDueAcquisitions.all(
-      instanceId,
-      ...SCHEDULABLE_STATES,
-      now,
-      limit,
-    ) as AcquisitionRow[]
-  ).map(rowToAcquisition);
+  const ids = whisparrConnections(getConfig()).flatMap((c) =>
+    c.instanceId ? [c.instanceId] : [],
+  );
+  return ids
+    .flatMap((instanceId) =>
+      (
+        S().listDueAcquisitions.all(
+          instanceId,
+          ...SCHEDULABLE_STATES,
+          now,
+          limit,
+        ) as AcquisitionRow[]
+      ).map(rowToAcquisition),
+    )
+    .sort((a, b) => (a.dueAt ?? 0) - (b.dueAt ?? 0) || a.id.localeCompare(b.id))
+    .slice(0, limit);
 }
 
 /** Transactionally claims one acquisition; concurrent claims lose with 409. */

@@ -262,7 +262,14 @@ export async function me(ctx: AuthContext): Promise<Response> {
   ]);
   return json({
     account: ctx.account,
-    providers: { tpdb, stashdb } satisfies ProviderStatus,
+    providers: {
+      tpdb,
+      stashdb,
+      tmdb:
+        ctx.config.providers?.tmdbReadToken || process.env.TMDB_READ_TOKEN
+          ? "not_verified"
+          : "not_configured",
+    } satisfies ProviderStatus,
   });
 }
 

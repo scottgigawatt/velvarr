@@ -648,37 +648,80 @@ function useUpdate(): UpdateInfo | null {
 }
 
 export function Credit() {
+  const credits = useRef<HTMLDialogElement>(null);
   const update = useUpdate();
   return (
-    <p className="credit">
-      {update && (
+    <>
+      <p className="credit">
+        {update && (
+          <a
+            className="chip chip-accent"
+            href={update.url}
+            target="_blank"
+            rel="noreferrer noopener"
+            aria-label={`Update available: version ${update.version}`}
+            title={`Velvarr v${update.version} is available`}
+          >
+            <Icon name="download" /> v{update.version}
+          </a>
+        )}
         <a
-          className="chip chip-accent"
-          href={update.url}
+          className="credit-name"
+          href="https://github.com/Skare69/velvarr"
           target="_blank"
           rel="noreferrer noopener"
-          aria-label={`Update available: version ${update.version}`}
-          title={`Velvarr v${update.version} is available`}
         >
-          <Icon name="download" /> v{update.version}
+          Velvarr
         </a>
-      )}
-      <a
-        className="credit-name"
-        href="https://github.com/Skare69/velvarr"
-        target="_blank"
-        rel="noreferrer noopener"
+        <a
+          href={`https://github.com/Skare69/velvarr/releases/tag/v${version}`}
+          target="_blank"
+          rel="noreferrer noopener"
+        >
+          v{version}
+        </a>
+        <button
+          type="button"
+          className="underline"
+          onClick={() => credits.current?.showModal()}
+        >
+          Credits
+        </button>
+      </p>
+      <dialog
+        ref={credits}
+        className="preferences-dialog"
+        aria-label="Metadata credits"
       >
-        Velvarr
-      </a>
-      <a
-        href={`https://github.com/Skare69/velvarr/releases/tag/v${version}`}
-        target="_blank"
-        rel="noreferrer noopener"
-      >
-        v{version}
-      </a>
-    </p>
+        <div className="dialog-heading">
+          <h2>Metadata credits</h2>
+          <button
+            type="button"
+            className="btn"
+            onClick={() => credits.current?.close()}
+          >
+            Close
+          </button>
+        </div>
+        <div className="p-5 space-y-4 text-sm">
+          <p>
+            Movie and scene metadata comes from TPDB and StashDB. Optional movie
+            metadata comes from TMDB.
+          </p>
+          <a
+            href="https://www.themoviedb.org"
+            target="_blank"
+            rel="noreferrer noopener"
+          >
+            <img src="/tmdb-logo.svg" alt="TMDB" width={137} height={18} />
+          </a>
+          <p>
+            This product uses the TMDB API but is not endorsed or certified by
+            TMDB.
+          </p>
+        </div>
+      </dialog>
+    </>
   );
 }
 
@@ -777,7 +820,7 @@ export function duration(seconds: number | undefined): string | null {
 }
 
 export function providerLabel(p: CatalogProvider): string {
-  return p === "tpdb" ? "TPDB" : "StashDB";
+  return { tpdb: "TPDB", stashdb: "StashDB", tmdb: "TMDB" }[p];
 }
 
 /** Which surface renders a reference's detail: a movie or scene detail lives

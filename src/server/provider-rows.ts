@@ -117,13 +117,15 @@ export function dedupeBy<T>(
 // fields (gammacdn, clips4sale, karups, adultempire, ...) are unbounded and
 // intentionally excluded, so emitted imageUrl values are always proxyable.
 const PROVIDER_IMAGE_HOSTS: Record<string, true> = {
+  "image.tmdb.org": true,
   "cdn.theporndb.net": true,
   "thumb.theporndb.net": true,
   "stashdb.org": true,
 };
 
 export type ImageUrlCheck =
-  { ok: true; service: "tpdb" | "stashdb" } | { ok: false; reason: string };
+  | { ok: true; service: "tpdb" | "stashdb" | "tmdb" }
+  | { ok: false; reason: string };
 
 /** Pure gate: is this URL a provider-hosted artwork source? Production hosts
  * must be https and on the allowlist above. Loopback plain http is accepted
@@ -156,7 +158,12 @@ export function isProviderImageUrl(url: string): ImageUrlCheck {
   }
   return {
     ok: true,
-    service: u.hostname.endsWith("theporndb.net") ? "tpdb" : "stashdb",
+    service:
+      u.hostname === "image.tmdb.org"
+        ? "tmdb"
+        : u.hostname.endsWith("theporndb.net")
+          ? "tpdb"
+          : "stashdb",
   };
 }
 

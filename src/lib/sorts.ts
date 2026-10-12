@@ -31,6 +31,12 @@ export interface SortSpec {
 export const SORT_CAPABILITIES: Readonly<
   Record<CatalogProvider, Partial<Record<CatalogKind, readonly SortSpec[]>>>
 > = {
+  tmdb: {
+    movie: [
+      { key: "relevance", directional: false },
+      { key: "recency", directional: true },
+    ],
+  },
   tpdb: {
     movie: [
       { key: "relevance", directional: false },
