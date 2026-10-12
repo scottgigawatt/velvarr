@@ -81,6 +81,7 @@ export function isPrivateHost(hostname: string): boolean {
   // (compose service names like "jellyfin"); resolvable-name classification
   // needs async DNS if this ever misfires.
   return (
+    h === "host.docker.internal" ||
     h.endsWith(".local") ||
     h.startsWith("fc") ||
     h.startsWith("fd") ||

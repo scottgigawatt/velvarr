@@ -23,7 +23,7 @@
 import { isHiddenTitle, tagMatches } from "./catalog-visibility.ts";
 
 import { AppError } from "./http.ts";
-import { suggestTags } from "./judgment.ts";
+import { judgmentConfigured, suggestTags } from "./judgment.ts";
 import {
   listCatalogTags,
   searchCatalog,
@@ -1113,8 +1113,8 @@ export async function searchBrowseTags(
   }
   if (tags.length === 0 && errors.length < providers.length) {
     try {
-      const key = getConfig()?.providers?.typesafeApiKey;
-      if (key !== undefined && key.trim() !== "") {
+      const settings = getConfig()?.providers;
+      if (judgmentConfigured(settings)) {
         const candidates: {
           id: string;
           name: string;
@@ -1130,7 +1130,7 @@ export async function searchBrowseTags(
             });
           }
         }
-        const suggestions = await suggestTags(q, candidates, key);
+        const suggestions = await suggestTags(q, candidates, settings);
         for (const suggestion of suggestions) {
           const candidate = candidates.find((c) => c.id === suggestion.id);
           if (candidate === undefined) continue;

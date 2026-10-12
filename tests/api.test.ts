@@ -2567,6 +2567,65 @@ test("provider credentials: stored config wins over environment, clear falls bac
   });
 });
 
+test("Ollama settings and model verification require admin admission and preserve integrations", async () => {
+  const baselineResponse = await call("GET", "/api/admin/integrations", {
+    cookie: owner,
+  });
+  const baseline = await baselineResponse.json();
+  const body = {
+    judgmentProvider: "ollama",
+    ollamaUrl: "http://localhost:11434",
+    ollamaModel: "nimble",
+  };
+  const denied = await call("PATCH", "/api/admin/integrations", {
+    cookie: member,
+    body,
+  });
+  assert.equal(denied.status, 403);
+  const checkDenied = await call("POST", "/api/admin/judgment/check", {
+    cookie: member,
+    body: {},
+  });
+  assert.equal(checkDenied.status, 403);
+  const foreignOrigin = await call("POST", "/api/admin/judgment/check", {
+    cookie: owner,
+    origin: "https://foreign.example",
+    body: {},
+  });
+  assert.equal(foreignOrigin.status, 403);
+
+  const saved = await call("PATCH", "/api/admin/integrations", {
+    cookie: owner,
+    body,
+  });
+  assert.equal(saved.status, 200);
+  const shape = await saved.json();
+  assert.equal(shape.judgment.provider, "ollama");
+  assert.equal(shape.judgment.configured, true);
+  assert.equal(shape.judgment.stored, true);
+  assert.deepEqual(shape.jellyfin, baseline.jellyfin);
+  assert.deepEqual(shape.whisparr, baseline.whisparr);
+  assert.deepEqual(shape.providers, baseline.providers);
+  assert.equal(JSON.stringify(shape).includes('apiKey"'), false);
+
+  const credentialEdit = await call("PATCH", "/api/admin/integrations", {
+    cookie: owner,
+    body: { typesafeApiKey: "unused-while-ollama-selected" },
+  });
+  assert.equal((await credentialEdit.json()).judgment.provider, "ollama");
+  const clear = await call("PATCH", "/api/admin/integrations", {
+    cookie: owner,
+    body: {
+      judgmentProvider: "",
+      ollamaUrl: "",
+      ollamaModel: "",
+      typesafeApiKey: "",
+    },
+  });
+  assert.equal(clear.status, 200);
+  assert.equal((await clear.json()).judgment.provider, "typesafe");
+});
+
 test("catalog search with a rejected tpdb key is 502 upstream_auth, not a 401 sign-out", async () => {
   // The client signs out on any 401 (shared.tsx api()), so an expired
   // provider key reaching the wire as 401 signs every user out of catalog
@@ -5597,7 +5656,11 @@ test("scan lag: imported-but-unscanned is awaiting_scan; outage and denial stay 
 });
 
 // Sweep cache: one scan per user per window; stale-index verdicts re-check.
-test("availability: cached sweep serves repeated calls; removed title reads missing, gained title reads available", async () => {
+test("availability: cached sweep serves repeated calls; removed title reads missing, gained title reads available", async (t) => {
+  // Each fixture change must follow the sweep timestamp; real millisecond
+  // collisions otherwise make the cached entry correctly appear fresh.
+  let now = Date.now();
+  t.mock.method(Date, "now", () => now);
   // Cold cache so the fixture sweep counter measures only this test.
   resetSweepCache();
   const probeId = "2a2b3c4d-0000-0000-0000-0000000000c1";
@@ -5661,6 +5724,7 @@ test("availability: cached sweep serves repeated calls; removed title reads miss
     cookie: member,
   });
   assert.equal((await outcomeOf(avail)).outcome, "available");
+  now++;
   removeProbe();
   const afterRemoval = await call(
     "GET",
@@ -5680,6 +5744,7 @@ test("availability: cached sweep serves repeated calls; removed title reads miss
     cookie: member,
   });
   assert.equal((await outcomeOf(lagging)).outcome, "awaiting_scan");
+  now++;
   fx.items.push({
     Id: probeItem,
     Name: "Cache Probe Movie",
