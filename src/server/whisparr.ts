@@ -344,11 +344,7 @@ export async function findWhisparrItemByPath(
   if (jellyfinPaths.length === 0) return null;
   const whisparr = config?.whisparr;
   if (!whisparr?.url || !whisparr.apiKey) return null;
-  const dtos = asMovieResources(
-    await requestJson<unknown>(whisparr.url, "/api/v3/movie", whisparr.apiKey, {
-      service: "whisparr",
-    }),
-  );
+  const dtos = await cachedMovieList(whisparr);
   const matches = matchesByPaths(dtos, whisparr, jellyfinPaths);
   if (matches.length > 1) {
     throw new AppError(
@@ -366,19 +362,64 @@ export async function findWhisparrItemByPath(
 // if one fetch per window still hurts.
 const MOVIE_LIST_TTL_MS = 30_000;
 const MOVIE_LIST_CACHE_MAX = 4;
+const DEFAULT_MOVIE_LIST_LIMIT_MIB = 64;
+const MAX_MOVIE_LIST_LIMIT_MIB = 256;
+
+/** Bound only Whisparr's unpaged collection, leaving ordinary JSON limits intact. */
+function movieListSizeLimit(): number {
+  const raw = process.env.VELVARR_WHISPARR_LIBRARY_LIMIT_MIB;
+  const mib = raw === undefined ? DEFAULT_MOVIE_LIST_LIMIT_MIB : Number(raw);
+  if (
+    (raw !== undefined && !/^\d+$/.test(raw.trim())) ||
+    !Number.isSafeInteger(mib) ||
+    mib < 2 ||
+    mib > MAX_MOVIE_LIST_LIMIT_MIB
+  ) {
+    throw new AppError(
+      500,
+      "bad_whisparr_config",
+      "VELVARR_WHISPARR_LIBRARY_LIMIT_MIB must be a whole number between 2 and 256.",
+    );
+  }
+  return mib * 1024 * 1024;
+}
+
+/** Cache only fields used for path correspondence, not artwork or other bulky metadata. */
+function compactMovieList(dtos: MovieResourceDto[]): MovieResourceDto[] {
+  return dtos.map(({ itemType, path, foreignId, tmdbId, tpdbId, stashId }) => ({
+    itemType,
+    path,
+    foreignId,
+    tmdbId,
+    tpdbId,
+    stashId,
+  }));
+}
+
 // Keyed by Whisparr base URL. Entries hold the in-flight promise: the
 // prefetch that overlaps the Jellyfin read and the enrichment that follows
 // it share one fetch instead of two.
 const movieListCache = new Map<
   string,
-  { at: number; dtos: Promise<MovieResourceDto[]> }
+  {
+    at: number;
+    apiKey: string;
+    sizeLimit: number;
+    dtos: Promise<MovieResourceDto[]>;
+  }
 >();
 
-function cachedMovieList(
+async function cachedMovieList(
   whisparr: NonNullable<IntegrationConfig["whisparr"]>,
 ): Promise<MovieResourceDto[]> {
+  const sizeLimit = movieListSizeLimit();
   const hit = movieListCache.get(whisparr.url);
-  if (hit !== undefined && Date.now() - hit.at < MOVIE_LIST_TTL_MS) {
+  if (
+    hit !== undefined &&
+    hit.apiKey === whisparr.apiKey &&
+    hit.sizeLimit === sizeLimit &&
+    Date.now() - hit.at < MOVIE_LIST_TTL_MS
+  ) {
     return hit.dtos;
   }
   const at = Date.now();
@@ -386,10 +427,15 @@ function cachedMovieList(
     whisparr.url,
     "/api/v3/movie",
     whisparr.apiKey,
-    { service: "whisparr" },
-  ).then(asMovieResources);
+    { service: "whisparr", sizeLimit },
+  ).then((dto) => compactMovieList(asMovieResources(dto)));
   movieListCache.delete(whisparr.url);
-  movieListCache.set(whisparr.url, { at, dtos });
+  movieListCache.set(whisparr.url, {
+    at,
+    apiKey: whisparr.apiKey,
+    sizeLimit,
+    dtos,
+  });
   if (movieListCache.size > MOVIE_LIST_CACHE_MAX) {
     const oldest = movieListCache.keys().next().value;
     if (oldest !== undefined) movieListCache.delete(oldest);
@@ -413,7 +459,8 @@ function cachedMovieList(
 export function prefetchWhisparrMovieList(config: IntegrationConfig): void {
   const whisparr = config?.whisparr;
   if (!whisparr?.url || !whisparr.apiKey) return;
-  void cachedMovieList(whisparr);
+  // Prefetch is best-effort; awaited enrichment still reports configuration and upstream errors.
+  void cachedMovieList(whisparr).catch(() => {});
 }
 
 /** One Whisparr sweep for a whole list of Jellyfin items: a single
