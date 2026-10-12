@@ -43,6 +43,8 @@ docker compose up -d   # pulls ghcr.io/skare69/velvarr
 
 To upgrade, bump the image tag in `compose.yaml`, then `docker compose pull && docker compose up -d`.
 
+Container images are published after CI checks pass. Stable releases provide exact tags such as `v0.37.0` and `0.37.0`, a minor alias such as `0.37`, and `latest`. Releases from version 1 onward also provide a major alias such as `1`. For development builds, use `ghcr.io/skare69/velvarr:edge`, which follows `main`. Prereleases provide exact version tags without updating stable aliases. Every published build also has a `sha-<commit>` tag.
+
 **From source** (Node 24.21+, Bun 1.3.14+):
 
 ```sh

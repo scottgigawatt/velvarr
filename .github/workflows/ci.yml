@@ -71,7 +71,7 @@ jobs:
       - name: Readiness check
         run: |
           ready=0
-          for i in $(seq 1 30); do
+          for _ in $(seq 1 30); do
             if curl -fsS http://127.0.0.1:6699/api/health | grep -q '"ok":true'; then ready=1; break; fi
             sleep 2
           done
@@ -95,7 +95,7 @@ jobs:
         run: |
           docker restart velvarr-smoke
           ready=0
-          for i in $(seq 1 30); do
+          for _ in $(seq 1 30); do
             if curl -fsS http://127.0.0.1:6699/api/health | grep -q '"ok":true'; then ready=1; break; fi
             sleep 2
           done
@@ -107,10 +107,13 @@ jobs:
           docker volume rm velvarr-smoke-data
 
   publish:
-    name: GHCR publication (release tags + opt-in)
+    name: GHCR publication (main edge, release tags + opt-in)
     runs-on: ubuntu-latest
     needs: [gates, container]
-    if: (github.event_name == 'workflow_dispatch' && inputs.publish == true) || startsWith(github.ref, 'refs/tags/v')
+    if: >-
+      (github.event_name == 'push' &&
+        (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))) ||
+      (github.event_name == 'workflow_dispatch' && inputs.publish == true)
     permissions:
       contents: read
       packages: write
@@ -118,6 +121,32 @@ jobs:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           persist-credentials: false
+          fetch-depth: 0
+      # A version-shaped name alone is insufficient: releases must belong to main.
+      - name: Validate release tag
+        id: release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_SHA: ${{ github.sha }}
+        run: |
+          semver_pattern='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-((0|[1-9][0-9]*)|([0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))(\.((0|[1-9][0-9]*)|([0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)))*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$'
+          if ! printf '%s\n' "$RELEASE_TAG" | grep -Eq "$semver_pattern"; then
+            echo "Release tag must use v-prefixed semantic versioning: $RELEASE_TAG" >&2
+            exit 1
+          fi
+
+          if ! git merge-base --is-ancestor "${RELEASE_SHA}^{commit}" origin/main; then
+            echo "Release tag must point to a commit on main: $RELEASE_TAG" >&2
+            exit 1
+          fi
+
+          # Build metadata does not make a stable release a prerelease.
+          version=${RELEASE_TAG%%+*}
+          case "$version" in
+            *-*) echo 'stable=false' >> "$GITHUB_OUTPUT" ;;
+            *) echo 'stable=true' >> "$GITHUB_OUTPUT" ;;
+          esac
       - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ghcr.io
@@ -127,11 +156,18 @@ jobs:
         id: meta
         with:
           images: ghcr.io/${{ github.repository }}
+          # Raw release tags retain the existing v-prefixed image references.
+          # Disable automatic latest so prereleases cannot move stable aliases.
+          flavor: latest=false
           tags: |
-            type=ref,event=branch
+            type=edge,branch=main
+            type=sha,prefix=sha-
+            type=ref,event=branch,enable=${{ github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/main' }}
             type=ref,event=tag
             type=semver,pattern={{version}}
-            type=semver,pattern=v{{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}},enable=${{ !startsWith(github.ref, 'refs/tags/v0.') }}
+            type=raw,value=latest,enable=${{ steps.release.outputs.stable == 'true' }}
       - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
