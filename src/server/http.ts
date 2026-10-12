@@ -350,7 +350,7 @@ export function parseJson<T>(bytes: Uint8Array, service: Service): T {
   }
 }
 
-// timeoutMs is an internal/test knob; callers use the 15s default.
+// Collection readers can set a bounded allowance; ordinary JSON remains capped at 2 MiB.
 export async function requestJsonBytes(
   baseUrl: string,
   path: string,
@@ -360,6 +360,7 @@ export async function requestJsonBytes(
     body?: unknown;
     service?: Service;
     timeoutMs?: number;
+    sizeLimit?: number;
   } = {},
 ): Promise<Uint8Array> {
   const { bytes } = await requestBounded(
@@ -371,7 +372,7 @@ export async function requestJsonBytes(
     options.body,
     options.timeoutMs ?? DEFAULT_TIMEOUT_MS,
     "application/json",
-    JSON_LIMIT,
+    options.sizeLimit ?? JSON_LIMIT,
     true,
   );
   return bytes;
@@ -386,6 +387,7 @@ export async function requestJson<T>(
     body?: unknown;
     service?: Service;
     timeoutMs?: number;
+    sizeLimit?: number;
   } = {},
 ): Promise<T> {
   return parseJson<T>(

@@ -66,6 +66,15 @@ bun run dev     # http://127.0.0.1:6699
 | `VELVARR_DISCORD_DETAIL`     | no               | `1` includes titles in notifications; off by default, messages stay identity-only.   |
 | `TYPESAFE_API_KEY`           | no               | Enables AI-assisted Jellyfin matching; a key saved in Settings → Metadata providers takes precedence. |
 | `VELVARR_UPDATE_CHECK`       | no               | `0` disables the release check. By default the server asks GitHub (`api.github.com`) for the latest release at most once an hour — ten minutes after a failure — to show the update chip. |
+| `VELVARR_WHISPARR_LIBRARY_LIMIT_MIB` | no | Maximum decoded Whisparr library-list response in MiB; default `64`, whole numbers `2` through `256`. Ordinary JSON responses retain their 2 MiB limit. |
+
+## Large Whisparr libraries
+
+Opening a Jellyfin library item resolves its identity against Whisparr's complete `/api/v3/movie` collection. Library details and list enrichment share the same 30-second cache, which retains only path and identity fields. This collection has a 64 MiB decoded-response allowance by default; other JSON endpoints retain the 2 MiB guard.
+
+If the collection still exceeds the allowance, measure its decoded size and set `VELVARR_WHISPARR_LIBRARY_LIMIT_MIB` above that measurement, with headroom, up to 256 MiB. This is a response-size ceiling, not a container memory limit; parsing large JSON also consumes memory. Authentication checks, redirect restrictions, and the existing request timeout remain in place.
+
+Pass the setting into the container's runtime environment and recreate the container after changing it. Compose `.env` files only supply interpolation values unless the chart also forwards the variable under `environment` or uses `env_file`. For the upstream chart's `.env.local`, add the setting there. No library titles, paths, API keys, or complete JSON responses are needed to diagnose the size limit.
 
 ## Backup and recovery
 
