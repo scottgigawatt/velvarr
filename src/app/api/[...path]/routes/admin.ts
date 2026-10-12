@@ -32,6 +32,10 @@ import {
   getJellyfinStatus,
 } from "../../../../server/jellyfin.ts";
 import { getProviderStatus } from "../../../../server/providers.ts";
+import {
+  judgmentConfiguration,
+  checkJudgmentConnection,
+} from "../../../../server/judgment.ts";
 import { getWhisparrStatus } from "../../../../server/whisparr.ts";
 
 export function integrationsShape(config: IntegrationConfig) {
@@ -51,6 +55,7 @@ export function integrationsShape(config: IntegrationConfig) {
           pathMappings: config.whisparr.pathMappings ?? [],
         }
       : null,
+    judgment: judgmentConfiguration(config.providers),
     providers: {
       tpdb: providerShape(config.providers?.tpdbApiToken, "TPDB_API_TOKEN"),
       stashdb: providerShape(
@@ -171,14 +176,53 @@ export function nextProviderCredentials(
   const tpdbApiToken = optionalText(body, "tpdbApiToken", 1024);
   const stashdbApiKey = optionalText(body, "stashdbApiKey", 512);
   const typesafeApiKey = optionalText(body, "typesafeApiKey", 512);
+  const judgmentProvider = optionalText(body, "judgmentProvider", 16)?.trim();
+  const ollamaUrl = optionalText(body, "ollamaUrl", 2048)?.trim();
+  const ollamaModel = optionalText(body, "ollamaModel", 128)?.trim();
+  if (
+    judgmentProvider !== undefined &&
+    judgmentProvider !== "" &&
+    judgmentProvider !== "typesafe" &&
+    judgmentProvider !== "ollama"
+  ) {
+    throw new AppError(
+      400,
+      "invalid_field",
+      "Judgment provider must be typesafe or ollama.",
+    );
+  }
+  if (ollamaModel && !/^[A-Za-z0-9][A-Za-z0-9._:/-]*$/.test(ollamaModel)) {
+    throw new AppError(400, "invalid_field", "Invalid Ollama model name.");
+  }
   if (
     tpdbApiToken === undefined &&
     stashdbApiKey === undefined &&
-    typesafeApiKey === undefined
+    typesafeApiKey === undefined &&
+    judgmentProvider === undefined &&
+    ollamaUrl === undefined &&
+    ollamaModel === undefined
   ) {
     return existing;
   }
-  const providers = {
+  const providers: NonNullable<IntegrationConfig["providers"]> = {
+    judgmentProvider:
+      judgmentProvider === undefined
+        ? existing?.judgmentProvider
+        : judgmentProvider === ""
+          ? undefined
+          : judgmentProvider,
+    ollamaUrl:
+      ollamaUrl === undefined
+        ? existing?.ollamaUrl
+        : ollamaUrl === ""
+          ? undefined
+          : validateBaseUrl(ollamaUrl),
+    ollamaModel:
+      ollamaModel === undefined
+        ? existing?.ollamaModel
+        : ollamaModel === ""
+          ? undefined
+          : ollamaModel,
     tpdbApiToken:
       tpdbApiToken === undefined
         ? existing?.tpdbApiToken
@@ -201,7 +245,10 @@ export function nextProviderCredentials(
   if (
     providers.tpdbApiToken === undefined &&
     providers.stashdbApiKey === undefined &&
-    providers.typesafeApiKey === undefined
+    providers.typesafeApiKey === undefined &&
+    providers.judgmentProvider === undefined &&
+    providers.ollamaUrl === undefined &&
+    providers.ollamaModel === undefined
   ) {
     return undefined;
   }
@@ -390,9 +437,15 @@ export async function adminUpdateIntegrations(
   const bodyKeys = Object.keys(body);
   if (
     bodyKeys.length > 0 &&
-    bodyKeys.every(
-      (k) =>
-        k === "tpdbApiToken" || k === "stashdbApiKey" || k === "typesafeApiKey",
+    bodyKeys.every((k) =>
+      [
+        "tpdbApiToken",
+        "stashdbApiKey",
+        "typesafeApiKey",
+        "judgmentProvider",
+        "ollamaUrl",
+        "ollamaModel",
+      ].includes(k),
     )
   ) {
     const providers = nextProviderCredentials(ctx.config.providers, body);
@@ -494,6 +547,13 @@ export const routes: RouteDef[] = [
     segments: ["admin", "providers"],
     auth: "admin",
     run: async (ctx) => adminProviders(ctx),
+  },
+  {
+    method: "POST",
+    segments: ["admin", "judgment", "check"],
+    auth: "admin",
+    run: async (ctx) =>
+      json(await checkJudgmentConnection(ctx.config.providers)),
   },
   {
     method: "POST",

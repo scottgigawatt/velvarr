@@ -890,7 +890,18 @@ function assertConfigShape(config: IntegrationConfig): void {
       typeof p !== "object" ||
       p === null ||
       !credentialOk(p.tpdbApiToken, 1024) ||
-      !credentialOk(p.stashdbApiKey, 512)
+      !credentialOk(p.stashdbApiKey, 512) ||
+      (p.judgmentProvider !== undefined &&
+        p.judgmentProvider !== "typesafe" &&
+        p.judgmentProvider !== "ollama") ||
+      (p.ollamaUrl !== undefined &&
+        (typeof p.ollamaUrl !== "string" ||
+          !p.ollamaUrl ||
+          p.ollamaUrl.length > 2048)) ||
+      (p.ollamaModel !== undefined &&
+        (typeof p.ollamaModel !== "string" ||
+          p.ollamaModel.length > 128 ||
+          !/^[A-Za-z0-9][A-Za-z0-9._:/-]*$/.test(p.ollamaModel)))
     ) {
       throw new AppError(
         400,

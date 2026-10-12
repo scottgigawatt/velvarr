@@ -1,3 +1,6 @@
+import { createHash } from "node:crypto";
+import type { IntegrationConfig, JudgmentProvider } from "../lib/contracts.ts";
+import { AppError, validateBaseUrl } from "./http.ts";
 import { choice, noul, score, TypeSafeClient } from "@typesafe-ai/sdk";
 
 /** Typed judgments over one question each, in the shape the TypeSafe docs
@@ -28,21 +31,137 @@ export type WorkIdentity = {
   year?: number;
 };
 
-// Built once per key value; no key anywhere disables every judgment
-// outright, which is the default deployment. The stored admin-UI key wins
-// over the environment, same precedence as the provider credentials.
-let cached: { key: string; client: TypeSafeClient } | null = null;
+type JudgmentOptions = IntegrationConfig["providers"] | string;
 
-function typeSafe(stored: string | undefined): TypeSafeClient | null {
-  const key = stored?.trim() || process.env.TYPESAFE_API_KEY?.trim() || "";
-  if (key === "") return null;
-  if (cached?.key !== key) {
+function providerOptions(options?: JudgmentOptions) {
+  return typeof options === "string" ? { typesafeApiKey: options } : options;
+}
+
+/** Effective, non-secret settings for the administrator UI and each caller. */
+export function judgmentConfiguration(options?: JudgmentOptions): {
+  provider: JudgmentProvider;
+  url: string;
+  model: string;
+  configured: boolean;
+  stored: boolean;
+} {
+  const stored = providerOptions(options);
+  const provider =
+    (stored?.judgmentProvider ??
+      process.env.VELVARR_JUDGMENT_PROVIDER?.trim()) ||
+    "typesafe";
+  if (provider !== "typesafe" && provider !== "ollama") {
+    throw new AppError(
+      400,
+      "invalid_config",
+      "Judgment provider must be typesafe or ollama.",
+    );
+  }
+  const url =
+    (stored?.ollamaUrl ?? process.env.OLLAMA_BASE_URL?.trim()) ||
+    "http://localhost:11434";
+  const model =
+    (stored?.ollamaModel ?? process.env.OLLAMA_MODEL?.trim()) || "nimble";
+  return {
+    provider,
+    url,
+    model,
+    configured:
+      provider === "ollama" ||
+      Boolean(
+        stored?.typesafeApiKey?.trim() || process.env.TYPESAFE_API_KEY?.trim(),
+      ),
+    stored:
+      stored?.judgmentProvider !== undefined ||
+      stored?.ollamaUrl !== undefined ||
+      stored?.ollamaModel !== undefined,
+  };
+}
+
+let cached: { identity: string; client: TypeSafeClient } | null = null;
+
+/** Both servers speak System One; provider selection never falls back to cloud. */
+function judgmentBackend(options?: JudgmentOptions) {
+  const settings = judgmentConfiguration(options);
+  if (!settings.configured) return null;
+  const local = settings.provider === "ollama";
+  const key = local
+    ? "ollama"
+    : providerOptions(options)?.typesafeApiKey?.trim() ||
+      process.env.TYPESAFE_API_KEY!.trim();
+  const url = local
+    ? validateBaseUrl(settings.url)
+    : process.env.TYPESAFE_BASE_URL?.trim();
+  const model = local
+    ? settings.model
+    : process.env.TYPESAFE_DEFAULT_MODEL?.trim();
+  const identity = createHash("sha256")
+    .update(JSON.stringify([settings.provider, url, model, key]))
+    .digest("hex");
+  if (cached?.identity !== identity) {
     cached = {
-      key,
-      client: new TypeSafeClient({ apiKey: key, timeout: 8000 }),
+      identity,
+      client: new TypeSafeClient({
+        apiKey: key,
+        ...(url ? { baseURL: url } : {}),
+        ...(model ? { defaultModel: model } : {}),
+        timeout: local ? 30000 : 8000,
+        ...(local
+          ? {
+              retry: { maxRetries: 0 },
+              // The SDK requires a placeholder key; local Ollama receives no credential.
+              fetch: (input, init) => {
+                const headers = new Headers(init?.headers);
+                headers.delete("authorization");
+                return globalThis.fetch(input, {
+                  ...init,
+                  headers,
+                  redirect: "error",
+                });
+              },
+            }
+          : {}),
+      }),
     };
   }
-  return cached.client;
+  return { ...cached, provider: settings.provider };
+}
+
+/** Capability checks degrade to disabled when an operator supplied invalid settings. */
+export function judgmentConfigured(options?: JudgmentOptions): boolean {
+  try {
+    return judgmentBackend(options) !== null;
+  } catch {
+    return false;
+  }
+}
+
+/** Probe the configured model with one bounded decision, without catalog data. */
+export async function checkJudgmentConnection(options?: JudgmentOptions) {
+  const settings = judgmentConfiguration(options);
+  if (!settings.configured)
+    return {
+      provider: settings.provider,
+      connected: false,
+      error: "No TypeSafe API key is configured.",
+    };
+  try {
+    const backend = judgmentBackend(options)!;
+    await backend.client.systemOne({
+      state: "The service is running.",
+      questions: { ready: noul("Does the state say the service is running?") },
+    });
+    return { provider: settings.provider, connected: true };
+  } catch {
+    return {
+      provider: settings.provider,
+      connected: false,
+      error:
+        settings.provider === "ollama"
+          ? "Ollama could not answer a decision. Check its URL, model, and support for /v1/systemone (Ollama 0.35 or later)."
+          : "TypeSafe could not answer a decision. Check its API key and connection.",
+    };
+  }
 }
 
 // Answered same-work judgments: the answer depends only on the two
@@ -59,14 +178,20 @@ const sameWorkMemo = new Map<string, boolean>();
 export async function sameWork(
   a: WorkIdentity,
   b: WorkIdentity,
-  storedKey?: string,
+  options?: JudgmentOptions,
 ): Promise<boolean> {
-  const ts = typeSafe(storedKey);
-  if (!ts) return false;
+  let backend: ReturnType<typeof judgmentBackend>;
+  try {
+    backend = judgmentBackend(options);
+  } catch {
+    return false;
+  }
+  if (!backend) return false;
+  const ts = backend.client;
   if (a.year !== undefined && b.year !== undefined && a.year !== b.year) {
     return false;
   }
-  const memoKey = JSON.stringify([a, b]);
+  const memoKey = JSON.stringify([backend.identity, a, b]);
   const known = sameWorkMemo.get(memoKey);
   if (known !== undefined) return known;
   try {
@@ -92,19 +217,16 @@ export async function sameWork(
   }
 }
 
-/** Top tag suggestions for a plain-language term, chosen among the
- * provider's real tag names — the model only ever selects from the list it
- * was handed, so a suggestion is always a real, addable tag. The none-hatch
- * and every probability below the top three are dropped here. */
-export async function suggestTags(
+/** Select only real provider tags; transport failures abort the whole local reduction. */
+async function chooseTags(
+  backend: NonNullable<ReturnType<typeof judgmentBackend>>,
   term: string,
   tags: { id: string; name: string }[],
-  storedKey?: string,
+  signal?: AbortSignal,
 ): Promise<{ id: string; name: string }[]> {
-  const ts = typeSafe(storedKey);
-  if (!ts || tags.length === 0) return [];
-  try {
-    const res = await ts.systemOne({
+  const ts = backend.client;
+  const res = await ts.systemOne(
+    {
       state: { term, tags: tags.map((t) => t.name) },
       questions: {
         pick: choice(
@@ -117,15 +239,52 @@ export async function suggestTags(
           ]),
         ),
       },
-    });
-    const ranked = Object.entries(
-      res.answers.pick.probabilities as Record<string, number>,
-    )
-      .filter(([name]) => name !== "none" && tags.some((t) => t.name === name))
-      .sort((x, y) => y[1] - x[1])
-      .slice(0, 3)
-      .map(([name]) => tags.find((t) => t.name === name)!);
-    return ranked;
+    },
+    { signal },
+  );
+  if (backend.provider === "ollama" && res.answers.pick.choice === "none")
+    return [];
+  const ranked = Object.entries(
+    res.answers.pick.probabilities as Record<string, number>,
+  )
+    .filter(([name]) => name !== "none" && tags.some((t) => t.name === name))
+    .sort((x, y) => y[1] - x[1])
+    .slice(0, 3)
+    .map(([name]) => tags.find((t) => t.name === name)!);
+  return ranked;
+}
+
+/** Suggest up to three real tags. Local reductions share one 30-second budget. */
+export async function suggestTags(
+  term: string,
+  tags: { id: string; name: string }[],
+  options?: JudgmentOptions,
+): Promise<{ id: string; name: string }[]> {
+  if (tags.length === 0) return [];
+  try {
+    const backend = judgmentBackend(options);
+    if (!backend) return [];
+    const local = backend.provider === "ollama";
+    const signal = local ? AbortSignal.timeout(30000) : undefined;
+    // Local choice questions allow 26 options, including none. Every batch
+    // uses the same rubric; a final choice ranks the surviving real tags.
+    let candidates = tags;
+    while (local && candidates.length > 25) {
+      const selected: typeof tags = [];
+      for (let start = 0; start < candidates.length; start += 25) {
+        selected.push(
+          ...(await chooseTags(
+            backend,
+            term,
+            candidates.slice(start, start + 25),
+            signal,
+          )),
+        );
+      }
+      candidates = selected;
+      if (candidates.length === 0) return [];
+    }
+    return await chooseTags(backend, term, candidates, signal);
   } catch {
     return [];
   }
@@ -162,11 +321,13 @@ const RANK_LEVELS = [
 export async function rankRelatedTitles<T extends RankableTitle>(
   seed: RankableTitle,
   candidates: T[],
-  storedKey?: string,
+  options?: JudgmentOptions,
 ): Promise<T[] | null> {
-  const ts = typeSafe(storedKey);
-  if (!ts || candidates.length <= 1 || candidates.length > 12) return null;
+  if (candidates.length <= 1 || candidates.length > 12) return null;
   try {
+    const backend = judgmentBackend(options);
+    if (!backend) return null;
+    const ts = backend.client;
     const res = await ts.systemOne({
       state: {
         source: seed,

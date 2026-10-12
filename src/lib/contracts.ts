@@ -514,6 +514,8 @@ export type WhisparrPathMapping = {
   jellyfinPrefix: string;
 };
 
+export type JudgmentProvider = "typesafe" | "ollama";
+
 export type IntegrationConfig = {
   jellyfin: {
     url: string;
@@ -537,9 +539,13 @@ export type IntegrationConfig = {
   providers?: {
     tpdbApiToken?: string;
     stashdbApiKey?: string;
-    /** Enables the typed same-work judgment and tag suggestions. Absent
-     * falls back to TYPESAFE_API_KEY; no key anywhere disables both. */
+    /** TypeSafe credentials; used only when TypeSafe is selected. */
     typesafeApiKey?: string;
+    /** Absent settings use VELVARR_JUDGMENT_PROVIDER (default: TypeSafe),
+     * OLLAMA_BASE_URL, and OLLAMA_MODEL. Ollama needs no API key. */
+    judgmentProvider?: JudgmentProvider;
+    ollamaUrl?: string;
+    ollamaModel?: string;
   };
 };
 
