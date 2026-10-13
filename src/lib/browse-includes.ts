@@ -16,8 +16,9 @@ export const TAG_FILTER_ID_CAP = 25;
 /** One free-text term's expansion over a provider's published tag listing
  * (the shape expandCatalogTagTerm returns). `complete: false` marks a walk
  * that hit its row cap; `dropped` marks uuid-less matches (numeric-string
- * tag ids that can never ride a native criterion); an empty id list is
- * never proof a side is empty. */
+ * tag ids that can never ride a native criterion); an empty id list from
+ * an incomplete walk proves nothing, while a complete walk's empty id
+ * list is grounded absence (resolveIncludeCriteria reports provablyEmpty). */
 export type TagExpansion = {
   complete: boolean;
   dropped: boolean;
@@ -37,6 +38,12 @@ export type IncludeCriteria = {
   /** True when at least one free-text term rides the native criterion: at
    * the scan ceiling such a stream degrades softly instead of 422ing. */
   freeTextNative: boolean;
+  /** True when some term's expansion is a complete, freshness-bounded
+   * listing walk with an empty id list and no uuid-less match: no
+   * published tag contains the term, so no title can carry it — the
+   * side's AND can never match, and the caller answers the side as
+   * provably empty (exact absence, no upstream scan). */
+  provablyEmpty: boolean;
 };
 
 /** Resolves the native include criteria for one provider side from the
@@ -60,6 +67,23 @@ export function resolveIncludeCriteria(
       anyOf: [],
       localTermIndexes: [],
       freeTextNative: false,
+      provablyEmpty: false,
+    };
+  }
+  // A complete, freshness-bounded listing walk (card 926308ec bounds the
+  // listing's age) that holds no tag for a term — and no uuid-less match —
+  // grounds the absence: no published tag contains the term, so no title
+  // can carry it and the AND can never match on this side. The caller
+  // answers the side as exact zero instead of scanning unfiltered pages
+  // into the query_too_broad ceiling. An incomplete walk, or one whose
+  // matches are uuid-less, proves nothing and keeps the local scan.
+  if (expansions.some((e) => e.complete && !e.dropped && e.ids.length === 0)) {
+    return {
+      allOf: [...anchoredIds],
+      anyOf: [],
+      localTermIndexes: expansions.map((_, i) => i),
+      freeTextNative: false,
+      provablyEmpty: true,
     };
   }
   // Every term must expand completely and natively, or the whole group
@@ -71,6 +95,7 @@ export function resolveIncludeCriteria(
       anyOf: [],
       localTermIndexes: expansions.map((_, i) => i),
       freeTextNative: false,
+      provablyEmpty: false,
     };
   }
   // Every title satisfying the AND carries a tag from EVERY group, so a
@@ -89,6 +114,7 @@ export function resolveIncludeCriteria(
         e.ids.length > 1 ? [i] : [],
       ),
       freeTextNative: singletonIds.length > 0,
+      provablyEmpty: false,
     };
   }
   // No anchored id and no singleton group: the smallest group is a valid
@@ -111,6 +137,7 @@ export function resolveIncludeCriteria(
       anyOf: [],
       localTermIndexes: expansions.map((_, i) => i),
       freeTextNative: false,
+      provablyEmpty: false,
     };
   }
   return {
@@ -118,11 +145,14 @@ export function resolveIncludeCriteria(
     anyOf: [...expansions[smallest]!.ids],
     localTermIndexes: expansions.flatMap((_, i) => (i !== smallest ? [i] : [])),
     freeTextNative: true,
+    provablyEmpty: false,
   };
 }
 
 /** The plan shape softCeilingFor reads (structural slice of browseTitles'
- * inline plan objects). */
+ * inline plan objects). `localInclude` carries only the free-text terms
+ * that re-check locally: uuid-less anchored chips and every other local
+ * filter keep the hard 422, so they never enter it. */
 export type SoftCeilingPlan = {
   localInclude: readonly unknown[];
   freeTextNative: boolean;
@@ -133,9 +163,10 @@ export type SoftCeilingPlan = {
  * re-check — the native pre-filter kept the scanned pages productive, so
  * the matches found are a real partial answer. Filmography scans (no
  * native tag criterion), anchored+free mixes where every free term
- * re-checks locally, and every other local filter keep the hard 422;
- * hidden or exclude starvation on such a stream still degrades (the pages
- * were productive). */
+ * re-checks locally, uuid-less anchored chips beside a native criterion,
+ * and every other local filter keep the hard 422; hidden or exclude
+ * starvation on such a stream still degrades (the pages were
+ * productive). */
 export function softCeilingFor(plan: SoftCeilingPlan): boolean {
   return plan.localInclude.length > 0 && plan.freeTextNative;
 }

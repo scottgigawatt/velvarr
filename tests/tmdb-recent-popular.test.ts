@@ -247,3 +247,30 @@ test("invalid windows fail before provider I/O and preview scans honor the small
   assert.equal(result.items.length, 0);
   assert.equal(result.errors?.[0]?.code, "scan_ceiling");
 });
+
+test("the broad default combines exact published keywords with OR and ignores approximate name matches", async () => {
+  const f = fixture();
+  const read = async <T>(path: string): Promise<T> => {
+    const url = new URL(path, "http://fixture");
+    if (url.pathname === "/3/search/keyword")
+      return {
+        results:
+          url.searchParams.get("query") === "pornography"
+            ? [
+                { id: 445, name: "pornography" },
+                { id: 999, name: "about pornography" },
+              ]
+            : url.searchParams.get("query") === "hentai"
+              ? [{ id: 446, name: "hentai" }]
+              : [],
+      } as T;
+    return f.read<T>(path);
+  };
+  await searchTmdb(read, {
+    provider: "tmdb",
+    kind: "movie",
+    sort: "recent-popular",
+  });
+  const listing = f.paths.find((p) => p.pathname === "/3/discover/movie")!;
+  assert.equal(listing.searchParams.get("with_keywords"), "445|446");
+});

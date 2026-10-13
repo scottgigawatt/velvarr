@@ -18,8 +18,10 @@ import type { TmdbQuery } from "./tmdb.ts";
 // never a fake empty page or fake end — narrow the filters. One exception:
 // a multi-term free-text AND split between a native tag criterion and the
 // local re-check degrades to a named partial page instead
-// (Stream.softCeiling). Raise MAX_SCAN_PAGES only when real browsing
-// measurably needs it.
+// (Stream.softCeiling). A second: a side whose free-text expansion is
+// provably empty (complete freshness-bounded listing, no match, no
+// uuid-less rows) answers exact zero before any scan. Raise
+// MAX_SCAN_PAGES only when real browsing measurably needs it.
 
 // Stryker disable all — the mutation window re-opens below the parse/adapters
 // block and covers the pure merge/plan logic only (mergeStreams, nativeQuery,
@@ -350,11 +352,13 @@ function visiblePredicate(
  * the expansion is complete and fits the native id cap). `localInclude`
  * holds the selections the visible predicate must still re-check locally:
  * free-text terms (several AND together, which one upstream tag
- * criterion cannot express). Picked tags never resolve on another provider. */
+ * criterion cannot express). Picked tags never resolve on another provider.
+ * `localFree` contains only free-text terms for the soft scan ceiling. */
 type ResolvedIncludes = {
   allOf: string[];
   anyOf: string[];
   localInclude: CatalogTagSelection[];
+  localFree: CatalogTagSelection[];
   /** True when at least one free-text term rides the native tag criterion
    * (a singleton expansion in `allOf`, or the `anyOf` group): at the scan
    * ceiling such a stream degrades softly — its pages were productive and
@@ -363,7 +367,9 @@ type ResolvedIncludes = {
 };
 
 /** Resolve native IDs only on the provider they were selected from.
- * Label-only terms expand against this provider's own published tags. */
+ * Label-only terms expand against this provider's own published tags.
+ * A complete fresh listing with no matching tag proves this side empty;
+ * an incomplete listing or uuid-less match keeps the local check. */
 async function includeIdsForSide(
   selections: CatalogTagSelection[],
   side: "tpdb" | "stashdb",
@@ -385,6 +391,7 @@ async function includeIdsForSide(
       allOf,
       anyOf: [],
       localInclude: free,
+      localFree: free,
       freeTextNative: false,
     };
   }
@@ -398,10 +405,16 @@ async function includeIdsForSide(
     expansions.push(await expandCatalogTagTerm(side, sel.name));
   }
   const criteria = resolveIncludeCriteria(allOf, expansions);
+  // Grounded absence (complete fresh listing, no uuid-less match, empty
+  // ids): the side is skipped — exact zero via the plans.length === 0
+  // path when no side survives — instead of a 40-page unfiltered scan
+  // ending in query_too_broad. An All browse keeps the surviving side.
+  if (criteria.provablyEmpty) return undefined;
   return {
     allOf: criteria.allOf,
     anyOf: criteria.anyOf,
     localInclude: criteria.localTermIndexes.map((i) => free[i]!),
+    localFree: criteria.localTermIndexes.map((i) => free[i]!),
     freeTextNative: criteria.freeTextNative,
   };
 }
@@ -1090,6 +1103,7 @@ export async function browseTitles(
     excludeIds: string[];
     localFiltered: boolean;
     localInclude: CatalogTagSelection[];
+    localFree: CatalogTagSelection[];
     localYear?: number;
     performerIds?: string[];
   }[] = [];
@@ -1113,6 +1127,7 @@ export async function browseTitles(
         (filmography &&
           query.include.some((tag) => tagAppliesToProvider(tag, "tpdb"))),
       localInclude: filmography ? query.include : tpdbIncludes.localInclude,
+      localFree: filmography ? query.include : tpdbIncludes.localFree,
       localYear: undefined,
     });
   }
@@ -1143,6 +1158,7 @@ export async function browseTitles(
         stashIncludes.localInclude.length > 0 ||
         query.year !== undefined,
       localInclude: stashIncludes.localInclude,
+      localFree: stashIncludes.localFree,
       localYear: query.year,
       performerIds:
         query.performerStarred === true ? starredPerformerIds : undefined,
@@ -1217,7 +1233,10 @@ export async function browseTitles(
         ),
         query.perPage,
         plan.localFiltered,
-        softCeilingFor(plan),
+        softCeilingFor({
+          localInclude: plan.localFree,
+          freeTextNative: plan.freeTextNative,
+        }),
         scanBudget,
       ),
   );
