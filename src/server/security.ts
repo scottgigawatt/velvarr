@@ -19,15 +19,25 @@ const MAX_BUCKETS = 1024;
 type Bucket = { count: number; windowStart: number };
 const buckets = new Map<string, Bucket>();
 
-// HTTPS upgrade for the session cookie comes from the request, not from a
-// pinned origin: behind any https reverse proxy (X-Forwarded-Proto) or direct
-// https URL the cookie gains Secure; plain LAN http legitimately cannot have
-// it (browsers drop Secure cookies on http).
+// HTTPS upgrade for the session cookie: an https reverse proxy
+// (X-Forwarded-Proto), a direct https URL, or a pinned https VELVARR_ORIGIN
+// all gain Secure. The pin covers proxies that do not send
+// X-Forwarded-Proto, so an accidental plain-http hop to the pinned host
+// never carries the token in cleartext. Plain LAN http legitimately cannot
+// have it (browsers drop Secure cookies on http).
 export function isSecureRequest(request: Request): boolean {
+  const proto = request.headers.get("x-forwarded-proto");
+  if (proto === "https:" || proto === "https") return true;
+  let pinned: URL | null = null;
+  try {
+    pinned = process.env.VELVARR_ORIGIN
+      ? new URL(process.env.VELVARR_ORIGIN)
+      : null;
+  } catch {
+    // Invalid pin: enforceOriginConfig reports it on the gated paths.
+  }
   return (
-    request.headers.get("x-forwarded-proto") === "https:" ||
-    request.headers.get("x-forwarded-proto") === "https" ||
-    new URL(request.url).protocol === "https:"
+    pinned?.protocol === "https:" || new URL(request.url).protocol === "https:"
   );
 }
 
@@ -94,9 +104,10 @@ export function guardMutation(request: Request): void {
   // with the victim's cookies and no CORS preflight. The browser's
   // Sec-Fetch-Site is the reliable same-origin signal; HTML forms cannot
   // send application/json, so any other content type on a mutation is a
-  // form post whatever the browser's age. Header-absent passes: the
-  // client's own bodyless DELETEs, and browsers without fetch metadata
-  // (their form posts still fail the content-type gate).
+  // form post whatever the browser's age. Header-absent passes only for
+  // bodyless mutations (the app's own DELETEs): a wire-framed body without
+  // a JSON content type — form posts and typeless Blob bodies alike — is
+  // refused here.
   const site = request.headers.get("sec-fetch-site");
   if (site && site.trim().toLowerCase() !== "same-origin") {
     throw new AppError(
@@ -106,10 +117,14 @@ export function guardMutation(request: Request): void {
     );
   }
   const contentType = request.headers.get("content-type");
-  if (
-    contentType &&
-    contentType.split(";")[0]!.trim().toLowerCase() !== "application/json"
-  ) {
+  const typeOk =
+    contentType?.split(";")[0]!.trim().toLowerCase() === "application/json";
+  // A body is framed by Content-Length or chunked Transfer-Encoding on the
+  // wire; Content-Length: 0 and absent framing mean no body.
+  const hasBody =
+    Number(request.headers.get("content-length") ?? "0") > 0 ||
+    request.headers.get("transfer-encoding") !== null;
+  if (contentType ? !typeOk : hasBody) {
     throw new AppError(
       403,
       "bad_content_type",
@@ -153,8 +168,9 @@ export function verifySetupSecret(value: unknown): void {
 }
 
 // Read-only gate: may this name try to authenticate now. Nothing is consumed
-// here — budget is charged on failed authentications only
-// (recordLoginFailure), so a successful login never burns its own account's
+// here — the attempt reserves its per-account slot right after the gate
+// (reserveLoginAttempt), and the slot is refunded on a success or a
+// non-credential error, so a successful login never burns its own account's
 // budget. The spray cap binds only names without an admitted Velvarr
 // account: admitted names skip it (their brute force is bounded by the
 // per-account bucket), so a rotating-name sprayer can fill the global
@@ -194,17 +210,35 @@ export function resetLoginBuckets(): void {
   buckets.clear();
 }
 
-// Charges one failed authentication: the account bucket carries the
-// brute-force limit, the global bucket is the last-resort spray cap. Global
-// is charged first so an already-locked account's guesses still feed it.
-// ponytail: with the global bucket full, an admitted name's failure throws
-// on the global charge before its account bucket fills; if upstream
-// round-trips during an active spray ever matter, charge admitted names
-// account-first.
-export function recordLoginFailure(name: string): void {
-  const now = Date.now();
-  consumeBucket("global", GLOBAL_LIMIT, now);
-  consumeBucket(`account:${name.trim().toLowerCase()}`, ACCOUNT_LIMIT, now);
+// Reserves one attempt slot in the account bucket before the attempt runs.
+// The reservation lands in the same synchronous step as the gate, so every
+// in-flight guess holds a slot and parallel guesses cannot all reach
+// upstream at once (a charge that only landed after the upstream
+// round-trip let a whole burst through). The returned refund covers the
+// outcomes that were not guesses — a success, an upstream outage, a
+// malformed field; a credential rejection keeps the charge. The account
+// bucket is charged regardless of the global bucket's state, so a sprayer
+// who fills the global cap cannot unlock unlimited guesses against known
+// admitted names.
+export function reserveLoginAttempt(name: string): () => void {
+  const key = `account:${name.trim().toLowerCase()}`;
+  consumeBucket(key, ACCOUNT_LIMIT, Date.now());
+  // ponytail: a refund landing after a window rollover frees one slot in
+  // the fresh window; only non-guess outcomes refund, so no guess ever
+  // gets capacity back.
+  return () => {
+    const bucket = buckets.get(key);
+    if (bucket && bucket.count > 0) bucket.count -= 1;
+  };
+}
+
+// Charges one failed authentication against the global spray cap. The
+// process-wide cap has no name dimension: the account slot was already
+// paid by reserveLoginAttempt before the attempt. Charging the cap on
+// every credential rejection keeps an active brute force feeding it even
+// once the name's account bucket is full.
+export function recordLoginFailure(): void {
+  consumeBucket("global", GLOBAL_LIMIT, Date.now());
 }
 
 export function sessionCookie(grant?: SessionGrant, secure?: boolean): string {

@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   sameWork,
+  resetSameWorkBreaker,
   suggestTags,
   rankRelatedTitles,
   judgmentConfiguration,
@@ -28,11 +29,13 @@ const response = (answers: unknown) =>
 
 async function withFetch(handler: typeof fetch, run: () => Promise<void>) {
   const original = globalThis.fetch;
+  resetSameWorkBreaker();
   globalThis.fetch = handler;
   try {
     await run();
   } finally {
     globalThis.fetch = original;
+    resetSameWorkBreaker();
   }
 }
 
@@ -109,11 +112,82 @@ test("Ollama outages do not invoke TypeSafe or cache an unanswered no", async ()
     async () => {
       const settings = { ...local, typesafeApiKey: "must-not-use-cloud" };
       assert.equal(await sameWork(a, b, settings), false);
+      assert.equal(await sameWork(a, b, settings), false);
+      assert.equal(calls, 1, "the outage cooldown prevents repeated calls");
+      resetSameWorkBreaker();
       assert.equal(await sameWork(a, b, settings), true);
       assert.equal(calls, 2);
     },
   );
 });
+
+test("a local outage does not suppress a different model, endpoint, or cloud backend", async () => {
+  const a = { title: "Backend cooldown probe" };
+  const b = { title: "Backend cooldown probe variant" };
+  let calls = 0;
+  await withFetch(
+    async () => {
+      calls++;
+      if (calls === 1) throw new Error("one local model is unavailable");
+      return response({ sameWork: { type: "noul", noul: 0.95 } });
+    },
+    async () => {
+      assert.equal(await sameWork(a, b, local), false);
+      assert.equal(await sameWork(a, b, local), false);
+      assert.equal(calls, 1);
+      assert.equal(
+        await sameWork(a, b, { ...local, ollamaModel: "tev1" }),
+        true,
+      );
+      assert.equal(
+        await sameWork(a, b, { ...local, ollamaUrl: "http://127.0.0.1:11434" }),
+        true,
+      );
+      assert.equal(
+        await sameWork(a, b, {
+          judgmentProvider: "typesafe",
+          typesafeApiKey: "fixture-cloud-key",
+        }),
+        true,
+      );
+      assert.equal(calls, 4, "only the failed backend is in cooldown");
+    },
+  );
+});
+
+test(
+  "local inference retains its allowance beyond the cloud timeout",
+  { timeout: 6000 },
+  async () => {
+    await withFetch(
+      async (_, init) => {
+        // Local models can take longer than the cloud availability budget.
+        await new Promise<void>((resolve, reject) => {
+          const timer = setTimeout(resolve, 2200);
+          init?.signal?.addEventListener(
+            "abort",
+            () => {
+              clearTimeout(timer);
+              reject(init.signal?.reason);
+            },
+            { once: true },
+          );
+        });
+        return response({ sameWork: { type: "noul", noul: 0.95 } });
+      },
+      async () => {
+        assert.equal(
+          await sameWork(
+            { title: "Local inference allowance" },
+            { title: "Local inference allowance variant" },
+            local,
+          ),
+          true,
+        );
+      },
+    );
+  },
+);
 
 test("contradicting years and malformed local answers preserve conservative matching", async () => {
   let calls = 0;

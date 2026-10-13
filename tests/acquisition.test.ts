@@ -56,6 +56,7 @@ let knobs = {
   failFindOnce: 0,
   holdAdd: null as Promise<void> | null,
   pathOverride: null as string | null,
+  findStatus: 0,
 };
 let onAdd: (() => void) | null = null;
 let storedItems = new Map<string, number>();
@@ -90,6 +91,8 @@ async function handle(
     return json(401, { message: "bad key" });
   if (knobs.downAll) return json(503, { message: "down" });
   if (req.method === "GET" && path.startsWith("/api/v3/movie?")) {
+    if (knobs.findStatus > 0)
+      return json(knobs.findStatus, { message: "routing fault" });
     if (knobs.failFindOnce > 0) {
       knobs.failFindOnce--;
       return json(503, { message: "find down" });
@@ -179,6 +182,7 @@ function freshDb(): void {
     failFindOnce: 0,
     pathOverride: null,
     holdAdd: null,
+    findStatus: 0,
   };
   storedItems = new Map();
   nextId = 1;
@@ -667,6 +671,33 @@ test("a 401 from a rotated key stays uncertain; the fixed key delivers", async (
   assert.equal(probe(id).state, "monitoring");
 });
 
+test("a 404 from the pre-POST lookup stays uncertain; a healthy pass delivers", async () => {
+  const owner = boot();
+  approve(owner.id, MOVIE_C);
+  const id = workId(MOVIE_C);
+
+  // A reverse proxy whose backend is restarting answers 404 for the whole
+  // API — including the stored-item lookup that precedes any POST. A
+  // healthy Whisparr answers that lookup with a list, never 404, so the 404
+  // is a routing fault, not proof the identity can never be delivered.
+  knobs.findStatus = 404;
+  const first = await acquisition.runDueWork();
+  assert.equal(first.failed, 0, "a routing 404 is not a terminal failure");
+  assert.equal(first.uncertain, 1);
+  assert.equal(postCount(), 0, "no POST when the lookup cannot be read");
+  assert.equal(probe(id).state, "uncertain");
+
+  knobs.findStatus = 0;
+  const healed = await acquisition.runDueWork(later());
+  assert.equal(
+    healed.delivered,
+    1,
+    "the recovered proxy delivers the held work",
+  );
+  assert.equal(postCount(), 1);
+  assert.equal(probe(id).state, "monitoring");
+});
+
 test("delivery disabled stays honestly blocked, then resumes when enabled", async () => {
   const owner = boot();
   approve(owner.id, MOVIE_A);
@@ -685,6 +716,76 @@ test("delivery disabled stays honestly blocked, then resumes when enabled", asyn
   const resumed = await acquisition.runDueWork(later());
   assert.equal(resumed.delivered, 1);
   assert.equal(postCount(), 1);
+});
+
+test("delivery disabled still observes sent work: downloading reaches imported", async () => {
+  const owner = boot();
+  approve(owner.id, MOVIE_A);
+  const id = workId(MOVIE_A);
+
+  // Sent while delivery was on; the work is downloading in the queue.
+  await acquisition.runDueWork();
+  knobs.inQueue = true;
+  await acquisition.runDueWork(later());
+  assert.equal(probe(id).state, "downloading");
+
+  // Delivery off: no new adds, but observation of the sent work continues.
+  storage.saveConfig(config(false));
+  knobs.hasFile = true;
+  const summary = await acquisition.runDueWork(later());
+  assert.equal(summary.observed, 1);
+  assert.equal(
+    postCount(),
+    1,
+    "disabled delivery never adds, but observation ran",
+  );
+  assert.equal(probe(id).state, "imported");
+});
+
+test("delivery disabled still reconciles an uncertain row stored upstream", async () => {
+  const owner = boot();
+  approve(owner.id, MOVIE_A);
+  const id = workId(MOVIE_A);
+
+  // The add outcome was unknown and the row is uncertain; the identity
+  // actually landed upstream.
+  knobs.addStatus = 500;
+  knobs.failFindAfterAdd = true;
+  await acquisition.runDueWork();
+  assert.equal(probe(id).state, "uncertain");
+  knobs.addStatus = 201;
+  knobs.failFindAfterAdd = false;
+  storedItems.set(EXT_A, 1);
+
+  // Delivery off: the exact-identity read reconciles the row, no POST.
+  storage.saveConfig(config(false));
+  const summary = await acquisition.runDueWork(later());
+  assert.equal(summary.reconciled, 1);
+  assert.equal(postCount(), 1, "reconciliation is a read, never an add");
+  assert.equal(probe(id).state, "monitoring");
+});
+
+test("delivery disabled blocks an uncertain row that would need a fresh add", async () => {
+  const owner = boot();
+  approve(owner.id, MOVIE_A);
+  const id = workId(MOVIE_A);
+
+  // The pre-POST lookup 404s: nothing stored upstream, row uncertain.
+  knobs.findStatus = 404;
+  await acquisition.runDueWork();
+  assert.equal(probe(id).state, "uncertain");
+  assert.equal(postCount(), 0);
+  knobs.findStatus = 0;
+
+  // Delivery off and the identity is absent: reconciliation would dispatch,
+  // so the row blocks on delivery instead of adding behind a disabled gate.
+  storage.saveConfig(config(false));
+  const summary = await acquisition.runDueWork(later());
+  assert.equal(summary.blocked, 1);
+  assert.equal(postCount(), 0, "disabled delivery never adds");
+  const held = probe(id);
+  assert.equal(held.state, "uncertain");
+  assert.ok(held.lastError?.includes("delivery"));
 });
 
 test("no configuration at all performs zero external calls, state untouched", async () => {

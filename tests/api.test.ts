@@ -17,6 +17,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { resetMetaCache } from "../src/server/providers.ts";
 import { resetSweepCache } from "../src/server/jellyfin.ts";
 import { resetUpdateCache } from "../src/server/update.ts";
+import { resetLoginBuckets } from "../src/server/security.ts";
 import { countPendingApprovals } from "../src/lib/approvals.ts";
 import type { RouteDef } from "../src/app/api/[...path]/admission.ts";
 import { resetSessionCache } from "../src/app/api/[...path]/admission.ts";
@@ -109,6 +110,10 @@ const TPDB_MOVIE = "2a2b3c4d-0000-0000-0000-000000000001";
 const TPDB_MOVIE2 = "2a2b3c4d-0000-0000-0000-000000000002";
 const TPDB_MOVIE3 = "2a2b3c4d-0000-0000-0000-000000000003";
 const TPDB_MOVIE4 = "2a2b3c4d-0000-0000-0000-000000000004";
+// Dedicated to the availability year-hint test: its catalog row and
+// acquisition belong to that test alone, so no other case's observation
+// facts can leak in or out (recordObservation merges, never replaces).
+const TPDB_MOVIE_YEAR = "2a2b3c4d-0000-0000-0000-0000000000c2";
 // Only used by the performer-filmography bulk test: TPDB_MOVIE3 already
 // carries approved intents from earlier tests, and an active-intent row
 // would collide with the bulk's new pending intent and show up in the
@@ -714,6 +719,20 @@ async function tpdbHandler(
         links: {},
       });
     }
+    // Isolated behind an exact q marker: a full first page with a provider
+    // next link under the fake 10000 cap total — more results exist while
+    // the count stays unknown.
+    if (url.searchParams.get("q") === "Many") {
+      return json(res, 200, {
+        data: Array.from({ length: 6 }, (_, i) =>
+          tpdbMovieRow(
+            `b1c2d3e4-0000-0000-0000-${String(700 + i).padStart(12, "0")}`,
+          ),
+        ),
+        meta: { total: 10000 },
+        links: { next: "https://fixture.test/next" },
+      });
+    }
     // TPDB caps unfiltered totals at the fake 10000 marker; a countable
     // filter (q) yields a real total. Mirrors the live provider behavior.
     const realTotal = url.searchParams.get("q") !== null;
@@ -845,6 +864,8 @@ async function tpdbHandler(
     });
   if (p === `/movies/${TPDB_MOVIE}`)
     return json(res, 200, { data: tpdbMovieRow(TPDB_MOVIE) });
+  if (p === `/movies/${TPDB_MOVIE_YEAR}`)
+    return json(res, 200, { data: tpdbMovieRow(TPDB_MOVIE_YEAR) });
   if (p === `/movies/${TPDB_MOVIE4}`)
     return json(res, 200, { data: tpdbMovieRow(TPDB_MOVIE4) });
   json(res, 404, {});
@@ -1284,6 +1305,30 @@ test("update chip: surfaces once per check, untrusted urls and failure degrade t
     resetUpdateCache();
     const degraded = await call("GET", "/api/update");
     assert.deepEqual(await degraded.json(), { update: null });
+
+    // A non-OK status degrades even when the body happens to carry a valid
+    // payload, and only a *leading* v is stripped from the tag: a malformed
+    // tag must not become a chip (1.v0.0 would otherwise strip to 1.0.0).
+    globalThis.fetch = (async () =>
+      Response.json(
+        {
+          tag_name: "v9.9.9",
+          html_url: "https://github.com/Skare69/velvarr/releases/tag/v9.9.9",
+        },
+        { status: 403 },
+      )) as typeof fetch;
+    resetUpdateCache();
+    const nonOk = await call("GET", "/api/update");
+    assert.deepEqual(await nonOk.json(), { update: null });
+
+    globalThis.fetch = (async () =>
+      Response.json({
+        tag_name: "1.v0.0",
+        html_url: "https://github.com/Skare69/velvarr/releases/tag/1.v0.0",
+      })) as typeof fetch;
+    resetUpdateCache();
+    const malformed = await call("GET", "/api/update");
+    assert.deepEqual(await malformed.json(), { update: null });
   } finally {
     globalThis.fetch = realFetch;
     resetUpdateCache();
@@ -1309,6 +1354,86 @@ test("update chip: VELVARR_UPDATE_CHECK=0 opts out with no github call", async (
   } finally {
     if (hadEnv) process.env.VELVARR_UPDATE_CHECK = realEnv;
     else delete process.env.VELVARR_UPDATE_CHECK;
+    globalThis.fetch = realFetch;
+    resetUpdateCache();
+  }
+});
+
+test("update chip: cache windows — one hour after success, ten minutes after failure", async () => {
+  const realFetch = globalThis.fetch;
+  const realNow = Date.now;
+  let now = 1_700_000_000_000;
+  let calls = 0;
+  let seenUrl = "";
+  let seenAccept = "";
+  let stub: () => Response = () => Response.json({});
+  try {
+    // README promises github is asked "at most once an hour — ten minutes
+    // after a failure". The windows are hardcoded here, not imported, so
+    // swapping FRESH_MS/FAILED_MS in src/server/update.ts fails this test.
+    Date.now = () => now;
+    globalThis.fetch = (async (
+      input: RequestInfo | URL,
+      init?: RequestInit,
+    ) => {
+      calls++;
+      seenUrl = String(input);
+      seenAccept =
+        (init?.headers as Record<string, string> | undefined)?.accept ?? "";
+      return stub();
+    }) as typeof fetch;
+
+    // A success is trusted for one hour: 1 ms inside the window is served
+    // from cache, exactly 1 h later github is asked again.
+    stub = () =>
+      Response.json({
+        tag_name: "v9.9.9",
+        html_url: "https://github.com/Skare69/velvarr/releases/tag/v9.9.9",
+      });
+    resetUpdateCache();
+    const first = await call("GET", "/api/update");
+    assert.deepEqual(await first.json(), {
+      update: {
+        version: "9.9.9",
+        url: "https://github.com/Skare69/velvarr/releases/tag/v9.9.9",
+      },
+    });
+    assert.equal(
+      seenUrl,
+      "https://api.github.com/repos/Skare69/velvarr/releases/latest",
+    );
+    assert.equal(seenAccept, "application/vnd.github+json");
+    assert.equal(calls, 1);
+    now += 60 * 60 * 1000 - 1;
+    await call("GET", "/api/update");
+    assert.equal(calls, 1);
+    now += 1;
+    await call("GET", "/api/update");
+    assert.equal(calls, 2);
+
+    // A failed check retries after ten minutes: 1 ms inside the window stays
+    // cached (one github blip must not hide a release for an hour, nor cost
+    // a call per hit), exactly 10 min later it retries — and a tag older
+    // than the current build correctly reports no update.
+    stub = () => new Response("rate limited", { status: 403 });
+    resetUpdateCache();
+    const degraded = await call("GET", "/api/update");
+    assert.deepEqual(await degraded.json(), { update: null });
+    assert.equal(calls, 3);
+    now += 10 * 60 * 1000 - 1;
+    await call("GET", "/api/update");
+    assert.equal(calls, 3);
+    now += 1;
+    stub = () =>
+      Response.json({
+        tag_name: "v0.0.1",
+        html_url: "https://github.com/Skare69/velvarr/releases/tag/v0.0.1",
+      });
+    const recovered = await call("GET", "/api/update");
+    assert.deepEqual(await recovered.json(), { update: null });
+    assert.equal(calls, 4);
+  } finally {
+    Date.now = realNow;
     globalThis.fetch = realFetch;
     resetUpdateCache();
   }
@@ -2409,12 +2534,24 @@ test("catalog search: auth, filter combos, honest totals, outage honesty", async
   assert.equal(filteredBody.totalCountKnown, true);
   assert.equal(filteredBody.total, 1);
 
+  // The shared 1900–2100 band is accepted and travels natively to TPDB.
+  // Below the band the route refuses (1899): accepting would let the
+  // adapter drop the filter and return unfiltered titles as if filtered.
+  const banded = await call(
+    "GET",
+    "/api/catalog/search?provider=tpdb&kind=movie&year=1900",
+    { cookie: member },
+  );
+  assert.equal(banded.status, 200);
+  assert.match(tpdbFx.lastQuery, /(^|[?&])year=1900(&|$)/);
+
   // Unsupported provider+kind+filter combinations: explicit errors, never
   // silent ignores.
   for (const query of [
     "provider=stashdb&kind=movie",
     "provider=stashdb&kind=scene&year=2020",
     "provider=tpdb&kind=movie&year=1800",
+    "provider=tpdb&kind=movie&year=1899",
     "provider=tpdb&kind=performer",
     "provider=tpdb&kind=performer&q=x&year=2020",
     `provider=tpdb&kind=performer&q=x&performer=${TPDB_PERFORMER}`,
@@ -3096,25 +3233,42 @@ test("requests: lifecycle, autoApprove, privacy, roles, origin", async () => {
   ).json()) as { acquisition: { state: string } | null };
   assert.equal(sharedForM2.acquisition?.state, "unsent");
 
+  // A second, still-pending request for the viewer (uniqueness is per-user,
+  // so m2's row on the same movie does not collide) keeps the non-approved
+  // side of member's list non-empty: the approved movie is the only other row.
+  const memberPending = await call("POST", "/api/requests", {
+    cookie: member,
+    body: { media: { provider: "tpdb", kind: "movie", id: TPDB_MOVIE2 } },
+  });
+  assert.equal(memberPending.status, 201);
+  const memberPendingBody = (await memberPending.json()) as {
+    request: { id: string };
+  };
+  const memberPendingId = memberPendingBody.request.id;
+
   // The requests LIST carries the shared acquisition state on approved rows
   // only: the requester can watch progress without another user's history.
   const listed = (await (
     await call("GET", "/api/requests", { cookie: member })
   ).json()) as {
     requests: {
+      id: string;
       decision: string;
-      acquisition: { state: string } | null;
+      acquisition?: { state: string } | null;
     }[];
   };
   // Requester list: acquisition facts yes, requester names no.
   assert.ok(listed.requests.every((r) => !("requestedBy" in r)));
   const approvedRow = listed.requests.find((r) => r.decision === "approved");
   assert.equal(approvedRow?.acquisition?.state, "unsent");
-  assert.ok(
-    listed.requests
-      .filter((r) => r.decision !== "approved")
-      .every((r) => r.acquisition === null),
+  // Non-approved rows return unchanged: exactly the pending row, by id,
+  // and it carries no acquisition field at all.
+  const nonApproved = listed.requests.filter((r) => r.decision !== "approved");
+  assert.deepEqual(
+    nonApproved.map((r) => r.id),
+    [memberPendingId],
   );
+  assert.ok(nonApproved.every((r) => !("acquisition" in r)));
 
   // Owner declines member2's pending request.
   const decline = await call("PATCH", `/api/requests/${m2RequestId}`, {
@@ -3372,6 +3526,57 @@ test("availability: distinct verdicts under the caller's own token", async () =>
   );
 });
 
+test("availability: the catalog year reaches the judgment; no detail read without a title hint", async () => {
+  // Exact title "Alpha Movie", but the catalog record (fixture row date
+  // 2024-02-03) contradicts the library item's ProductionYear 2020: the year
+  // policy rejects the pair, so the verdict is 'missing' — not the
+  // 'ambiguous' a title-only comparison produces. The acquisition is this
+  // test's own (recordObservation merges facts, so a shared one would leak).
+  const ownReq = await call("POST", "/api/requests", {
+    cookie: member,
+    body: {
+      media: { provider: "tpdb", kind: "movie", id: TPDB_MOVIE_YEAR },
+    },
+  });
+  assert.equal(ownReq.status, 201);
+  const ownId = ((await ownReq.json()) as { request: { id: string } }).request
+    .id;
+  await call("PATCH", `/api/requests/${ownId}`, {
+    cookie: owner,
+    body: { decision: "approved" },
+  });
+  const acq = getAcquisitionByReference({
+    provider: "tpdb",
+    kind: "movie",
+    id: TPDB_MOVIE_YEAR,
+  });
+  assert.ok(acq);
+  recordAcquisitionObservation(acq.id, {
+    state: "monitoring",
+    item: { whisparrId: 88, title: "Alpha Movie" },
+  });
+  const readsBefore = tpdbFx.calls;
+  const contradicting = await call(
+    "GET",
+    `/api/availability/tpdb/movie/${TPDB_MOVIE_YEAR}`,
+    { cookie: member },
+  );
+  assert.equal((await outcomeOf(contradicting)).outcome, "missing");
+  // One detail read carried both the year and the performer; never two.
+  assert.equal(tpdbFx.calls, readsBefore + 1);
+
+  // No acquisition, no title hint: nothing can use the year or the
+  // performer, so the provider is not read at all.
+  const idleBefore = tpdbFx.calls;
+  const neverAcquired = await call(
+    "GET",
+    "/api/availability/tpdb/movie/2a2b3c4d-0000-0000-0000-000000000005",
+    { cookie: member },
+  );
+  assert.equal((await outcomeOf(neverAcquired)).outcome, "missing");
+  assert.equal(tpdbFx.calls, idleBefore);
+});
+
 // --- M3 phase B: studio kind; browse params wired with explicit rejects ---
 test("studio search per provider; studio references refused as media; unsupported combos 400", async () => {
   // Providers read credentials and base at call time; point StashDB at the
@@ -3568,6 +3773,9 @@ interface FixtureCategory {
   provider: string;
   kind: string;
   items: { reference: { provider: string; kind: string; id: string } }[];
+  total?: number;
+  totalCountKnown?: boolean;
+  hasMore?: boolean;
   error?: { code: string };
 }
 
@@ -5399,6 +5607,66 @@ test("discover appends ONE followed rail across providers and isolates a provide
   }
 });
 
+test("followed rail names the provider when one performer's filmography fails", async () => {
+  // Two TPDB follows; one filmography 500s. The survivor's titles must
+  // still render beside a tpdb-tagged warning — a partial success never
+  // reads as complete.
+  for (const [id, name] of [
+    [TPDB_PERFORMER, "Fixture Performer"],
+    [TPDB_PERFORMER3, "Bulk Fixture Performer"],
+  ] as const) {
+    const created = await call("POST", "/api/follows", {
+      cookie: member2,
+      body: { performer: { provider: "tpdb", kind: "performer", id }, name },
+    });
+    assert.equal(created.status, 201);
+  }
+  resetMetaCache();
+  tpdbFx.failPaths = [`/performers/${TPDB_PERFORMER}/movies`];
+  try {
+    const page = await call("GET", "/api/discover", { cookie: member2 });
+    assert.equal(page.status, 200, "shelf failure must not fail the page");
+    const shelf = (await shelvesOf(page)).find(
+      (s) => s.id === "followed-titles",
+    );
+    assert.ok(shelf, "rail exists");
+    assert.equal(shelf.error, undefined);
+    assert.equal(shelf.errors?.length, 1, "the failed provider is named");
+    assert.equal(shelf.errors?.[0]?.provider, "tpdb");
+    assert.match(shelf.errors?.[0]?.code ?? "", /unavailable/);
+    // The failing performer contributes nothing; the other one's title
+    // survives.
+    assert.deepEqual(
+      (shelf.items ?? []).map((item) => refOf(item)?.id),
+      [TPDB_MOVIE6],
+    );
+  } finally {
+    tpdbFx.failPaths = [];
+  }
+
+  // All pages answer: no warning at all.
+  resetMetaCache();
+  const allOk = await call("GET", "/api/discover", { cookie: member2 });
+  assert.equal(allOk.status, 200);
+  const okShelf = (await shelvesOf(allOk)).find(
+    (s) => s.id === "followed-titles",
+  );
+  assert.equal(okShelf?.error, undefined);
+  assert.equal(okShelf?.errors, undefined);
+  assert.deepEqual(
+    (okShelf?.items ?? []).map((item) => refOf(item)?.id).sort(),
+    [TPDB_MOVIE5, TPDB_MOVIE6].sort(),
+  );
+
+  // Leave the standard six shelves for everyone after this test.
+  for (const id of [TPDB_PERFORMER, TPDB_PERFORMER3]) {
+    const removed = await call("DELETE", `/api/follows/tpdb/${id}`, {
+      cookie: member2,
+    });
+    assert.equal(removed.status, 204);
+  }
+});
+
 test("global search: six isolated categories, auth, blank q 400", async () => {
   assert.equal((await call("GET", "/api/search?q=Fixture")).status, 401);
 
@@ -5441,6 +5709,24 @@ test("global search: six isolated categories, auth, blank q 400", async () => {
       assert.equal(item.reference.provider, category.provider, category.id);
     }
   }
+  // The count travels with the category: the provider's attested exact
+  // total, never the bare page length. StashDB's studio search is the
+  // provider-capped shape: no total is known and none is invented.
+  assert.deepEqual(
+    search.categories.map((category) => [
+      category.totalCountKnown,
+      category.total,
+      category.hasMore,
+    ]),
+    [
+      [true, 1, false], // tpdb-movies
+      [true, 1, false], // stashdb-scenes
+      [true, 1, false], // tpdb-performers
+      [true, 1, false], // stashdb-performers
+      [true, 1, false], // tpdb-studios
+      [false, undefined, false], // stashdb-studios
+    ],
+  );
   assert.deepEqual(moviesCat?.items[0]?.reference, {
     provider: "tpdb",
     kind: "movie",
@@ -5500,6 +5786,34 @@ test("global search: six isolated categories, auth, blank q 400", async () => {
     assert.equal(category?.error, undefined, category?.id);
     assert.ok((category?.items.length ?? 0) > 0, category?.id);
   }
+  // A failed source carries no count at all — no total, no attestation.
+  for (const category of [
+    outStashScenes,
+    outStashPerformers,
+    outStashStudios,
+  ]) {
+    assert.equal(category?.totalCountKnown, false, category?.id);
+    assert.equal(category?.total, undefined, category?.id);
+    assert.equal(category?.hasMore, false, category?.id);
+  }
+});
+
+test("global search: a full first page reports hasMore, not the page length", async () => {
+  const ok = await call("GET", "/api/search?q=Many", { cookie: member });
+  assert.equal(ok.status, 200);
+  const search = await searchOf(ok);
+  const movies = search.categories.find((c) => c.id === "tpdb-movies");
+  assert.equal(movies?.error, undefined, "tpdb-movies");
+  // The fixture serves a full 6-row page under the fake 10000 cap with a
+  // provider next link: more results exist, the count stays unknown, and
+  // no total is invented.
+  assert.equal(movies?.hasMore, true, "tpdb-movies");
+  assert.equal(movies?.totalCountKnown, false, "tpdb-movies");
+  assert.equal(movies?.total, undefined, "tpdb-movies");
+  assert.ok(
+    (movies?.items.length ?? 0) > 0 && (movies?.items.length ?? 0) <= 6,
+    "tpdb-movies",
+  );
 });
 
 // --- M3: studioMode — accepted only for StashDB scene + studio filter ---
@@ -5883,6 +6197,66 @@ test("same-site and form mutations are refused even with VELVARR_ORIGIN unset", 
     });
     assert.equal(own.status, 200);
     assert.match(cookieOf(own), /^velvarr_session=/);
+  } finally {
+    process.env.VELVARR_ORIGIN = ORIGIN;
+  }
+});
+
+// A pinned https origin upgrades the session cookie even without
+// X-Forwarded-Proto (a proxy may omit it), and bodied mutations need the
+// JSON content type even when fetch metadata would let them through.
+test("pinned https origin secures the cookie; bodied mutations need a JSON content type", async () => {
+  process.env.VELVARR_ORIGIN = "https://velvarr.example.com";
+  try {
+    // Plain-http request URL, no X-Forwarded-Proto: only the pin can
+    // upgrade, so the login cookie must carry Secure.
+    const login = await call("POST", "/api/login", {
+      origin: "https://velvarr.example.com",
+      headers: { "sec-fetch-site": "same-origin" },
+      body: { username: "owner", password: "pass-owner" },
+    });
+    assert.equal(login.status, 200);
+    assert.match(login.headers.get("set-cookie") ?? "", /; Secure/);
+
+    // The sibling-app attack without fetch metadata: a typeless Blob body
+    // (no Content-Type, no CORS preflight). The wire frames every body with
+    // Content-Length or chunked encoding, so the Request models that
+    // framing explicitly.
+    const payload = JSON.stringify({
+      username: "owner",
+      password: "pass-owner",
+    });
+    const typeless = await api.POST(
+      new Request(`${ORIGIN}/api/login`, {
+        method: "POST",
+        body: new Blob([payload]),
+        headers: {
+          origin: "https://velvarr.example.com",
+          "content-length": String(payload.length),
+        },
+      }),
+      {
+        params: Promise.resolve({
+          path: segments(new URL("/api/login", ORIGIN).pathname),
+        }),
+      },
+    );
+    assert.equal(typeless.status, 403);
+    const typelessBody = (await typeless.json()) as {
+      error: { code: string };
+    };
+    assert.equal(typelessBody.error.code, "bad_content_type");
+    assert.equal(typeless.headers.get("set-cookie"), null);
+
+    // A bodyless DELETE without fetch metadata still passes the gate: it
+    // reaches the route and fails on the malformed id instead.
+    const del = await call("DELETE", "/api/follows/tpdb/not-a-uuid", {
+      origin: "https://velvarr.example.com",
+      cookie: owner,
+    });
+    assert.equal(del.status, 400);
+    const delBody = (await del.json()) as { error: { code: string } };
+    assert.equal(delBody.error.code, "invalid_reference");
   } finally {
     process.env.VELVARR_ORIGIN = ORIGIN;
   }
@@ -7208,4 +7582,192 @@ test("login spray cap: rotating strangers fill it, the admitted owner still sign
     body: { username: "owner", password: "pass-member" },
   });
   assert.notEqual(guess.status, 200);
+});
+
+// A plain-Error def folded into the real dispatch: pushed at module scope so
+// the spread inside route.ts (imported in before()) sees it. Session auth —
+// the open-surface assertion at the top of this file pins the exact open
+// list. At the file's end: the owner account exists only after setup ran.
+catalogRoutes.push({
+  method: "GET",
+  segments: ["boom"],
+  auth: "session",
+  run: () => {
+    throw new Error("boom");
+  },
+});
+
+test("unexpected route errors log once with the path and answer the stock 500; malformed path escapes answer 400", async () => {
+  const cookie = await loginAs("owner");
+  const logged: unknown[][] = [];
+  const realConsoleError = console.error;
+  console.error = (...args: unknown[]) => {
+    logged.push(args);
+  };
+  try {
+    const failing = await call("GET", "/api/boom", { cookie });
+    assert.equal(failing.status, 500);
+    assert.deepEqual(await failing.json(), {
+      error: { code: "internal", message: "Internal server error." },
+    });
+    assert.equal(logged.length, 1);
+    assert.match(String(logged[0]?.[0]), /^GET \/api\/boom/);
+    assert.ok(logged[0]?.[1] instanceof Error);
+
+    // A malformed percent-escape is the client's mistake: 400 invalid_path,
+    // and never a logged fault. Direct api.GET: call()'s segments() helper
+    // decodes eagerly and would throw before dispatch sees the path.
+    const malformed = await api.GET(
+      new Request(`${ORIGIN}/api/catalog/%E0%A4%A`, {
+        headers: { origin: ORIGIN, cookie },
+      }),
+      { params: Promise.resolve({ path: ["catalog", "%E0%A4%A"] }) },
+    );
+    assert.equal(malformed.status, 400);
+    assert.deepEqual(await malformed.json(), {
+      error: { code: "invalid_path", message: "Invalid request path." },
+    });
+    assert.equal(logged.length, 1);
+  } finally {
+    console.error = realConsoleError;
+  }
+});
+
+test("oversized POST bodies are rejected without buffering them", async () => {
+  // A non-browser client can POST application/json to open routes without a
+  // session, so the 32KiB limit must fire on the stream, not after a full
+  // read into memory.
+  const CHUNK = 1024;
+  const TOTAL = 256 * CHUNK; // 256 KiB available, 8x over the limit
+  let produced = 0;
+  let cancelled = false;
+  const counting = new ReadableStream<Uint8Array>({
+    pull(controller) {
+      if (produced >= TOTAL) {
+        controller.close();
+        return;
+      }
+      produced += CHUNK;
+      controller.enqueue(new Uint8Array(CHUNK).fill(0x20));
+    },
+    cancel() {
+      cancelled = true;
+    },
+  });
+  const res = await api.POST(
+    new Request(`${ORIGIN}/api/login`, {
+      method: "POST",
+      headers: { origin: ORIGIN, "content-type": "application/json" },
+      body: counting,
+      duplex: "half",
+    } as RequestInit),
+    { params: Promise.resolve({ path: ["login"] }) },
+  );
+  assert.equal(res.status, 413);
+  assert.equal((await errorShape(res)).code, "payload_too_large");
+  // The producer was cut off near the limit, never drained.
+  assert.ok(produced <= 32 * 1024 + 4 * CHUNK, `pulled ${produced} bytes`);
+  assert.ok(cancelled, "stream was not cancelled");
+});
+
+test("a declared Content-Length over the limit is refused without reading", async () => {
+  let produced = 0;
+  const never = new ReadableStream<Uint8Array>({
+    pull() {
+      produced += 1;
+      throw new Error("body must not be read");
+    },
+  });
+  const res = await api.POST(
+    new Request(`${ORIGIN}/api/login`, {
+      method: "POST",
+      headers: {
+        origin: ORIGIN,
+        "content-type": "application/json",
+        "content-length": String(64 * 1024),
+      },
+      body: never,
+      duplex: "half",
+    } as RequestInit),
+    { params: Promise.resolve({ path: ["login"] }) },
+  );
+  assert.equal(res.status, 413);
+  assert.equal((await errorShape(res)).code, "payload_too_large");
+  // The one pull below is the Request constructor's body inspection, not the
+  // handler's: it errors the stream, so any handler read would reject into a
+  // 500 — the 413 above proves the body was never read.
+  assert.ok(produced <= 1, `handler read the body (${produced} pulls)`);
+});
+test("concurrent wrong-password logins for one name: at most ACCOUNT_LIMIT reach Jellyfin", async () => {
+  // The account bucket must bound a burst, not just a sequence: a charge
+  // that only lands after the upstream round-trip lets every parallel
+  // guess pass the read-only gate before any of them is counted.
+  resetLoginBuckets();
+  fx.journalOn = true;
+  fx.journal.length = 0;
+  try {
+    const responses = await Promise.all(
+      Array.from({ length: 40 }, () =>
+        call("POST", "/api/login", {
+          body: { username: "owner", password: "pass-member" },
+        }),
+      ),
+    );
+    const reached = fx.journal.filter(
+      (entry) =>
+        entry.method === "POST" && entry.path === "/Users/AuthenticateByName",
+    ).length;
+    assert.ok(
+      reached >= 1,
+      "the burst must be real: at least one guess reaches Jellyfin",
+    );
+    assert.ok(
+      reached <= 5,
+      `at most ACCOUNT_LIMIT guesses may reach Jellyfin, saw ${reached}`,
+    );
+    assert.ok(
+      responses.some((res) => res.status === 429),
+      "the surplus guesses must be refused at the gate",
+    );
+    for (const res of responses) {
+      assert.ok(
+        res.status === 429 || res.status === 502,
+        `unexpected status ${res.status}`,
+      );
+    }
+  } finally {
+    fx.journalOn = false;
+  }
+});
+
+test("failed sign-in attempts leave an audit line with the reported client ip", async () => {
+  // Seerr-parity detection: every credential rejection logs the attempted
+  // name and the client address the hop in front reported — never the
+  // password.
+  resetLoginBuckets();
+  const lines: string[] = [];
+  const originalWarn = console.warn;
+  console.warn = (line?: unknown) => {
+    lines.push(String(line));
+  };
+  try {
+    const res = await call("POST", "/api/login", {
+      headers: { "x-forwarded-for": "203.0.113.7, 10.0.0.1" },
+      body: { username: "member", password: "pass-guess-9" },
+    });
+    assert.equal(res.status, 502);
+  } finally {
+    console.warn = originalWarn;
+  }
+  const line = lines.find((entry) => entry.includes("failed sign-in attempt"));
+  assert.ok(line, "a credential rejection must leave an audit line");
+  assert.ok(line.includes("ip=203.0.113.7"), "first forwarded hop wins");
+  assert.ok(
+    line.includes(`account=${JSON.stringify("member")}`),
+    "the attempted name is logged injection-safe",
+  );
+  assert.ok(
+    !line.includes("pass-guess-9"),
+    "the password stays out of the log",
+  );
 });

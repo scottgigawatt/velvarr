@@ -33,7 +33,12 @@ const config = {
   // slack on top of the measured net time, never the sole kill clock.
   timeoutMS: 60000,
   concurrency: 8,
-  mutate: ["src/lib/**/*.ts", "src/server/browse.ts", "src/server/related.ts"],
+  mutate: [
+    "src/lib/**/*.ts",
+    "src/server/browse.ts",
+    "src/server/related.ts",
+    "src/server/update.ts",
+  ],
   // TypeScript 7 (typescript-go) dropped the JS config API Stryker's tsconfig
   // preprocessor needs. Pointing at a nonexistent file skips its rewrite,
   // which only fixes extends/references paths for monorepo sandboxes — this
@@ -44,17 +49,20 @@ const config = {
   // No `incremental` here: with the command runner a stale cache replayed
   // statuses from an older command (one replay reported decisions.ts at 0%
   // that the current suite kills completely). The honest cost is the full
-  // run: ~18.5 min at 1468 tested of 2272 instrumented (2026-10-12,
-  // Linux worker, concurrency 8).
+  // run: ~22 min at 1478 tested (2026-10-12, Linux worker, concurrency 8).
   reporters: ["clear-text", "progress"],
   // stryker.log (cwd) captures the run including worker deaths, but its
   // per-mutant detail covers killed mutants only — the survived diffs are
   // console-only, so capture stdout when hunting survivors.
   fileLogLevel: "trace",
-  // break is the measured clean-run score (85.01, 2026-10-12), floored;
-  // a regression below it fails the run, and the margin is one mutant.
-  // status.ts is fully killed: the badge and acquisition-line tests pin
-  // every branch, and the sorts suite pins the capability table.
+  // break is the measured clean-run score (86.23, 2026-10-12, after the
+  // browse include-criteria decisions moved into src/lib/browse-includes.ts)
+  // floored to one decimal; a regression below it fails the run, and the
+  // margin is under two mutants.
+  // status.ts and browse-includes.ts are fully killed: the badge and
+  // acquisition-line tests pin every status branch, the sorts suite pins
+  // the capability table, and tests/browse.test.ts pins the include
+  // criteria, the soft-ceiling predicate and the ceiling outcome directly.
   // Accepted survivors: sorts.ts's defensive `?.`/`?? []` chains, which
   // no typed provider/kind input can reach, the error-message copy
   // strings in related.ts, the
@@ -62,11 +70,14 @@ const config = {
   // empty-array shape defaults asserted nowhere, the fetch-param conditionals
   // and sort comparators in browse.ts/contracts.ts/related.ts that the
   // provider fixtures assert only loosely — vocabulary, shape and ordering,
-  // not dedupe/merge logic — update.ts's four outcome-equivalent mutants
+  // not dedupe/merge logic — lib/update.ts's four outcome-equivalent mutants
   // (guard some-vs-every, loop-bound and comparison rewrites that cannot flip
-  // a returned boolean), and api-get.ts's FIFO-cap edges (has/clear/eviction
+  // a returned boolean), src/server/update.ts's payload-guard chain (a
+  // non-string tag_name/html_url or an || → && rewrite dies in the same
+  // caught TypeError and the two error-message copy strings never surface),
+  // and api-get.ts's FIFO-cap edges (has/clear/eviction
   // conditionals asserted only loosely by the queue-order tests).
-  thresholds: { high: 85, low: 75, break: 85 },
+  thresholds: { high: 85, low: 75, break: 86.2 },
 };
 
 export default config;

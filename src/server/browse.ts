@@ -13,8 +13,11 @@
 //
 // ponytail: upstream scan ceiling is 40 provider pages per stream per
 // request. Hitting it before a page fills is a visible 422 "query_too_broad",
-// never a fake empty page or fake end — narrow the filters. Raise
-// MAX_SCAN_PAGES only when real browsing measurably needs it.
+// never a fake empty page or fake end — narrow the filters. One exception:
+// a multi-term free-text AND split between a native tag criterion and the
+// local re-check degrades to a named partial page instead
+// (Stream.softCeiling). Raise MAX_SCAN_PAGES only when real browsing
+// measurably needs it.
 
 // Stryker disable all — the mutation window re-opens below the parse/adapters
 // block and covers the pure merge/plan logic only (mergeStreams, nativeQuery,
@@ -29,7 +32,14 @@ import {
   searchCatalog,
   searchCatalogTags,
   tagCounterpart,
+  expandCatalogTagTerm,
 } from "./providers.ts";
+import {
+  resolveIncludeCriteria,
+  scanCeilingOutcome,
+  softCeilingFor,
+  type TagExpansion,
+} from "../lib/browse-includes.ts";
 import type {
   CatalogSearchPage,
   CatalogSearchQuery,
@@ -38,8 +48,12 @@ import type {
   ReleaseDateOperation,
 } from "./providers.ts";
 import { getConfig, parseTagSelections } from "./storage.ts";
-import { isIsoDate } from "./provider-rows.ts";
-import { normalizeFacetName } from "../lib/contracts.ts";
+import { isIsoDate, isUuid } from "./provider-rows.ts";
+import {
+  CATALOG_YEAR_MAX,
+  CATALOG_YEAR_MIN,
+  normalizeFacetName,
+} from "../lib/contracts.ts";
 import { BROWSE_MIXED_SORTS, SORT_KEYS, sortSpec } from "../lib/sorts.ts";
 import type {
   BrowseTagsResponse,
@@ -195,8 +209,14 @@ export function parseBrowseQuery(params: URLSearchParams): BrowseQuery {
   let year: number | undefined;
   if (yearRaw !== null && yearRaw.trim() !== "") {
     year = Number(yearRaw);
-    if (!Number.isInteger(year) || year < 1900 || year > 2100) {
-      throw invalidQuery("year must be a calendar year between 1900 and 2100.");
+    if (
+      !Number.isInteger(year) ||
+      year < CATALOG_YEAR_MIN ||
+      year > CATALOG_YEAR_MAX
+    ) {
+      throw invalidQuery(
+        `year must be a calendar year between ${CATALOG_YEAR_MIN} and ${CATALOG_YEAR_MAX}.`,
+      );
     }
   }
   const pageRaw = params.get("page");
@@ -236,9 +256,11 @@ export function parseBrowseQuery(params: URLSearchParams): BrowseQuery {
     ...(q !== undefined && q !== "" ? { q } : {}),
     include: parseSelections(params, "include"),
     // Both lists accept labels with no provider id: an include label is a
-    // free-text term matched locally as a substring, an exclude label runs
-    // the local family matcher. Neither can travel natively, so neither is
-    // rejected here.
+    // free-text term that expands on each side's published tags — the
+    // native any-of criterion when the expansion is complete and within
+    // the native id cap, the local substring re-check otherwise — and an
+    // exclude label runs the local family matcher. Neither can travel as
+    // an exact native tag, so neither is rejected here.
     exclude: parseSelections(params, "exclude"),
     ...omitUndefined({
       studioTpdb: parseId(params, "studioTpdb"),
@@ -263,10 +285,12 @@ export function parseBrowseQuery(params: URLSearchParams): BrowseQuery {
 
 // --- stream planning ---
 
-/** A selection with no provider id on either side: a free-text chip, which
- * can only filter locally. One predicate for the whole pipeline — parse,
- * native resolution and the visible predicate must agree on it, or a
- * free-text include 400s or disqualifies a side again. */
+/** A selection with no provider id on either side: a free-text chip. An
+ * include expands to every published tag whose name contains the term and
+ * travels natively as an any-of criterion; an exclude runs the local
+ * family matcher. One predicate for the whole pipeline — parse, native
+ * resolution and the visible predicate must agree on it, or a free-text
+ * include 400s or disqualifies a side again. */
 function isFreeTextSelection(sel: CatalogTagSelection): boolean {
   return sel.tpdb === undefined && sel.stashdb === undefined;
 }
@@ -297,37 +321,91 @@ function visiblePredicate(
   };
 }
 
-/** Resolves the native include-id list for one provider side. Every included
- * tag must be matchable on a qualifying source: a selection already carrying
- * the side's UUID uses it; otherwise the counterpart id is resolved through
- * the providers' own published label pairing. Free-text selections carry no
- * native anchor anywhere, so they are skipped here and filter locally
- * instead. An unresolvable anchored tag disqualifies the whole side
- * (undefined) — it is NEVER allowed to run unfiltered. A lookup that fails
+/** The native include criteria one provider side can carry: `allOf` are
+ * the anchored tag ids plus every singleton free-text expansion (AND
+ * criterion — a title satisfying the term AND must carry each of these
+ * tags), `anyOf` the smallest free-text expansion (any-of criterion — a
+ * valid pre-filter only, sent when no singleton or anchored id exists and
+ * the expansion is complete and fits the native id cap). `localFree`
+ * holds the free-text terms the visible predicate must still re-check
+ * locally: several terms AND together, which one upstream tag criterion
+ * cannot express. */
+type ResolvedIncludes = {
+  allOf: string[];
+  anyOf: string[];
+  localFree: CatalogTagSelection[];
+  /** True when at least one free-text term rides the native tag criterion
+   * (a singleton expansion in `allOf`, or the `anyOf` group): at the scan
+   * ceiling such a stream degrades softly — its pages were productive and
+   * the matches found are a real partial answer. */
+  freeTextNative: boolean;
+};
+
+/** Resolves the native include criteria for one provider side. Anchored
+ * selections resolve as before: a selection already carrying the side's
+ * UUID uses it; otherwise the counterpart id is resolved through the
+ * providers' own published label pairing, and an unresolvable anchored tag
+ * — including a uuid-less match (TPDB numeric-string id) — disqualifies the
+ * whole side (undefined) — it is NEVER allowed to run unfiltered.
+ * Free-text includes expand on THIS side's complete published tag listing
+ * (expandCatalogTagTerm), anchored ids or not. Every term's expansion must
+ * be complete and native — no capped walk, no uuid-less rows — before
+ * anything free travels: a partial criterion would silently drop titles,
+ * and an empty expansion is never proof the side is empty, so the side is
+ * never skipped for one; anything incomplete keeps the WHOLE free group on
+ * the local substring re-check with the side's approximate totals. Of a
+ * complete group set, the most selective valid pre-filter travels: every
+ * singleton group joins the anchored ids in the all-of criterion (an AND
+ * match must carry each of those tags), and with no singleton and no
+ * anchored id the smallest group rides alone as any-of while the other
+ * terms keep filtering locally. A lookup that fails
  * throws; browseTitles records the side as a failed source instead of
  * reading the outage as absence. */
 async function includeIdsForSide(
   selections: CatalogTagSelection[],
   side: "tpdb" | "stashdb",
-): Promise<string[] | undefined> {
-  const ids: string[] = [];
+  expandFree: boolean,
+): Promise<ResolvedIncludes | undefined> {
+  const allOf: string[] = [];
+  const free: CatalogTagSelection[] = [];
   for (const sel of selections) {
     const direct = side === "tpdb" ? sel.tpdb : sel.stashdb;
     if (direct !== undefined) {
-      if (!ids.includes(direct)) ids.push(direct);
+      if (!allOf.includes(direct)) allOf.push(direct);
       continue;
     }
-    // Free text filters locally below; it never constrains a native query.
-    if (isFreeTextSelection(sel)) continue;
-    // tagCounterpart searches the OTHER provider by exact normalized label.
-    const counterpart = await tagCounterpart(
-      side === "tpdb" ? "stashdb" : "tpdb",
-      sel.name,
-    );
-    if (counterpart === undefined) return undefined;
-    if (!ids.includes(counterpart.id)) ids.push(counterpart.id);
+    if (!isFreeTextSelection(sel)) {
+      // tagCounterpart searches the OTHER provider by exact normalized
+      // label.
+      const counterpart = await tagCounterpart(
+        side === "tpdb" ? "stashdb" : "tpdb",
+        sel.name,
+      );
+      if (counterpart === undefined) return undefined;
+      if (!allOf.includes(counterpart.id)) allOf.push(counterpart.id);
+      continue;
+    }
+    free.push(sel);
   }
-  return ids;
+  if (free.length === 0 || !expandFree) {
+    return { allOf, anyOf: [], localFree: free, freeTextNative: false };
+  }
+  // Every term expands before the decision: the tag listing behind
+  // expandCatalogTagTerm is memoized, so reading every term costs no extra
+  // upstream traffic, and complete term indexes keep localFree aligned
+  // with the caller's selections. The ride-local-or-native decision
+  // itself lives in resolveIncludeCriteria.
+  const expansions: TagExpansion[] = [];
+  for (const sel of free) {
+    expansions.push(await expandCatalogTagTerm(side, sel.name));
+  }
+  const criteria = resolveIncludeCriteria(allOf, expansions);
+  return {
+    allOf: criteria.allOf,
+    anyOf: criteria.anyOf,
+    localFree: criteria.localTermIndexes.map((i) => free[i]!),
+    freeTextNative: criteria.freeTextNative,
+  };
 }
 
 // --- ordered merge over provider-native streams ---
@@ -387,6 +465,12 @@ class Stream {
   /** True when any displayed predicate is evaluated locally, which makes
    * provider-reported totals count the wrong thing. */
   readonly localFiltered: boolean;
+  /** True when this stream's local filter is the local half of a free-text
+   * AND whose other terms ride the native tag criterion: at the scan
+   * ceiling it degrades to a named incomplete error instead of throwing,
+   * because the native pre-filter kept the scanned pages productive and
+   * the matches found are a real partial answer. */
+  readonly softCeiling: boolean;
   private page = 0;
   private fetches = 0;
   private readonly base: CatalogSearchQuery;
@@ -398,11 +482,13 @@ class Stream {
     visible: (d: CatalogDetail) => boolean,
     perPage: number,
     localFiltered: boolean,
+    softCeiling = false,
   ) {
     this.base = base;
     this.visible = visible;
     this.perPage = perPage;
     this.localFiltered = localFiltered;
+    this.softCeiling = softCeiling;
   }
 
   get live(): boolean {
@@ -415,16 +501,29 @@ class Stream {
   }
 
   /** One more upstream page into the buffer. Throws query_too_broad when the
-   * documented ceiling is hit while upstream continuation still exists. */
+   * documented ceiling is hit while upstream continuation still exists —
+   * except a softCeiling stream, which degrades to a named scan_ceiling
+   * error instead of throwing. */
   async fetch(): Promise<void> {
     if (!this.live) return;
     this.fetches += 1;
     if (this.fetches > MAX_SCAN_PAGES) {
-      throw new AppError(
-        422,
-        "query_too_broad",
-        "Browse reached its upstream page limit before filling this page; narrow the filters.",
-      );
+      const ceiling = scanCeilingOutcome(this.softCeiling, this.base.provider);
+      if (ceiling.hard) {
+        throw new AppError(
+          422,
+          "query_too_broad",
+          "Browse reached its upstream page limit before filling this page; narrow the filters.",
+        );
+      }
+      // ponytail ceiling: a free-text AND the providers cannot express
+      // natively degrades instead of 422ing — the native pre-filter kept
+      // every scanned page productive, so the matches found are a real
+      // partial answer and the named error says so. Widen the native
+      // expression (provider combinator criteria) if this fires often.
+      this.exhausted = true;
+      this.error = ceiling.error;
+      return;
     }
     this.page += 1;
     try {
@@ -518,7 +617,8 @@ async function mergeStreams(
     // an unfetched page.
     // A page whose rows were all filtered out locally must not end the
     // browse: keep pulling that stream until it yields a visible row or
-    // genuinely runs out (the scan ceiling throws).
+    // genuinely runs out (a hard scan ceiling throws; a soft one ends the
+    // stream with its named scan_ceiling error).
     for (const s of streams) {
       while (s.buffer.length === 0 && s.live) await s.fetch();
     }
@@ -546,7 +646,16 @@ async function mergeStreams(
   const errors: SourceError[] = streams
     .filter((s) => s.error !== undefined)
     .map((s) => s.error!);
-  if (items.length === 0 && errors.length === streams.length) {
+  // A 502 needs every side to have failed for real: a stream stopping on
+  // its own scan ceiling is a bounded (if matchless) answer, not an outage,
+  // so a ceiling beside a real outage — or beside another ceiling — stays
+  // a partial page whose named errors say so. Only outages on every side
+  // leave nothing answered.
+  if (
+    items.length === 0 &&
+    errors.length === streams.length &&
+    errors.every((e) => e.code !== "scan_ceiling")
+  ) {
     allSourcesFailed(streams); // all-source failure stays visible
   }
   const exhausted =
@@ -593,6 +702,9 @@ function nativeQuery(
   plan: {
     provider: CatalogProvider;
     includeIds: string[];
+    /** True when includeIds are a free-text expansion: the native criterion
+     * is any-of (`tags`) instead of all-of (`tagsAll`). */
+    includeAny: boolean;
     excludeIds: string[];
     performerIds?: string[];
   },
@@ -618,7 +730,9 @@ function nativeQuery(
       ...(query.studioTpdb !== undefined ? { studio: query.studioTpdb } : {}),
       ...(filmography ? { performer: query.performerTpdb } : {}),
       ...(plan.includeIds.length > 0 && !filmography
-        ? { tagsAll: plan.includeIds }
+        ? plan.includeAny
+          ? { tags: plan.includeIds }
+          : { tagsAll: plan.includeIds }
         : {}),
       ...(sort !== undefined
         ? {
@@ -644,11 +758,14 @@ function nativeQuery(
     ...(query.studioStashdb !== undefined
       ? { studio: query.studioStashdb, studioMode: query.studioMode }
       : {}),
-    // One upstream tag criterion: native ALL-of-includes, or — only when no
-    // include is native — native excludes. Mixed include+exclude keeps the
-    // includes native and re-checks every exclusion locally.
+    // One upstream tag criterion: native includes (all-of anchored or any-of
+    // free-text expansion), or — only when no include is native — native
+    // excludes. Mixed include+exclude keeps the includes native and
+    // re-checks every exclusion locally.
     ...(plan.includeIds.length > 0
-      ? { tagsAll: plan.includeIds }
+      ? plan.includeAny
+        ? { tags: plan.includeIds }
+        : { tagsAll: plan.includeIds }
       : plan.excludeIds.length > 0
         ? { tagsExclude: plan.excludeIds }
         : {}),
@@ -919,25 +1036,28 @@ export async function browseTitles(
   const resolveIncludes = (
     wanted: boolean,
     side: "tpdb" | "stashdb",
-  ): Promise<string[] | undefined> => {
+  ): Promise<ResolvedIncludes | undefined> => {
     if (!wanted) return Promise.resolve(undefined);
-    return includeIdsForSide(query.include, side).catch((err: unknown) => {
-      unresolved.push(unresolvedStream(side, err));
-      return undefined;
-    });
+    // The filmography route rejects tag parameters, so TPDB never expands
+    // free text there; every other side can carry the any-of criterion.
+    const expandFree = !(side === "tpdb" && filmography);
+    return includeIdsForSide(query.include, side, expandFree).catch(
+      (err: unknown) => {
+        unresolved.push(unresolvedStream(side, err));
+        return undefined;
+      },
+    );
   };
   const [tpdbIncludes, stashIncludes] = await Promise.all([
     resolveIncludes(movieWanted, "tpdb"),
     resolveIncludes(sceneWanted, "stashdb"),
   ]);
 
-  // Free-text includes carry no native anchor: both sides keep running and
-  // the visible predicate applies the term locally as a substring.
-  const freeIncludes = query.include.filter(isFreeTextSelection);
-
   const plans: {
     provider: CatalogProvider;
     includeIds: string[];
+    includeAny: boolean;
+    freeTextNative: boolean;
     excludeIds: string[];
     localFiltered: boolean;
     localInclude: CatalogTagSelection[];
@@ -945,37 +1065,52 @@ export async function browseTitles(
     performerIds?: string[];
   }[] = [];
   if (movieWanted && tpdbIncludes !== undefined) {
+    // Free-text includes expand natively on this side (the filmography
+    // route rejects tag parameters, so there they stay local); anchored
+    // ids and singleton expansions share the one all-of criterion, so
+    // anyOf only ever rides alone.
     plans.push({
       provider: "tpdb",
-      includeIds: tpdbIncludes,
+      includeIds:
+        tpdbIncludes.allOf.length > 0 ? tpdbIncludes.allOf : tpdbIncludes.anyOf,
+      includeAny:
+        tpdbIncludes.allOf.length === 0 && tpdbIncludes.anyOf.length > 0,
+      freeTextNative: tpdbIncludes.freeTextNative,
       excludeIds: [], // TPDB has no native exclude criterion
       localFiltered:
         hiddenTags.length > 0 ||
         query.exclude.length > 0 ||
-        freeIncludes.length > 0 ||
+        tpdbIncludes.localFree.length > 0 ||
         (filmography && query.include.length > 0),
-      localInclude: filmography ? query.include : freeIncludes,
+      localInclude: filmography ? query.include : tpdbIncludes.localFree,
       localYear: undefined,
     });
   }
   if (sceneWanted && stashIncludes !== undefined) {
+    const includesNative =
+      stashIncludes.allOf.length > 0 || stashIncludes.anyOf.length > 0;
     plans.push({
       provider: "stashdb",
-      includeIds: stashIncludes,
+      includeIds:
+        stashIncludes.allOf.length > 0
+          ? stashIncludes.allOf
+          : stashIncludes.anyOf,
+      includeAny:
+        stashIncludes.allOf.length === 0 && stashIncludes.anyOf.length > 0,
+      freeTextNative: stashIncludes.freeTextNative,
       // One upstream tag criterion: native excludes only when no include is
       // native. Selections without a StashDB id stay local-only below.
-      excludeIds:
-        stashIncludes.length === 0
-          ? query.exclude
-              .map((sel) => sel.stashdb)
-              .filter((id): id is string => id !== undefined)
-          : [],
+      excludeIds: includesNative
+        ? []
+        : query.exclude
+            .map((sel) => sel.stashdb)
+            .filter((id): id is string => id !== undefined),
       localFiltered:
         hiddenTags.length > 0 ||
         query.exclude.length > 0 ||
-        freeIncludes.length > 0 ||
+        stashIncludes.localFree.length > 0 ||
         query.year !== undefined,
-      localInclude: freeIncludes,
+      localInclude: stashIncludes.localFree,
       localYear: query.year,
       performerIds:
         query.performerStarred === true ? starredPerformerIds : undefined,
@@ -1050,6 +1185,7 @@ export async function browseTitles(
         ),
         query.perPage,
         plan.localFiltered,
+        softCeilingFor(plan),
       ),
   );
   streams.push(...unresolved);
@@ -1145,6 +1281,10 @@ export async function searchBrowseTags(
       continue;
     }
     for (const row of result.value) {
+      // A uuid-less TPDB id would fail the stored-selection boundary with
+      // a misleading 400 and can never ride a native filter: the row never
+      // rides back (the typed term stays offered as free text).
+      if (provider === "tpdb" && !isUuid(row.id)) continue;
       const label = normalizeFacetName(row.name);
       if (label === "") continue;
       const existing = byLabel.get(label);
@@ -1173,6 +1313,9 @@ export async function searchBrowseTags(
         for (let i = 0; i < settled.length; i++) {
           if (settled[i]!.status !== "fulfilled") continue;
           for (const row of await listCatalogTags(providers[i]!)) {
+            // Same boundary as the search rows: uuid-less TPDB tag ids
+            // would fail the stored-selection validation downstream.
+            if (providers[i] === "tpdb" && !isUuid(row.id)) continue;
             candidates.push({
               id: row.id,
               name: row.name,
