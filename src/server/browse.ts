@@ -1,3 +1,4 @@
+import { previewLimitError, type CatalogScanBudget } from "./catalog-budget.ts";
 import type { TmdbQuery } from "./tmdb.ts";
 // User-visible catalog composition: one Browse destination over TPDB movies
 // and StashDB scenes, with personal hidden tags and tag include/exclude
@@ -39,6 +40,7 @@ import {
   resolveIncludeCriteria,
   scanCeilingOutcome,
   softCeilingFor,
+  TAG_FILTER_ID_CAP,
   type TagExpansion,
 } from "../lib/browse-includes.ts";
 import type {
@@ -486,6 +488,7 @@ class Stream {
    * because the native pre-filter kept the scanned pages productive and
    * the matches found are a real partial answer. */
   readonly softCeiling: boolean;
+  private readonly scanBudget?: CatalogScanBudget;
   private page = 0;
   private fetches = 0;
   private readonly base: CatalogSearchQuery;
@@ -498,12 +501,14 @@ class Stream {
     perPage: number,
     localFiltered: boolean,
     softCeiling = false,
+    scanBudget?: CatalogScanBudget,
   ) {
     this.base = base;
     this.visible = visible;
     this.perPage = perPage;
     this.localFiltered = localFiltered;
     this.softCeiling = softCeiling;
+    this.scanBudget = scanBudget;
   }
 
   get live(): boolean {
@@ -522,7 +527,12 @@ class Stream {
   async fetch(): Promise<void> {
     if (!this.live) return;
     this.fetches += 1;
-    if (this.fetches > MAX_SCAN_PAGES) {
+    if (this.fetches > (this.scanBudget?.maxPages ?? MAX_SCAN_PAGES)) {
+      if (this.scanBudget) {
+        this.exhausted = true;
+        this.error = previewLimitError(this.base.provider);
+        return;
+      }
       const ceiling = scanCeilingOutcome(this.softCeiling, this.base.provider);
       if (ceiling.hard) {
         throw new AppError(
@@ -990,6 +1000,7 @@ export async function browseTitles(
   query: BrowseQuery,
   hiddenTags: CatalogTagSelection[],
   starredPerformerIds: string[] = [],
+  scanBudget?: CatalogScanBudget,
 ): Promise<BrowsePage> {
   if (query.movieSource === "tmdb" && query.type !== "scene") {
     if (
@@ -1035,9 +1046,10 @@ export async function browseTitles(
         page: query.page,
         perPage: query.perPage,
       },
-      hiddenTags,
+      [], // TMDB receives hidden tags as exclusions in the same bounded scan.
+      scanBudget,
     );
-    return { ...result, errors: [] };
+    return { ...result, errors: result.errors ?? [] };
   }
   const plan = planBrowseSides(query);
   if (query.performerStarred === true && starredPerformerIds.length === 0) {
@@ -1132,9 +1144,11 @@ export async function browseTitles(
       // native. Selections without a StashDB id stay local-only below.
       excludeIds: includesNative
         ? []
-        : query.exclude
+        : [...query.exclude, ...(scanBudget ? hiddenTags : [])]
             .map((sel) => sel.stashdb)
-            .filter((id): id is string => id !== undefined),
+            .filter((id): id is string => id !== undefined)
+            // Keep excess and label-family exclusions in the local predicate.
+            .slice(0, TAG_FILTER_ID_CAP),
       localFiltered:
         hiddenTags.length > 0 ||
         query.exclude.length > 0 ||
@@ -1216,6 +1230,7 @@ export async function browseTitles(
         query.perPage,
         plan.localFiltered,
         softCeilingFor(plan),
+        scanBudget,
       ),
   );
   streams.push(...unresolved);
@@ -1237,7 +1252,16 @@ export async function browseTitles(
 export async function searchVisibleCatalog(
   query: CatalogSearchQuery,
   hiddenTags: CatalogTagSelection[],
+  scanBudget?: CatalogScanBudget,
 ): Promise<CatalogSearchPage> {
+  // TMDB already filters keywords/adult/date while scanning native pages.
+  // A second visible-page fill loop could multiply the scan budget.
+  if (query.provider === "tmdb")
+    return searchCatalog({
+      ...query,
+      excludeTags: [...(query.excludeTags ?? []), ...hiddenTags],
+      ...(scanBudget ? { scanBudget } : {}),
+    });
   if (
     hiddenTags.length === 0 ||
     (query.kind !== "movie" && query.kind !== "scene")
@@ -1251,13 +1275,15 @@ export async function searchVisibleCatalog(
     (d) => !isHiddenTitle(d, hiddenTags),
     perPage,
     true, // hidden filtering is always local
+    false,
+    scanBudget,
   );
   const start = (requestedPage - 1) * perPage;
   // `live` (not `open`): a stream holding buffered rows but no continuation
   // must end the fill, otherwise this spins on a no-op fetch.
   while (stream.buffer.length < start + perPage && stream.live) {
     await stream.fetch();
-    if (stream.error !== undefined) {
+    if (stream.error !== undefined && stream.error.code !== "scan_ceiling") {
       throw new AppError(502, stream.error.code, stream.error.message);
     }
   }
@@ -1271,10 +1297,11 @@ export async function searchVisibleCatalog(
     // Exhausted but holding rows past this page: the surplus is still
     // pageable (mergeStreams requires the same empty-buffer proof).
     hasMore: !exhausted || stream.buffer.length > start + perPage,
-    ...(exhausted
+    ...(exhausted && !stream.error
       ? { total: stream.buffer.length, totalCountKnown: true }
       : { totalCountKnown: false }),
     items: stream.buffer.slice(start, start + perPage),
+    ...(stream.error ? { errors: [stream.error] } : {}),
   };
 }
 

@@ -1,3 +1,4 @@
+import { previewLimitError, type CatalogScanBudget } from "./catalog-budget.ts";
 // TMDB movie reads only. Search pages stay lightweight; details are fetched on demand.
 import type {
   CatalogDetail,
@@ -25,6 +26,8 @@ export type TmdbQuery = {
   direction?: "asc" | "desc";
   page?: number;
   perPage?: number;
+  /** Internal preview policy, never forwarded to the provider. */
+  scanBudget?: CatalogScanBudget;
 };
 type Row = Record<string, unknown>;
 type Read = <T>(path: string) => Promise<T>;
@@ -227,7 +230,11 @@ export async function searchTmdb(
   const items: CatalogDetail[] = [];
   let total: number | undefined,
     more = false;
-  for (let fetched = 0; fetched < 40; fetched++, nativePage++) {
+  for (
+    let fetched = 0;
+    fetched < (query.scanBudget?.maxPages ?? 40);
+    fetched++, nativePage++
+  ) {
     if (nativePage > 500)
       throw new AppError(
         422,
@@ -371,6 +378,18 @@ export async function searchTmdb(
         ...(!filtered && Number(data.total_pages) <= 500 ? { total } : {}),
       };
   }
+  if (query.scanBudget)
+    return {
+      provider: "tmdb",
+      kind: "movie",
+      page,
+      perPage,
+      items,
+      sort: appliedSort,
+      hasMore: false,
+      totalCountKnown: false,
+      errors: [previewLimitError("tmdb")],
+    };
   throw new AppError(
     422,
     "query_too_broad",

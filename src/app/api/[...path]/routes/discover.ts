@@ -1,3 +1,5 @@
+import { TAG_FILTER_ID_CAP } from "../../../../lib/browse-includes.ts";
+import { DISCOVER_SCAN_BUDGET } from "../../../../server/catalog-budget.ts";
 import { type AuthContext, json } from "../admission.ts";
 import { PROVIDER_UUID } from "../parse.ts";
 import type {
@@ -216,7 +218,11 @@ export function browseShelf(
     return { ...base, error: shelfError(result.reason) };
   const page = result.value;
   if (page.items.length === 0 && page.errors.length > 0) {
-    const down = new Set(page.errors.map((error) => error.provider));
+    const down = new Set(
+      page.errors
+        .filter((error) => error.code !== "scan_ceiling")
+        .map((error) => error.provider),
+    );
     if (down.has("tpdb") && down.has("stashdb")) {
       return {
         ...base,
@@ -338,7 +344,11 @@ export function facetShelves(
     const page = newReleases.value;
     items = page.items;
     if (items.length === 0 && page.errors.length > 0) {
-      const down = new Set(page.errors.map((entry) => entry.provider));
+      const down = new Set(
+        page.errors
+          .filter((entry) => entry.code !== "scan_ceiling")
+          .map((entry) => entry.provider),
+      );
       if (down.has("tpdb") && down.has("stashdb")) {
         error = {
           code: page.errors[0]!.code,
@@ -676,11 +686,20 @@ export async function discover(ctx: AuthContext): Promise<Response> {
             direction: "desc",
             page: 1,
             perPage: SHELF_ITEMS,
+            tagsExclude: hiddenTags
+              .flatMap((tag) => (tag.stashdb ? [tag.stashdb] : []))
+              .slice(0, TAG_FILTER_ID_CAP),
           },
           hiddenTags,
-        ).then((page) => ({ ...page, errors: [] }));
+          DISCOVER_SCAN_BUDGET,
+        ).then((page) => ({ ...page, errors: page.errors ?? [] }));
       }
-      return browseTitles(parseBrowseQuery(params), hiddenTags);
+      return browseTitles(
+        parseBrowseQuery(params),
+        hiddenTags,
+        [],
+        DISCOVER_SCAN_BUDGET,
+      );
     }),
   );
   const [recentlyAdded, requests] = await Promise.allSettled([

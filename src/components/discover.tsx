@@ -54,11 +54,13 @@ interface DiscoverPage {
 function sourceLabel(s: Shelf["source"]): string {
   return s === "tpdb"
     ? "TPDB"
-    : s === "stashdb"
-      ? "StashDB"
-      : s === "jellyfin"
-        ? "Jellyfin"
-        : "Velvarr";
+    : s === "tmdb"
+      ? "TMDB"
+      : s === "stashdb"
+        ? "StashDB"
+        : s === "jellyfin"
+          ? "Jellyfin"
+          : "Velvarr";
 }
 
 /** A browse link starts fresh and passes the server's canonical params
@@ -439,6 +441,16 @@ export function ShelfSection({
           </p>
         </div>
       );
+    } else if (shelf.error.code === "query_too_broad") {
+      body = (
+        <div
+          className="discovery-shelf-body panel p-4 text-sm text-muted"
+          role="note"
+        >
+          This filtered preview could not be filled. Open Browse to narrow the
+          search, or adjust your preferences.
+        </div>
+      );
     } else {
       body = (
         <ErrorPanel
@@ -455,7 +467,9 @@ export function ShelfSection({
   } else if (!shelf.items || shelf.items.length === 0) {
     body = (
       <div className="discovery-shelf-body panel p-4 text-sm text-muted">
-        Nothing here yet.
+        {shelf.errors?.some((error) => error.code === "scan_ceiling")
+          ? "No matching titles in this preview."
+          : "Nothing here yet."}
       </div>
     );
   } else {

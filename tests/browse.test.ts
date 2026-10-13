@@ -1,3 +1,4 @@
+import { DISCOVER_SCAN_BUDGET } from "../src/server/catalog-budget.ts";
 // Browse-service regression tests: isolated 127.0.0.1 HTTP fixtures only.
 // No real network, no source-text asserts — every case drives browseTitles /
 // searchVisibleCatalog / searchBrowseTags / parseBrowseQuery against a
@@ -3614,4 +3615,172 @@ test("every sort-table row is observable: membership, direction rule, offers", (
   // A key the tab's side does not carry reads as non-directional: a stale
   // relevance on the Scenes tab clamps its direction off, never crashes.
   assert.equal(browseSortIsDirectional("scene", "relevance"), false);
+});
+
+test("bounded previews keep sparse matches, stop after three native pages, and never leak hidden titles", async () => {
+  const hidden = { id: 25, uuid: uuid(125), name: "Hidden" };
+  let moviesCalled = 0;
+  await runBrowse(
+    scriptedUpstream({
+      tagRows: [hidden],
+      moviePages: [
+        {
+          rows: [tpdbRow(uuid(1), "Blocked", "2024-01-01", [hidden])],
+          next: "x",
+          total: 10000,
+        },
+        {
+          rows: [tpdbRow(uuid(2), "Visible", "2024-01-01")],
+          next: "x",
+          total: 10000,
+        },
+        {
+          rows: [tpdbRow(uuid(3), "Blocked again", "2024-01-01", [hidden])],
+          next: "x",
+          total: 10000,
+        },
+      ],
+      scenes: { count: 0, rows: [] },
+      onMovieRequest: (_page, qs) => {
+        moviesCalled++;
+        assert.equal(qs.get("per_page"), "12");
+      },
+    }),
+    async () => {
+      const page = await browseTitles(
+        {
+          type: "movie",
+          include: [],
+          exclude: [],
+          studioMode: "exact",
+          page: 1,
+          perPage: 12,
+        },
+        [{ name: hidden.name, tpdb: hidden.uuid }],
+        [],
+        DISCOVER_SCAN_BUDGET,
+      );
+      assert.equal(moviesCalled, 3);
+      assert.deepEqual(
+        page.items.map((item) => item.title),
+        ["Visible"],
+      );
+      assert.equal(page.totalCountKnown, false);
+      assert.equal(page.hasMore, false);
+      assert.deepEqual(
+        page.errors.map((e) => [e.provider, e.code]),
+        [["tpdb", "scan_ceiling"]],
+      );
+    },
+  );
+});
+
+test("scene previews stop at their budget with no matches instead of reporting an outage", async () => {
+  const hidden = { id: uuid(125), name: "Hidden" };
+  let scenesCalled = 0;
+  await runBrowse(
+    scriptedUpstream({
+      tagRows: [],
+      moviePages: [],
+      scenes: {
+        count: 10000,
+        rows: [stashRow(uuid(1), "Blocked", "2024-01-01", [hidden])],
+      },
+      onScenesRequest: () => {
+        scenesCalled++;
+      },
+    }),
+    async () => {
+      const page = await searchVisibleCatalog(
+        { provider: "stashdb", kind: "scene", sort: "trending", perPage: 12 },
+        [{ name: hidden.name, stashdb: hidden.id }],
+        DISCOVER_SCAN_BUDGET,
+      );
+      assert.equal(scenesCalled, 3);
+      assert.deepEqual(page.items, []);
+      assert.equal(page.totalCountKnown, false);
+      assert.equal(page.hasMore, false);
+      assert.equal(page.errors?.[0]?.code, "scan_ceiling");
+    },
+  );
+});
+
+test("a complete preview does not scan extra pages or claim partial coverage", async () => {
+  let moviesCalled = 0;
+  await runBrowse(
+    scriptedUpstream({
+      tagRows: [],
+      moviePages: [
+        {
+          rows: [tpdbRow(uuid(1), "Visible", "2024-01-01")],
+          next: "x",
+          total: 10000,
+        },
+      ],
+      scenes: { count: 0, rows: [] },
+      onMovieRequest: () => {
+        moviesCalled++;
+      },
+    }),
+    async () => {
+      const page = await browseTitles(
+        {
+          type: "movie",
+          include: [],
+          exclude: [],
+          studioMode: "exact",
+          page: 1,
+          perPage: 1,
+        },
+        [{ name: "Hidden" }],
+        [],
+        DISCOVER_SCAN_BUDGET,
+      );
+      assert.equal(moviesCalled, 1);
+      assert.equal(page.items.length, 1);
+      assert.deepEqual(page.errors, []);
+    },
+  );
+});
+
+test("Discover scene queries push hidden IDs upstream while keeping local exclusion checks", async () => {
+  const hidden = { id: uuid(125), name: "Hidden" };
+  let scenesCalled = 0;
+  await runBrowse(
+    scriptedUpstream({
+      tagRows: [],
+      moviePages: [],
+      scenes: {
+        count: 10000,
+        rows: [stashRow(uuid(1), "Blocked", "2024-01-01", [hidden])],
+      },
+      onScenesRequest: (input) => {
+        scenesCalled++;
+        assert.deepEqual(input.tags, {
+          value: [hidden.id],
+          modifier: "EXCLUDES",
+        });
+      },
+    }),
+    async () => {
+      const page = await browseTitles(
+        {
+          type: "scene",
+          include: [],
+          exclude: [],
+          studioMode: "exact",
+          sort: "trending",
+          direction: "desc",
+          page: 1,
+          perPage: 12,
+        },
+        [{ name: hidden.name, stashdb: hidden.id }],
+        [],
+        DISCOVER_SCAN_BUDGET,
+      );
+      assert.equal(scenesCalled, 3);
+      assert.deepEqual(page.items, []);
+      assert.equal(page.errors[0]?.code, "scan_ceiling");
+    },
+  );
 });

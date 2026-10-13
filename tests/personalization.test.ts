@@ -1,3 +1,9 @@
+import { DISCOVER_SCAN_BUDGET } from "../src/server/catalog-budget.ts";
+import { browseTitles, parseBrowseQuery } from "../src/server/browse.ts";
+import {
+  discover,
+  facetShelves,
+} from "../src/app/api/[...path]/routes/discover.ts";
 import { judgmentConfiguration, sameWork } from "../src/server/judgment.ts";
 // Personal settings, provider isolation, and bounded keyword filtering use disposable data only.
 import assert from "node:assert/strict";
@@ -520,5 +526,211 @@ test("TMDB cast and studio choices use native IDs and title searches verify both
     calls.length,
     before,
     "invalid facet IDs are refused before any provider read",
+  );
+});
+
+test("sparse TMDB previews have one bounded native scan with adult and hidden filtering intact", async () => {
+  let listingPages = 0;
+  let keywords = 0;
+  await withFixture(
+    (req, res) => {
+      const url = new URL(req.url ?? "/", "http://fixture");
+      if (url.pathname.startsWith("/3/genre"))
+        return sendJson(res, 200, { genres: [] });
+      if (url.pathname.endsWith("/keywords")) {
+        keywords++;
+        const movieId = Number(url.pathname.split("/")[3]);
+        return sendJson(res, 200, {
+          keywords: movieId === 21 ? [] : [{ id: 4, name: "Hidden" }],
+        });
+      }
+      listingPages++;
+      const page = Number(url.searchParams.get("page"));
+      sendJson(res, 200, {
+        page,
+        total_pages: 100,
+        total_results: 2000,
+        results: Array.from({ length: 20 }, (_, i) => ({
+          id: (page - 1) * 20 + i + 1,
+          title: "Fixture",
+          adult: i < 2,
+        })),
+      });
+    },
+    async (fixture) => {
+      const previous = process.env.TMDB_BASE_URL;
+      process.env.TMDB_BASE_URL = fixture.origin;
+      try {
+        fresh({ ...base, providers: { tmdbReadToken: "fixture-token" } });
+        resetMetaCache();
+        const page = await browseTitles(
+          parseBrowseQuery(
+            new URLSearchParams(
+              "type=movie&movieSource=tmdb&sort=trending&perPage=12",
+            ),
+          ),
+          [{ name: "Hidden", tmdb: "4" }],
+          [],
+          DISCOVER_SCAN_BUDGET,
+        );
+        assert.equal(listingPages, 3);
+        assert.equal(
+          keywords,
+          6,
+          "metadata is hydrated only for adult candidates in the bounded listing window",
+        );
+        assert.deepEqual(
+          page.items.map((item) => item.reference.id),
+          ["21"],
+        );
+        assert.equal(page.items[0]?.adult, true);
+        assert.equal(page.errors[0]?.code, "scan_ceiling");
+        assert.equal(page.totalCountKnown, false);
+        assert.equal(page.hasMore, false);
+      } finally {
+        if (previous === undefined) delete process.env.TMDB_BASE_URL;
+        else process.env.TMDB_BASE_URL = previous;
+        resetMetaCache();
+      }
+    },
+  );
+});
+
+test("empty limited snapshots do not mark Studios or Genres as unavailable", async () => {
+  const errors = ["tpdb", "stashdb"].map((provider) => ({
+    provider: provider as "tpdb" | "stashdb",
+    code: "scan_ceiling",
+    message: "Preview limited",
+  }));
+  const shelves = await facetShelves({
+    status: "fulfilled",
+    value: {
+      items: [],
+      errors,
+      page: 1,
+      perPage: 12,
+      hasMore: false,
+      totalCountKnown: false,
+    },
+  });
+  assert.ok(shelves.every((shelf) => shelf.error === undefined));
+});
+
+test("Discover applies its small budget to every provider row and retains honest empty previews", async () => {
+  const counts = { tpdb: 0, scenes: 0, tmdbNew: 0, tmdbTrending: 0 };
+  const id = "00000000-1111-4222-8333-444444444444";
+  await withFixture(
+    (req, res, body) => {
+      const url = new URL(req.url ?? "/", "http://fixture");
+      if (url.pathname === "/movies") {
+        counts.tpdb++;
+        assert.equal(url.searchParams.get("per_page"), "12");
+        return sendJson(res, 200, {
+          data: [
+            {
+              id,
+              title: "Blocked",
+              date: "2025-01-01",
+              tags: [{ id: 4, uuid: id, name: "Hidden" }],
+              performers: [],
+              scenes: [],
+              movies: [],
+              posters: {},
+              background: {},
+            },
+          ],
+          links: { next: "next" },
+          meta: { total: 10000 },
+        });
+      }
+      if (url.pathname === "/graphql") {
+        const gql = JSON.parse(body);
+        if (gql.query.includes("queryScenes")) {
+          counts.scenes++;
+          return sendJson(res, 200, {
+            data: {
+              queryScenes: {
+                count: 10000,
+                scenes: [
+                  {
+                    id,
+                    title: "Blocked",
+                    date: "2025-01-01",
+                    tags: [{ id, name: "Hidden" }],
+                    performers: [],
+                    studio: null,
+                    urls: [],
+                    images: [],
+                  },
+                ],
+              },
+            },
+          });
+        }
+        return sendJson(res, 200, {
+          data: { searchTag: [], queryTags: { count: 0, tags: [] } },
+        });
+      }
+      if (url.pathname.startsWith("/3/genre"))
+        return sendJson(res, 200, { genres: [] });
+      if (url.pathname.startsWith("/3/")) {
+        if (url.pathname.includes("trending")) counts.tmdbTrending++;
+        else counts.tmdbNew++;
+        const page = Number(url.searchParams.get("page"));
+        return sendJson(res, 200, {
+          page,
+          total_pages: 100,
+          total_results: 2000,
+          results: [{ id: page, title: "Not adult", adult: false }],
+        });
+      }
+      if (url.pathname === "/tags")
+        return sendJson(res, 200, { data: [], links: { next: null } });
+      return sendJson(res, 200, { Items: [], TotalRecordCount: 0 });
+    },
+    async (fixture) => {
+      const keys = ["TPDB_BASE_URL", "STASHDB_BASE_URL", "TMDB_BASE_URL"];
+      const previous = keys.map((key) => process.env[key]);
+      keys.forEach((key) => {
+        process.env[key] = fixture.origin;
+      });
+      try {
+        const ctx = fresh({
+          ...base,
+          jellyfin: { ...base.jellyfin, url: fixture.origin },
+          providers: {
+            tpdbApiToken: "fixture-tpdb",
+            stashdbApiKey: "fixture-stash",
+            tmdbReadToken: "fixture-tmdb",
+          },
+        });
+        storage.saveContentPreferences(owner.id, {
+          hiddenTags: [{ name: "Hidden" }],
+        });
+        resetMetaCache();
+        const response = await discover(ctx);
+        const result = await response.json();
+        assert.equal(response.status, 200);
+        assert.deepEqual(counts, {
+          tpdb: 3,
+          scenes: 6,
+          tmdbNew: 3,
+          tmdbTrending: 3,
+        });
+        for (const shelf of result.shelves.filter(
+          (s: { kind: string }) => s.kind === "catalog",
+        )) {
+          assert.equal(shelf.error, undefined, shelf.title);
+          assert.deepEqual(shelf.items, []);
+          assert.equal(shelf.errors[0].code, "scan_ceiling", shelf.title);
+        }
+      } finally {
+        keys.forEach((key, index) => {
+          if (previous[index] === undefined) delete process.env[key];
+          else process.env[key] = previous[index];
+        });
+        resetMetaCache();
+      }
+    },
   );
 });

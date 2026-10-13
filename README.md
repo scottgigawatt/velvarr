@@ -94,7 +94,7 @@ The existing matching rules remain unchanged: AI can flag a possible title match
 
 **Preferences** is available in the main navigation and your profile menu. Save **Preferred tags** to apply them every time you browse; titles must match every included tag, while hidden tags take priority. You can pause preferred tags for one All browse or turn them off in Preferences. **Use my tag preferences** controls personalization of catalog shelves on Discover. Each account keeps its own tags, shelf order, row limit, and appearance.
 
-Discover separates new TPDB movies, new StashDB scenes, and new TMDB movies. Trending shelves use StashDB scene trends and TMDB weekly movie trends. TPDB has no supported trending signal, so its shelf is labeled as new releases. Shelf links open Browse with the same provider and criteria.
+Discover separates new TPDB movies, new StashDB scenes, and new TMDB movies. Trending shelves use StashDB scene trends and TMDB weekly movie trends. TPDB has no supported trending signal, so its shelf is labeled as new releases. Shelf links open Browse with the same provider and criteria. Each title preview shows up to 12 matches and scans at most three listing pages per provider. Sparse personalized previews retain any matches found and explain that coverage is limited, rather than reporting a provider outage or scanning until the row fills. Provider-native tag and date filters narrow requests where supported; TMDB trending cannot filter adult classifications or keywords upstream.
 
 **Appearance** offers dark, light, and system modes, five palettes, and a custom accent. Changes apply immediately and persist with your account.
 

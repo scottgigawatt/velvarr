@@ -59,6 +59,7 @@ import type {
   CatalogReference,
   CrossProviderLink,
   MediaKind,
+  SourceError,
 } from "../lib/contracts.ts";
 import {
   CATALOG_YEAR_MAX,
@@ -863,6 +864,8 @@ function shiftIsoDate(date: string, days: number): string {
 }
 
 export interface CatalogSearchPage {
+  /** A bounded preview can retain matches while reporting incomplete coverage. */
+  errors?: SourceError[];
   provider: CatalogProvider;
   kind: "movie" | "scene" | "performer" | "studio";
   page: number;
