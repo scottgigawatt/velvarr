@@ -43,8 +43,8 @@ import { searchTmdb, detailTmdb, type TmdbQuery } from "./tmdb.ts";
 //   scenes under that studio's child rows; mutually exclusive with studios,
 //   which is a MultiIDCriterionInput). StudioSortEnum
 //   has no trending order, so studio search exposes no sort at all. StashDB
-//   studio records carry explicit provider URLs, but cross-provider linking
-//   stays performer-level only — studios are never merged across providers.
+//   studio records carry explicit provider URLs, which drive cross-provider
+//   linking; movies and scenes are never linked across providers.
 
 import { AppError, parseJson, requestBytes, requestJsonBytes } from "./http.ts";
 import type { Service } from "./http.ts";
@@ -55,8 +55,13 @@ import type {
   CrossProviderLink,
   MediaKind,
 } from "../lib/contracts.ts";
-import { normalizeFacetName } from "../lib/contracts.ts";
+import {
+  CATALOG_YEAR_MAX,
+  CATALOG_YEAR_MIN,
+  normalizeFacetName,
+} from "../lib/contracts.ts";
 import { sortSpec, type SortKey } from "../lib/sorts.ts";
+import { TAG_FILTER_ID_CAP } from "../lib/browse-includes.ts";
 
 // Pure cross-provider identity policy (published links only, no name
 // matching) lives in its own module; this adapter keeps the I/O around it.
@@ -127,6 +132,7 @@ export function resetMetaCache(): void {
   artworkInFlight.clear();
   tpdbTagNumbers.clear();
   counterpartMemo.clear();
+  tagListingMemo.clear();
 }
 
 /** Learns the numeric filter key behind a TPDB tag uuid while rows map.
@@ -187,6 +193,7 @@ export async function requestJson<T>(
     service?: Service;
     timeoutMs?: number;
     cacheTtlMs?: number;
+    validate?: (parsed: unknown) => void;
   } = {},
 ): Promise<T> {
   const service = options.service ?? "jellyfin";
@@ -210,6 +217,13 @@ export async function requestJson<T>(
         method,
         body: options.body,
         timeoutMs: options.timeoutMs,
+      }).then((bytes) => {
+        // A body that fails to parse — or a service's semantic check, e.g.
+        // StashDB GraphQL errors — must never become the fresh shared cache
+        // entry: the previous good payload stays the stale-on-error fallback.
+        const parsed = parseJson<unknown>(bytes, service);
+        options.validate?.(parsed);
+        return bytes;
       });
       if (cacheable) {
         const own = pending;
@@ -292,6 +306,37 @@ function notConfigured(provider: "tpdb" | "stashdb"): AppError {
   );
 }
 
+// gqlgen (stash-box) answers a failed resolver with HTTP 200, partial data
+// and a non-empty errors array: { data: { findScene: null }, errors: [...] }.
+// A null/absent dataKey beside errors is an outage, never an authoritative
+// absence — it is named here, before the body can be cached, so the next
+// read re-requests instead of replaying the error for the whole TTL. A null
+// dataKey WITHOUT errors stays the documented absence signal for find*
+// queries. Errors beside a POPULATED dataKey are failures elsewhere in the
+// document: the requested record resolved, so the partial payload is used.
+function rejectStashGraphQlFailure(parsed: unknown, dataKey: string): void {
+  if (parsed === null || typeof parsed !== "object") return;
+  const body = parsed as {
+    data?: Record<string, unknown> | null;
+    errors?: unknown;
+  };
+  if (body.data === null || body.data === undefined) return;
+  const value = body.data[dataKey];
+  if (value !== null && value !== undefined) return;
+  if (Array.isArray(body.errors) && body.errors.length > 0) {
+    const first = body.errors[0] as { message?: unknown } | undefined;
+    const detail =
+      typeof first?.message === "string" && first.message !== ""
+        ? `: ${first.message}`
+        : "";
+    throw new AppError(
+      502,
+      "upstream_bad_response",
+      `StashDB reported a GraphQL failure${detail}`,
+    );
+  }
+}
+
 async function stashQuery(
   query: string,
   variables: Record<string, unknown>,
@@ -313,10 +358,16 @@ async function stashQuery(
     service: "stashdb",
     method: "POST",
     body: { query, variables },
+    // The GraphQL verdict must land before the body is cached, or an error
+    // body becomes the fresh shared entry for the whole TTL.
+    validate: (parsed) => rejectStashGraphQlFailure(parsed, dataKey),
   });
   // HTTP-level failures (401 auth, 422 schema, 5xx outage) already surfaced
-  // by the transport with upstreamStatus. data:null at HTTP 200 is the
-  // authoritative absence signal for find* queries.
+  // by the transport with upstreamStatus. A null dataKey beside GraphQL
+  // errors already surfaced as upstream_bad_response before caching; what
+  // reaches here is a clean body, partial data whose errors sit beside a
+  // populated dataKey, or a null dataKey with no errors — the documented
+  // authoritative-absence signal for find* queries.
   if (
     body === null ||
     typeof body !== "object" ||
@@ -874,7 +925,7 @@ function cleanTagIds(
     );
   }
   const ids: string[] = [];
-  for (const entry of v.slice(0, 25)) {
+  for (const entry of v.slice(0, TAG_FILTER_ID_CAP)) {
     const s = cleanString(entry, 64);
     if (s === undefined || !isUuid(s)) {
       throw new AppError(
@@ -1260,7 +1311,7 @@ export async function searchCatalog(
       // paging only; query/year filters are rejected, not ignored.
       if (
         cleanQueryTerm(query.query) !== undefined ||
-        cleanYear(query.year) !== undefined ||
+        query.year !== undefined ||
         query.releaseDate !== undefined
       ) {
         throw new AppError(
@@ -1307,9 +1358,19 @@ export async function searchCatalog(
     }
     const studioFilter = await resolveTpdbStudioFilter(query.studio);
     const releaseDate = cleanReleaseDate(query.releaseDate);
+    if (query.year !== undefined && cleanYear(query.year) === undefined) {
+      // A year the provider cannot filter is refused here, never dropped:
+      // dropping would send the query unfiltered and present whatever came
+      // back as if the year filter had been applied.
+      throw new AppError(
+        400,
+        "invalid_search",
+        `year must be a calendar year between ${CATALOG_YEAR_MIN} and ${CATALOG_YEAR_MAX}.`,
+      );
+    }
     const path = tpdbQuery({
       q: cleanQueryTerm(query.query),
-      year: cleanYear(query.year),
+      year: query.year,
       date: releaseDate?.cutoff,
       date_operation: releaseDate?.operation,
       ...(await tpdbTagFilters(includeTags ?? allTags)),
@@ -1570,6 +1631,153 @@ export async function getCatalogDetail(
   throw new AppError(400, "invalid_reference", "Unknown catalog kind.");
 }
 
+/** Row cap for the tag-listing walk behind free-text include expansion: a
+ * published vocabulary past this many rows degrades the expansion to the
+ * local substring check (approximate totals) instead of an incomplete
+ * native union. ponytail: raise the cap (and pay the longer paged burst)
+ * if a real provider ever exceeds it — the incompleteness is reported, not
+ * hidden. */
+const TAG_EXPANSION_MAX_ROWS = 5000;
+
+interface TagListing {
+  rows: { id: string; name: string }[];
+  complete: boolean;
+}
+
+// Process-lifetime listing memo, keyed by provider: the walk is one bounded
+// burst of paged reads whose answer feeds every free-text expansion, and
+// published vocabularies change slowly. Incomplete walks memoize too —
+// retrying per request would re-pay the burst for the same capped answer.
+const tagListingMemo = new Map<CatalogProvider, TagListing>();
+
+/** Shared StashDB tag-row parsing for the flat [Tag] {id, name} shapes
+ * (searchTag, queryTags): validated, deduplicated by id. */
+function stashTagRows(rows: unknown[]): { id: string; name: string }[] {
+  const out: { id: string; name: string }[] = [];
+  for (const row of rows) {
+    if (row === null || typeof row !== "object") continue;
+    const name = "name" in row ? cleanString(row.name, 120) : undefined;
+    if ("id" in row && isUuid(row.id) && name !== undefined) {
+      out.push({ id: row.id, name });
+    }
+  }
+  return dedupeBy(out, (t) => t.id);
+}
+
+/** The provider's complete published tag listing: TPDB /tags with no term
+ * (the same listing tpdbTagFilters walks; `links.next` is the end signal),
+ * StashDB queryTags with no name filter (stash-box orders it by name
+ * ascending by default and silently caps per_page at 100, so the page walk
+ * is stable and `count` tells the end). Deliberately NOT searchCatalogTags:
+ * that endpoint is the providers' relevance search — StashDB runs a BM25
+ * match with prefix and fuzzy distance on name/aliases, TPDB's `q` is
+ * documented only as a "search query" — which guarantees neither mid-word
+ * substrings nor every row below its cap. `complete` is false when the walk
+ * hit its row cap; callers must then treat the rows as possibly missing
+ * matches. */
+async function catalogTagListing(
+  provider: CatalogProvider,
+): Promise<TagListing> {
+  const memo = tagListingMemo.get(provider);
+  if (memo !== undefined) return memo;
+  const rows: { id: string; name: string }[] = [];
+  let complete = true;
+  if (provider === "tpdb") {
+    for (let page = 1; ; page++) {
+      const body = await tpdbGet<TpdbListBody>(
+        `/tags${tpdbQuery({ page, per_page: 100 })}`,
+      );
+      if (!Array.isArray(body?.data)) {
+        throw new AppError(
+          502,
+          "upstream_bad_response",
+          "TPDB returned an unusable tag listing.",
+        );
+      }
+      const batch = tpdbTags(body.data, recordTagPair);
+      rows.push(...batch);
+      // A rows-less page beside a next link is a walk the provider did not
+      // finish: stop and report the rows as possibly incomplete.
+      if (batch.length === 0) {
+        complete = typeof body.links?.next !== "string";
+        break;
+      }
+      if (typeof body.links?.next !== "string") break;
+      if (rows.length >= TAG_EXPANSION_MAX_ROWS) {
+        complete = false;
+        break;
+      }
+    }
+  } else {
+    for (let page = 1; ; page++) {
+      const res = await stashQuery(
+        "query($p: Int!) { queryTags(input: { page: $p, per_page: 100 }) { count tags { id name } } }",
+        { p: page },
+        "queryTags",
+      );
+      if (
+        res === null ||
+        typeof res !== "object" ||
+        !("tags" in res) ||
+        !Array.isArray(res.tags) ||
+        !("count" in res)
+      ) {
+        throw new AppError(
+          502,
+          "upstream_bad_response",
+          "StashDB returned an unusable tag listing.",
+        );
+      }
+      const count = res.count;
+      if (typeof count !== "number" || !Number.isInteger(count) || count < 0) {
+        throw new AppError(
+          502,
+          "upstream_bad_response",
+          "StashDB returned an unusable tag count.",
+        );
+      }
+      const batch = stashTagRows(res.tags);
+      rows.push(...batch);
+      if (batch.length === 0 || rows.length >= count) break;
+      if (rows.length >= TAG_EXPANSION_MAX_ROWS) {
+        complete = false;
+        break;
+      }
+    }
+  }
+  const listing: TagListing = { rows: dedupeBy(rows, (t) => t.id), complete };
+  tagListingMemo.set(provider, listing);
+  return listing;
+}
+
+/** Free-text include expansion on one provider: every published tag whose
+ * FOLDED name contains the folded term, read from the provider's complete
+ * tag listing. `complete: false` marks a walk that hit its row cap — the
+ * caller must then filter the term locally instead of trusting the id
+ * list. `dropped` reports uuid-less matches (TPDB's numeric-string tag
+ * ids): they can never ride a native tag criterion, so the term falls back
+ * to local filtering or titles tagged only with those rows would silently
+ * vanish. */
+export async function expandCatalogTagTerm(
+  provider: CatalogProvider,
+  term: string,
+): Promise<{ ids: string[]; dropped: boolean; complete: boolean }> {
+  const needle = normalizeFacetName(term);
+  if (needle === "") return { ids: [], dropped: false, complete: false };
+  const { rows, complete } = await catalogTagListing(provider);
+  const ids: string[] = [];
+  let dropped = false;
+  for (const row of rows) {
+    if (!normalizeFacetName(row.name).includes(needle)) continue;
+    if (!isUuid(row.id)) {
+      dropped = true;
+      continue;
+    }
+    if (!ids.includes(row.id)) ids.push(row.id);
+  }
+  return { ids, dropped, complete };
+}
+
 /** Tag lookup for filter pickers: provider-native {id, name} pairs for a
  * search term. TPDB /tags and StashDB searchTag; ids are never mapped across
  * providers. First page/limit only — enough to build a filter list. */
@@ -1616,15 +1824,7 @@ export async function searchCatalogTags(
       "StashDB returned an unusable tag search.",
     );
   }
-  const out: { id: string; name: string }[] = [];
-  for (const row of res.slice(0, MAX.tags)) {
-    if (row === null || typeof row !== "object") continue;
-    const name = "name" in row ? cleanString(row.name, 120) : undefined;
-    if ("id" in row && isUuid(row.id) && name !== undefined) {
-      out.push({ id: row.id, name });
-    }
-  }
-  return dedupeBy(out, (t) => t.id);
+  return stashTagRows(res).slice(0, MAX.tags);
 }
 
 /** The provider's first tag page, no term — the candidate list the tag
@@ -1666,15 +1866,7 @@ export async function listCatalogTags(
       "StashDB returned an unusable tag listing.",
     );
   }
-  const out: { id: string; name: string }[] = [];
-  for (const row of res.slice(0, MAX.tags)) {
-    if (row === null || typeof row !== "object") continue;
-    const name = "name" in row ? cleanString(row.name, 120) : undefined;
-    if ("id" in row && isUuid(row.id) && name !== undefined) {
-      out.push({ id: row.id, name });
-    }
-  }
-  return dedupeBy(out, (t) => t.id);
+  return stashTagRows(res).slice(0, MAX.tags);
 }
 
 /** Process-lifetime memo of computed performer auto-links, keyed by
@@ -1881,7 +2073,13 @@ export async function tagCounterpart(
   if (target === "") return undefined; // an empty label identifies nothing
   const other: CatalogProvider = from === "tpdb" ? "stashdb" : "tpdb";
   const rows = await searchCatalogTags(other, name);
-  const row = rows.find((r) => normalizeFacetName(r.name) === target);
+  // A uuid-less label match (TPDB sometimes emits numeric-string tag ids)
+  // is unresolvable: the id can never ride a native tag filter, and
+  // cleanTagIds would 400 the whole query. Callers treat undefined as an
+  // unresolvable anchored tag and disqualify the side.
+  const row = rows.find(
+    (r) => normalizeFacetName(r.name) === target && isUuid(r.id),
+  );
   return row === undefined ? undefined : { provider: other, id: row.id };
 }
 

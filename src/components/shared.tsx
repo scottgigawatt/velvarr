@@ -481,6 +481,7 @@ interface SessionInfo {
   account: Account;
   providers: ProviderStatus | null;
   signOut: () => void;
+  refreshSession: () => Promise<void>;
 }
 
 export const SessionCtx = createContext<SessionInfo | null>(null);
@@ -950,8 +951,12 @@ function RequestableCard({
     }
   }, [media.provider, media.kind, media.id]);
 
+  /* Auto re-checks (preload, hover, focus) stay off while a request error is
+     shown: they would erase the only note explaining the failed POST. The
+     "Retry check" button is the explicit way out; its GET re-reads myRequest,
+     so a lost-but-saved request still resolves. */
   useEffect(() => {
-    if (status) return;
+    if (status || error) return;
     let cancelled = false;
     const preload = () => {
       const previous = cardPreloads.shift()!;
@@ -967,7 +972,7 @@ function RequestableCard({
       cancelled = true;
       window.removeEventListener("load", preload);
     };
-  }, [check, status]);
+  }, [check, status, error]);
 
   async function request() {
     if (working.current) return;
@@ -986,7 +991,7 @@ function RequestableCard({
       window.dispatchEvent(new Event(REQUESTS_CHANGED));
     } catch (e) {
       exists = e instanceof ApiError && e.code === "request_exists";
-      // Re-check before offering another POST: a lost response may have saved it.
+      // Drop stale status so a wrong badge never outlives the failed POST.
       setStatus(null);
       if (!exists) setError(messageOf(e));
     } finally {
@@ -1042,7 +1047,7 @@ function RequestableCard({
     <div
       className={`media-card media-request-card${scene ? " scene-card" : ""}`}
       onPointerEnter={(e) => {
-        if (!status && e.pointerType !== "touch") void check();
+        if (!status && !error && e.pointerType !== "touch") void check();
       }}
     >
       <button
@@ -1050,7 +1055,7 @@ function RequestableCard({
         className="media-open"
         aria-label={`View details for ${item.title}`}
         onFocus={() => {
-          if (!status) void check();
+          if (!status && !error) void check();
         }}
         onClick={() => onOpen(media)}
       >

@@ -123,26 +123,21 @@ export default function VelvarrApp() {
   const [bootError, setBootError] = useState<string | null>(null);
   useTapReveal();
 
-  const enterApp = useCallback(async () => {
+  // Re-reads the session snapshot; also runs after an admin saves or clears
+  // a provider key, so provider chips and not-configured claims update
+  // without a full reload.
+  const refreshSession = useCallback(async () => {
     const me = await api<{ account: Account; providers: ProviderStatus }>(
       "/api/me",
     );
     setAccount(me.account);
     setProviders(me.providers);
-    setPhase("app");
   }, []);
 
-  useEffect(() => {
-    const refreshProviders = () => {
-      void api<{ providers: ProviderStatus }>("/api/me").then(
-        (me) => setProviders(me.providers),
-        () => {},
-      );
-    };
-    window.addEventListener("velvarr:providers-changed", refreshProviders);
-    return () =>
-      window.removeEventListener("velvarr:providers-changed", refreshProviders);
-  }, []);
+  const enterApp = useCallback(async () => {
+    await refreshSession();
+    setPhase("app");
+  }, [refreshSession]);
 
   const enterAppSafe = useCallback(() => {
     // This tab just swapped the cookie (login or setup completion); other
@@ -243,7 +238,9 @@ export default function VelvarrApp() {
 
   if (phase !== "app" || !account) return <BootSkeleton />;
   return (
-    <SessionCtx.Provider value={{ account, providers, signOut }}>
+    <SessionCtx.Provider
+      value={{ account, providers, signOut, refreshSession }}
+    >
       <Shell />
     </SessionCtx.Provider>
   );
@@ -884,12 +881,19 @@ function Shell() {
   const isAdmin = session.account.role === "admin";
   const navigation = useRef<HTMLDialogElement>(null);
   const accountMenu = useRef<HTMLDetailsElement>(null);
+  // The menu's Preferences button hides with the menu before showModal, so
+  // only that opener needs a manual focus restore; live openers (Browse's
+  // "N hidden" button) get the browser's native one.
+  const prefsFromMenu = useRef(false);
   const [menuOpen, setMenuOpen] = useState(false);
   const [prefsOpen, setPrefsOpen] = useState(false);
   // Browse controls ("N hidden", drawer note) open the modal in place so the
   // URL keeps every filter — the removed ?view=preferences dropped them.
   useEffect(() => {
-    const open = () => setPrefsOpen(true);
+    const open = () => {
+      prefsFromMenu.current = false;
+      setPrefsOpen(true);
+    };
     window.addEventListener(OPEN_PREFERENCES, open);
     return () => window.removeEventListener(OPEN_PREFERENCES, open);
   }, []);
@@ -1034,6 +1038,7 @@ function Shell() {
               className="btn"
               onClick={() => {
                 if (accountMenu.current) accountMenu.current.open = false;
+                prefsFromMenu.current = true;
                 setPrefsOpen(true);
               }}
             >
@@ -1142,8 +1147,10 @@ function Shell() {
           setPrefsOpen(false);
           // The Preferences button hid with the account menu before
           // showModal, so the browser has no live element to return focus
-          // to; put it back on the menu's visible opener.
-          accountMenu.current?.querySelector("summary")?.focus();
+          // to; put it back on the menu's visible opener. Other openers
+          // stay live, and the native close steps already restored them.
+          if (prefsFromMenu.current)
+            accountMenu.current?.querySelector("summary")?.focus();
         }}
       />
     </div>

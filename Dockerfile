@@ -28,12 +28,18 @@ RUN groupadd --system --gid 10001 velvarr \
  && useradd --system --uid 10001 --gid velvarr --home-dir /app --shell /usr/sbin/nologin velvarr \
  && mkdir -p /data \
  && chown velvarr:velvarr /data
-COPY --from=build --chown=velvarr:velvarr /app/.next/standalone ./
-COPY --from=build --chown=velvarr:velvarr /app/.next/static ./.next/static
-COPY --from=build --chown=velvarr:velvarr /app/public ./public
+# Code stays root-owned and world-readable so app-level code execution cannot
+# rewrite it; the runtime user may write only /data.
+COPY --from=build /app/.next/standalone ./
+COPY --from=build /app/.next/static ./.next/static
+COPY --from=build /app/public ./public
+# Dependency installers may preserve group/world write bits despite root ownership.
+RUN chmod -R go-w /app
 USER velvarr
 EXPOSE 6699
 VOLUME /data
+# /api/status reads storage: with a /data the runtime user cannot open it
+# answers 500, so the container goes unhealthy. /api/health is static 200.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-  CMD ["node", "-e", "fetch('http://127.0.0.1:6699/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+  CMD ["node", "-e", "fetch('http://127.0.0.1:6699/api/status').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
 CMD ["node", "server.js"]

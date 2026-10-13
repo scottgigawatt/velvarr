@@ -10,6 +10,7 @@ import { test } from "node:test";
 
 import {
   AppError,
+  isPrivateHost,
   requestBytes,
   requestJson,
   validateBaseUrl,
@@ -196,6 +197,57 @@ test("validateBaseUrl allows private HTTP only through VELVARR_ALLOW_HTTP=1", ()
     assert.throws(
       () => validateBaseUrl("http://media.example.com"),
       appError(400, "invalid_url"),
+    );
+  } finally {
+    if (previous === undefined) delete process.env.VELVARR_ALLOW_HTTP;
+    else process.env.VELVARR_ALLOW_HTTP = previous;
+  }
+});
+
+test("isPrivateHost classifies public DNS names and IPv6 literals as public", () => {
+  // fc/fd are unique-local hextets, not DNS-name prefixes; IPv6 literals are
+  // not dotless Docker service names; IPv4-mapped IPv6 classifies by its
+  // embedded IPv4 (the URL parser serializes [::ffff:8.8.8.8] to the hex
+  // form [::ffff:808:808]).
+  assert.equal(isPrivateHost("fdic.gov"), false);
+  assert.equal(isPrivateHost("fc.attacker.example.com"), false);
+  assert.equal(isPrivateHost("[2001:4860:4860::8888]"), false);
+  assert.equal(isPrivateHost("[::ffff:808:808]"), false);
+  assert.equal(isPrivateHost("[::ffff:8.8.8.8]"), false);
+  assert.equal(isPrivateHost("[::ffff:10.0.0.1]"), true);
+  assert.equal(isPrivateHost("[fd00::1]"), true);
+  assert.equal(isPrivateHost("jellyfin"), true);
+  const previous = process.env.VELVARR_ALLOW_HTTP;
+  try {
+    process.env.VELVARR_ALLOW_HTTP = "1";
+    assert.throws(
+      () => validateBaseUrl("http://[2001:4860:4860::8888]:8096"),
+      appError(400, "invalid_url"),
+    );
+    assert.throws(
+      () => validateBaseUrl("http://fdic.gov"),
+      appError(400, "invalid_url"),
+    );
+    assert.throws(
+      () => validateBaseUrl("http://fc.attacker.example.com"),
+      appError(400, "invalid_url"),
+    );
+    assert.throws(
+      () => validateBaseUrl("http://[::ffff:8.8.8.8]"),
+      appError(400, "invalid_url"),
+    );
+    assert.throws(
+      () => validateBaseUrl("http://velvarr.example.com"),
+      appError(400, "invalid_url"),
+    );
+    // Docker service names and unique-local literals stay admitted.
+    assert.equal(
+      validateBaseUrl("http://jellyfin:8096"),
+      "http://jellyfin:8096",
+    );
+    assert.equal(
+      validateBaseUrl("http://[fd00::1]:8096"),
+      "http://[fd00::1]:8096",
     );
   } finally {
     if (previous === undefined) delete process.env.VELVARR_ALLOW_HTTP;
@@ -1821,6 +1873,28 @@ test("resolvePlaybackAccess reports ambiguity instead of guessing", async () => 
   });
 });
 
+/** Intercepts api.typesafe.ai judgment calls, counts them, and answers
+ * "same work" (noul 0.93); every other URL passes through untouched. The
+ * returned callable is a plain two-arg fetch; the named cast only satisfies
+ * lib.dom's read-only fetch signature, no shape beyond it. */
+function typeSafeJudgeYes(count: { judged: number }): typeof fetch {
+  const realFetch = globalThis.fetch;
+  const intercept = async (
+    url: RequestInfo | URL,
+    init?: RequestInit,
+  ): Promise<Response> => {
+    if (String(url).includes("api.typesafe.ai")) {
+      count.judged += 1;
+      return new Response(
+        JSON.stringify({ answers: { sameWork: { type: "noul", noul: 0.93 } } }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    }
+    return realFetch(url, init);
+  };
+  return intercept as unknown as typeof fetch; // lib.dom fetch signature
+}
+
 test("resolvePlaybackAccess near-miss uses the stored TypeSafe key with no environment key", async () => {
   // A key saved in Settings is reported as configured, yet the sweep's
   // default ask called sameWork without it: the judgment then read only
@@ -1828,18 +1902,9 @@ test("resolvePlaybackAccess near-miss uses the stored TypeSafe key with no envir
   // Settings showed "AI-assisted matching on".
   const priorEnvKey = process.env.TYPESAFE_API_KEY;
   delete process.env.TYPESAFE_API_KEY;
-  const realFetch = globalThis.fetch;
-  let judged = 0;
-  globalThis.fetch = (async (url: RequestInfo | URL, init?: RequestInit) => {
-    if (String(url).includes("api.typesafe.ai")) {
-      judged++;
-      return new Response(
-        JSON.stringify({ answers: { sameWork: { type: "noul", noul: 0.93 } } }),
-        { status: 200, headers: { "content-type": "application/json" } },
-      );
-    }
-    return realFetch(url, init);
-  }) as typeof fetch;
+  const priorFetch = globalThis.fetch;
+  const counter = { judged: 0 };
+  globalThis.fetch = typeSafeJudgeYes(counter);
   try {
     await withFixture(avHandler({ entries: avEntries() }), async (fx) => {
       const cfg = {
@@ -1861,10 +1926,51 @@ test("resolvePlaybackAccess near-miss uses the stored TypeSafe key with no envir
           reason: "Title/year similarity only; administrator review required.",
         },
       );
-      assert.equal(judged, 1);
+      assert.equal(counter.judged, 1);
     });
   } finally {
-    globalThis.fetch = realFetch;
+    globalThis.fetch = priorFetch;
+    if (priorEnvKey === undefined) delete process.env.TYPESAFE_API_KEY;
+    else process.env.TYPESAFE_API_KEY = priorEnvKey;
+  }
+});
+
+test("resolvePlaybackAccess spends no judgment on contradicting years", async () => {
+  // The year policy lives in code: an exact title whose catalog year
+  // contradicts the item's ProductionYear is 'missing', and the same-work
+  // judgment is never asked even when a key is configured.
+  const priorEnvKey = process.env.TYPESAFE_API_KEY;
+  delete process.env.TYPESAFE_API_KEY;
+  const priorFetch = globalThis.fetch;
+  const counter = { judged: 0 };
+  globalThis.fetch = typeSafeJudgeYes(counter);
+  try {
+    await withFixture(
+      // Only the contradicting item is in the pool: any other near-miss
+      // candidate without a year would legitimately reach the judgment.
+      avHandler({ entries: avEntries().slice(0, 1) }),
+      async (fx) => {
+        const cfg = {
+          ...avConfig(fx.origin, [LIB_A]),
+          providers: { typesafeApiKey: "ts_contradicting_year" },
+        };
+        // "Provider Movie" is the fixture item's exact name (year 2024); a
+        // 1999 record is a different work — a remake, not a naming variant.
+        assert.deepEqual(
+          await resolvePlaybackAccess(cfg, TOKEN, account([LIB_A]), {
+            provider: "tpdb",
+            kind: "movie",
+            id: "tpdb-unjudged-uuid",
+            title: "Provider Movie",
+            year: 1999,
+          }),
+          { outcome: "missing" },
+        );
+        assert.equal(counter.judged, 0);
+      },
+    );
+  } finally {
+    globalThis.fetch = priorFetch;
     if (priorEnvKey === undefined) delete process.env.TYPESAFE_API_KEY;
     else process.env.TYPESAFE_API_KEY = priorEnvKey;
   }
@@ -2114,6 +2220,84 @@ test("resolvePlaybackAccess reports a capped sweep as unavailable, never missing
   });
 });
 
+test("resolvePlaybackAccess retries a truncated cached pool when the matched item 404s", async () => {
+  // The stale-index case at the cap: Jellyfin replaces a matched item (an
+  // upgraded file gets a new id), so the cached pool still holds the old id
+  // whose Ancestors probe 404s into 'denied'. A truncated pool must not
+  // blanket-skip the forced fresh retry — only its nothing-found verdict
+  // stands; the retried walk finds the replacement and reads available.
+  const entries: AvEntry[] = [
+    {
+      lib: LIB_A,
+      item: avItem({
+        id: hexId(0x6001),
+        name: "Replaced Movie",
+        providerIds: { Tpdb: "tpdb-replaced-uuid" },
+        path: "C:\\media\\movies\\Replaced Movie\\Replaced Movie.mkv",
+      }),
+    },
+    ...Array.from({ length: 12_001 }, (_, i) => ({
+      lib: LIB_A,
+      item: avItem({ id: hexId(0x6100 + i), name: `Filler Movie ${i}` }),
+    })),
+  ];
+  await withFixture(avHandler({ entries }), async (fx) => {
+    const cfg = avConfig(fx.origin, [LIB_A]);
+    const hints = {
+      provider: "tpdb" as const,
+      kind: "movie" as const,
+      id: "tpdb-replaced-uuid",
+    };
+    // First resolve walks a truncated pool (12,002 items, 12,000 fetched),
+    // matches the old id, proves it live: available. 200 movie pages plus
+    // one empty episode page.
+    const first = await resolvePlaybackAccess(
+      cfg,
+      TOKEN,
+      account([LIB_A]),
+      hints,
+    );
+    assert.equal(first.outcome, "available");
+    if (first.outcome !== "available") return assert.fail("unreachable");
+    assert.equal(first.item.id, hexId(0x6001));
+    assert.equal(
+      fx.log.filter(
+        (r) => r.method === "GET" && pathOf(r.url) === `/users/${ME_ID}/items`,
+      ).length,
+      201,
+    );
+    // The upgrade swaps the item id under the same provider id; the cached
+    // pool still holds the old one, which now 404s on Ancestors.
+    entries[0] = {
+      lib: LIB_A,
+      item: avItem({
+        id: hexId(0x6002),
+        name: "Replaced Movie",
+        providerIds: { Tpdb: "tpdb-replaced-uuid" },
+        path: "C:\\media\\movies\\Replaced Movie\\Replaced Movie.mkv",
+      }),
+    };
+    const again = await resolvePlaybackAccess(
+      cfg,
+      TOKEN,
+      account([LIB_A]),
+      hints,
+      { cachedSweep: true },
+    );
+    // The stale pooled 'denied' took the forced fresh retry, and the retried
+    // walk found the replacement: the verdict reflects the live library.
+    assert.equal(again.outcome, "available");
+    if (again.outcome !== "available") return assert.fail("unreachable");
+    assert.equal(again.item.id, hexId(0x6002));
+    assert.equal(
+      fx.log.filter(
+        (r) => r.method === "GET" && pathOf(r.url) === `/users/${ME_ID}/items`,
+      ).length,
+      402,
+    );
+  });
+});
+
 test("resolvePlaybackAccess reports outages as unavailable and propagates auth failures", async () => {
   await withFixture(
     avHandler({ entries: avEntries(), sweepStatus: 500 }),
@@ -2194,6 +2378,7 @@ import {
   buildMoviePayload,
   deliverToWhisparr,
   findWhisparrItem,
+  findWhisparrItemByPath,
   observeWhisparrItem,
   resolveWhisparrItem,
 } from "../src/server/whisparr.ts";
@@ -2316,6 +2501,52 @@ function metadataSource(payload: {
   if (/^tpdbid:/i.test(payload.foreignId)) return "tpdb";
   return "scene";
 }
+
+// --- full-list read bound ---
+
+test("the full movie-list read carries its own bound above the shared JSON cap", async () => {
+  const served =
+    (pad: number, count: number): FixtureHandler =>
+    (req, res) => {
+      if (pathOf(req.url ?? "") === "/api/v3/movie") {
+        return sendJson(
+          res,
+          200,
+          Array.from({ length: count }, (_, i) =>
+            storedMovie({
+              id: i + 1,
+              path: `/data/xxx/Pad Movie ${i + 1}`,
+              pad: "x".repeat(pad),
+            }),
+          ),
+        );
+      }
+      sendJson(res, 404, {});
+    };
+  // A >2 MiB list (the shared JSON_LIMIT) still resolves by path.
+  await withFixture(served(2300, 1000), async (fx) => {
+    assert.deepEqual(
+      await findWhisparrItemByPath(deliveryConfig(fx.origin), [
+        "/data/xxx/Pad Movie 7/file.mkv",
+      ]),
+      { provider: "tpdb", kind: "movie", id: MOVIE_UUID },
+    );
+  });
+  // Above the movie-list bound the failure keeps its name.
+  await withFixture(
+    served(Math.ceil((64 * 1024 * 1024) / 12000) + 200, 12000),
+    async (fx) => {
+      await assert.rejects(
+        findWhisparrItemByPath(deliveryConfig(fx.origin), [
+          "/data/xxx/Pad Movie 7/file.mkv",
+        ]),
+        (err: unknown) =>
+          err instanceof AppError &&
+          err.message === "Whisparr returned an oversized response.",
+      );
+    },
+  );
+});
 
 // --- resolution ---
 

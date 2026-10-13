@@ -18,18 +18,30 @@ import { resolvePlaybackAccess } from "../../../../server/jellyfin.ts";
 import {
   getCatalogDetail,
   searchCatalog,
+  type CatalogSearchPage,
 } from "../../../../server/providers.ts";
 import { searchVisibleCatalog } from "../../../../server/browse.ts";
 
-async function performerHint(
+// Year and performer reach the same-work judgment only through a title
+// hint: candidatesMayMatch returns before any ask without one, and
+// titleYearSimilar needs the title too. So the provider detail read waits
+// for a title hint and carries both facts in one round-trip; an outage or
+// an absent record degrades to exact matching, exactly as before.
+async function identityHints(
   media: MediaReference,
-): Promise<{ performer: string } | Record<string, never>> {
+  title: string | null | undefined,
+): Promise<{ performer?: string; year?: number }> {
+  if (!title) return {};
   try {
     const detail = await getCatalogDetail(media);
+    const year = Number.parseInt((detail?.releaseDate ?? "").slice(0, 4), 10);
     const credit = detail?.credits.find(
       (c) => c.reference.kind === "performer",
     );
-    return credit ? { performer: credit.name } : {};
+    return {
+      ...(credit ? { performer: credit.name } : {}),
+      ...(Number.isInteger(year) && year > 0 ? { year } : {}),
+    };
   } catch {
     return {};
   }
@@ -71,7 +83,7 @@ export async function availability(
         ? { title: acquisition.whisparrTitle }
         : {}),
       ...(acquisition?.state === "imported" ? { imported: true } : {}),
-      ...(await performerHint(media)),
+      ...(await identityHints(media, acquisition?.whisparrTitle)),
     },
     // The one cache-eligible caller: repeated badge calls share one sweep.
     { cachedSweep: true },
@@ -104,6 +116,11 @@ export interface SearchCategory {
   provider: "tpdb" | "stashdb";
   kind: CatalogKind;
   items: CatalogDetail[];
+  /** Provider-attested exact total; absent when the count is unknown. */
+  total?: number;
+  totalCountKnown: boolean;
+  /** More results exist behind this first page. */
+  hasMore: boolean;
   error?: ShelfError;
 }
 
@@ -113,11 +130,29 @@ export function categoryOf(
   id: string,
   provider: "tpdb" | "stashdb",
   kind: CatalogKind,
-  result: PromiseSettledResult<CatalogDetail[]>,
+  result: PromiseSettledResult<CatalogSearchPage>,
 ): SearchCategory {
   return result.status === "fulfilled"
-    ? { id, provider, kind, items: result.value }
-    : { id, provider, kind, items: [], error: shelfError(result.reason) };
+    ? {
+        id,
+        provider,
+        kind,
+        items: result.value.items,
+        ...(result.value.total !== undefined
+          ? { total: result.value.total }
+          : {}),
+        totalCountKnown: result.value.totalCountKnown,
+        hasMore: result.value.hasMore,
+      }
+    : {
+        id,
+        provider,
+        kind,
+        items: [],
+        totalCountKnown: false,
+        hasMore: false,
+        error: shelfError(result.reason),
+      };
 }
 
 export async function globalSearch(
@@ -153,7 +188,7 @@ export async function globalSearch(
         perPage: SEARCH_PER_PAGE,
       },
       hiddenTags,
-    ).then((page) => page.items),
+    ),
     searchVisibleCatalog(
       {
         provider: "stashdb",
@@ -163,31 +198,31 @@ export async function globalSearch(
         perPage: SEARCH_PER_PAGE,
       },
       hiddenTags,
-    ).then((page) => page.items),
+    ),
     searchCatalog({
       provider: "tpdb",
       kind: "performer",
       query: term,
       page: 1,
       perPage: SEARCH_PER_PAGE,
-    }).then((page) => page.items),
+    }),
     searchCatalog({
       provider: "stashdb",
       kind: "performer",
       query: term,
-    }).then((page) => page.items),
+    }),
     searchCatalog({
       provider: "tpdb",
       kind: "studio",
       query: term,
       page: 1,
       perPage: SEARCH_PER_PAGE,
-    }).then((page) => page.items),
+    }),
     searchCatalog({
       provider: "stashdb",
       kind: "studio",
       query: term,
-    }).then((page) => page.items),
+    }),
   ]);
   // Six source-labeled categories, never merged across providers. Each is
   // the provider's own search order — no global ranking is computed here.

@@ -70,12 +70,17 @@ jobs:
             velvarr:ci
       - name: Readiness check
         run: |
+          # /api/status reads storage: a /data the runtime user cannot write
+          # (or a migration that throws) answers 500, so this fails the job.
+          # /api/health is static and always 200. Any "startup failed" in the
+          # logs fails too: the acquisition loop may be dead while /api/status
+          # still answers.
           ready=0
           for _ in $(seq 1 30); do
-            if curl -fsS http://127.0.0.1:6699/api/health | grep -q '"ok":true'; then ready=1; break; fi
+            if curl -fsS http://127.0.0.1:6699/api/status | grep -q '"initialized":'; then ready=1; break; fi
             sleep 2
           done
-          if [ "$ready" != 1 ]; then
+          if [ "$ready" != 1 ] || docker logs velvarr-smoke 2>&1 | grep -q 'startup failed'; then
             docker logs --tail 100 velvarr-smoke
             exit 1
           fi
@@ -91,15 +96,45 @@ jobs:
           fi
       - name: Assert non-root runtime
         run: docker exec velvarr-smoke node -e "if (process.getuid() === 0) { console.error('container must not run as root'); process.exit(1) }"
+      # Deep scan plus direct probes, both as the exec user (velvarr). The scan
+      # alone cannot carry the verdict: CI run 38287663285 failed here with a
+      # bare exit 1, and the old form let a find error (set -e on the capture)
+      # look identical to listed writable paths. Now find's stderr is printed
+      # and only listed paths fail the job; the verdict comes from write
+      # probes on every directory the Dockerfile creates and on the code
+      # files, which is the property this job promises: writable /data only.
+      - name: Assert app code is not writable by the runtime user
+        run: |
+          writable=$(docker exec velvarr-smoke find /app -writable 2>/tmp/velvarr-find.err) \
+            || echo "deep scan exited $? (stderr above)"
+          if [ -n "$writable" ]; then
+            echo "/app paths writable by the runtime user:"
+            echo "$writable"
+            exit 1
+          fi
+          docker exec velvarr-smoke sh -c '
+            for d in /app /app/.next /app/.next/static /app/public /app/node_modules; do
+              [ -d "$d" ] || continue
+              if touch "$d/.ci-wprobe" 2>/dev/null; then
+                echo "runtime user created a file in $d"; rm -f "$d/.ci-wprobe"; exit 1
+              fi
+            done
+            for f in /app/server.js /app/package.json; do
+              if [ -f "$f" ] && [ -w "$f" ]; then
+                echo "runtime user can write $f"; exit 1
+              fi
+            done
+            exit 0
+          '
       - name: Restart and re-check readiness on persistent data
         run: |
           docker restart velvarr-smoke
           ready=0
           for _ in $(seq 1 30); do
-            if curl -fsS http://127.0.0.1:6699/api/health | grep -q '"ok":true'; then ready=1; break; fi
+            if curl -fsS http://127.0.0.1:6699/api/status | grep -q '"initialized":'; then ready=1; break; fi
             sleep 2
           done
-          if [ "$ready" != 1 ]; then
+          if [ "$ready" != 1 ] || docker logs velvarr-smoke 2>&1 | grep -q 'startup failed'; then
             docker logs --tail 100 velvarr-smoke
             exit 1
           fi
@@ -110,10 +145,12 @@ jobs:
     name: GHCR publication (main edge, release tags + opt-in)
     runs-on: ubuntu-latest
     needs: [gates, container]
+    # Main publishes edge; tag pushes publish releases. Manual dispatches
+    # are branch-only so they cannot replace a recorded release digest.
     if: >-
       (github.event_name == 'push' &&
         (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))) ||
-      (github.event_name == 'workflow_dispatch' && inputs.publish == true)
+      (github.event_name == 'workflow_dispatch' && inputs.publish == true && startsWith(github.ref, 'refs/heads/'))
     permissions:
       contents: read
       packages: write

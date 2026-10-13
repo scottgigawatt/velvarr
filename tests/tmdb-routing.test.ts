@@ -206,6 +206,15 @@ async function whisparrFixture(key: string) {
       json(item);
       return;
     }
+    const itemId = /^\/api\/v3\/movie\/(\d+)$/.exec(url.pathname);
+    if (itemId) {
+      const item = [...items.values()].find(
+        (entry) => entry.id === Number(itemId[1]),
+      );
+      if (!item) res.statusCode = 404;
+      json(item ?? {});
+      return;
+    }
     if (url.pathname === "/api/v3/movie") {
       const ref = url.searchParams.get("tpdbId")
         ? `tpdbId:${url.searchParams.get("tpdbId")}`
@@ -562,6 +571,92 @@ test("withdrawing unsent work is scoped to the selected instance", () => {
   assert.ok(storage.getAcquisitionByReference(media, legacyId));
   storage.cancelRequest(owner, mainRequest.id);
   assert.equal(storage.getAcquisitionByReference(media, legacyId), null);
+});
+
+test("sent work remains observable on its selected connection with movie delivery disabled", async () => {
+  const observedMain = await whisparrFixture("fixture-observation-main");
+  const observedAlternate = await whisparrFixture(
+    "fixture-observation-alternate",
+  );
+  const isolatedDir = mkdtempSync(
+    join(tmpdir(), "velvarr-disabled-observation-"),
+  );
+  storage.closeStorage();
+  process.env.VELVARR_DATA_DIR = isolatedDir;
+  try {
+    // Independent endpoints and storage keep this lifecycle test out of the routing fixture's history.
+    const isolated = modernConfigForObservation();
+    storage.bootstrap(isolated, ownerUser, "fixture-observation-session");
+    const admin = storage.getAccount(ownerUser.id)!;
+    storage.decideRequest(
+      admin,
+      storage.createRequest(admin.id, tmdb).id,
+      "approved",
+    );
+    await runDueWork(Date.now() + 1);
+    const sent = storage.getAcquisitionByReference(tmdb)!;
+    assert.equal(sent.state, "monitoring");
+    const item = observedAlternate.items.get(tmdb.id)!;
+    item.hasFile = true;
+    item.movieFileId = 1;
+    item.sizeOnDisk = 1024;
+    const disabled = storage.getConfig()!;
+    disabled.whisparrInstances![1]!.delivery!.enabled = false;
+    storage.saveConfig(disabled);
+
+    await runDueWork(Date.now() + 60_000);
+    assert.equal(storage.getAcquisition(sent.id)!.state, "imported");
+    assert.equal(
+      observedMain.adds.length,
+      0,
+      "Main must not receive Alternate's work",
+    );
+    assert.equal(
+      observedAlternate.adds.length,
+      1,
+      "observation must not issue another add",
+    );
+    storage.closeStorage();
+    storage.initializeStorage();
+    assert.equal(storage.getAcquisition(sent.id)!.state, "imported");
+    assert.equal(storage.listDueAcquisitions(Date.now() + 60_000).length, 0);
+  } finally {
+    storage.closeStorage();
+    process.env.VELVARR_DATA_DIR = dataDir;
+    await Promise.all(
+      [observedMain.server, observedAlternate.server].map(
+        (server) =>
+          new Promise<void>((resolve) => server.close(() => resolve())),
+      ),
+    );
+    rmSync(isolatedDir, { recursive: true, force: true });
+  }
+
+  function modernConfigForObservation(): IntegrationConfig {
+    return {
+      ...config,
+      whisparrInstances: [
+        {
+          name: "Main",
+          movieProvider: "tpdb",
+          sceneDefault: true,
+          url: observedMain.url,
+          apiKey: observedMain.key,
+          delivery: enabled("/data/movies"),
+          sceneDelivery: enabled("/data/scenes"),
+        },
+        {
+          name: "Alternate",
+          movieProvider: "tmdb",
+          sceneDefault: false,
+          url: observedAlternate.url,
+          apiKey: observedAlternate.key,
+          delivery: enabled("/data/movies"),
+          sceneDelivery: enabled("/data/scenes"),
+        },
+      ],
+    };
+  }
 });
 
 test("editing routes does not replay approvals; an unavailable Main cannot block Alternate", async () => {

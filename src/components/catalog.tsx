@@ -36,6 +36,7 @@ import type {
   CatalogReference,
   CatalogTagSelection,
 } from "../lib/contracts";
+import { CATALOG_YEAR_MAX, CATALOG_YEAR_MIN } from "../lib/contracts";
 // Names for studio/tag filter ids live in lib/names, seeded at navigation
 // time (details, picks, tiles) — URLs carry ids, chips still get labels.
 import { filterName, seedPerformerPick } from "../lib/names";
@@ -247,7 +248,7 @@ function SortSelect({
 
 /** Local input that resyncs when the URL value changes from the outside
  * (chip removal, provider switch, Back) without fighting the user's typing. */
-function useSyncedInput(value: string) {
+export function useSyncedInput(value: string) {
   const [input, setInput] = useState(value);
   const committed = useRef(value);
   useEffect(() => {
@@ -330,7 +331,11 @@ function YearBox({
     const t = input.trim();
     // Server rejects anything but a 4-digit year in range; never send junk.
     if (t !== "" && !/^\d{4}$/.test(t)) return;
-    if (t !== "" && (Number(t) < 1870 || Number(t) > 2100)) return;
+    if (
+      t !== "" &&
+      (Number(t) < CATALOG_YEAR_MIN || Number(t) > CATALOG_YEAR_MAX)
+    )
+      return;
     mark(t);
     onCommit(t);
   }, [disabled, input, mark, onCommit]);
@@ -343,8 +348,8 @@ function YearBox({
         id={id}
         type="number"
         inputMode="numeric"
-        min={1870}
-        max={2100}
+        min={CATALOG_YEAR_MIN}
+        max={CATALOG_YEAR_MAX}
         placeholder="Any year"
         className="input"
         value={input}
@@ -460,14 +465,18 @@ function DateCutoff({
 /** Debounced performer lookup behind the performer filter: the filter takes
  * a provider-native id, so the user picks a result — a typed name is never
  * sent. One field searches both sources; each result carries its side.
+ * Failures stay per side and sides the session marks not configured are
+ * skipped, so one source failing never hides the other source's rows.
  * TPDB performer search is paged; StashDB is unpaged and caps its result
  * list, which the picker says out loud. */
 function usePerformerOptions(term: string): {
   items: { performer: CatalogDetail; side: CatalogProvider }[];
-  error: string | null;
+  errors: { provider: CatalogProvider; message: string }[];
+  skipped: CatalogProvider[];
   loading: boolean;
 } {
   const t = term.trim();
+  const { providers } = useSession();
   // The debounce commits the read path, not the fetch: keystrokes settle
   // before the hook sees a new read at all.
   const [committed, setCommitted] = useState<string | null>(null);
@@ -486,15 +495,36 @@ function usePerformerOptions(term: string): {
       q: committed ?? "",
       ...(provider === "tpdb" ? { page: "1", perPage: "10" } : {}),
     })}`;
+  // A side the session marks not configured can never answer; looking it up
+  // would only draw its guaranteed 503 over the working side's rows. An
+  // unknown status (session not loaded) still looks the side up.
   const tpdb = useApiGet<CatalogSearchPage>(
-    committed !== null ? search("tpdb") : null,
+    committed !== null && providers?.tpdb !== "not_configured"
+      ? search("tpdb")
+      : null,
     [committed],
   );
   const stash = useApiGet<CatalogSearchPage>(
-    committed !== null ? search("stashdb") : null,
+    committed !== null && providers?.stashdb !== "not_configured"
+      ? search("stashdb")
+      : null,
     [committed],
   );
-  const error = [tpdb.error, stash.error].find((e) => e !== null) ?? null;
+  // Failures stay per side: one source failing must not hide the other
+  // source's rows, and the picker names the side that failed.
+  const errors = [
+    ...(tpdb.error !== null
+      ? [{ provider: "tpdb" as const, message: tpdb.error }]
+      : []),
+    ...(stash.error !== null
+      ? [{ provider: "stashdb" as const, message: stash.error }]
+      : []),
+  ];
+  const skipped = providers
+    ? (["tpdb", "stashdb"] as const).filter(
+        (p) => providers[p] === "not_configured",
+      )
+    : [];
   return {
     items: [
       ...(tpdb.data?.items ?? []).map((performer) => ({
@@ -506,7 +536,8 @@ function usePerformerOptions(term: string): {
         side: "stashdb" as const,
       })),
     ],
-    error,
+    errors,
+    skipped,
     loading: t !== "" && (committed !== t || tpdb.loading || stash.loading),
   };
 }
@@ -523,7 +554,7 @@ function PerformerPicker({
   onStarred: (on: boolean) => void;
 }) {
   const [term, setTerm] = useState("");
-  const { items, error, loading } = usePerformerOptions(term);
+  const { items, errors, skipped, loading } = usePerformerOptions(term);
   return (
     <div>
       <div className="cat-picker-head">
@@ -559,16 +590,10 @@ function PerformerPicker({
           ? "Scenes featuring any performer you follow. Picking a specific performer replaces this filter; performers known only to TPDB cannot match."
           : "One field, both sources: a TPDB performer opens their whole filmography (movies) and replaces the other filters until removed; a StashDB performer filters scenes. StashDB caps results at about ten rows."}
       </p>
-      {error ? (
-        <p className="cat-note" role="alert">
-          Performer search failed: {error}
-        </p>
-      ) : loading ? (
+      {loading ? (
         <p className="cat-note" aria-live="polite">
           Searching…
         </p>
-      ) : term.trim() !== "" && items.length === 0 ? (
-        <p className="cat-note">No performers match “{term.trim()}”.</p>
       ) : items.length > 0 ? (
         <ul className="cat-picker">
           {items.map(({ performer, side }) => (
@@ -595,7 +620,22 @@ function PerformerPicker({
             </li>
           ))}
         </ul>
+      ) : term.trim() !== "" && errors.length === 0 && skipped.length === 0 ? (
+        // Empty is only claimed when nothing failed and nothing was skipped:
+        // the notes below carry the failures, like the grid's per-provider
+        // panels.
+        <p className="cat-note">No performers match “{term.trim()}”.</p>
       ) : null}
+      {errors.map((e) => (
+        <p key={e.provider} className="cat-note" role="alert">
+          {providerLabel(e.provider)} search failed: {e.message}
+        </p>
+      ))}
+      {skipped.map((p) => (
+        <p key={`skipped-${p}`} className="cat-note">
+          {providerLabel(p)} is not configured, so it was not searched.
+        </p>
+      ))}
     </div>
   );
 }
@@ -983,7 +1023,16 @@ export function TitlesView() {
             hasMore: items.length > prev.items.length ? page.hasMore : false,
             ...(page.total !== undefined ? { total: page.total } : {}),
             totalCountKnown: page.totalCountKnown,
-            errors: page.errors,
+            // The server rebuilds each page from scratch and reports only
+            // that request's errors, so an append keeps earlier pages'
+            // named errors (newest message per provider wins) until a
+            // reset; a recovered provider cannot unreport its lost rows.
+            errors: [
+              ...prev.errors.filter(
+                (pe) => !page.errors.some((ne) => ne.provider === pe.provider),
+              ),
+              ...page.errors,
+            ],
             hiddenTagCount: page.hiddenTagCount ?? prev.hiddenTagCount,
           };
         });
@@ -1433,14 +1482,25 @@ export function TitlesView() {
             />
           ) : (
             <>
-              {acc.errors.map((e) => (
-                <ErrorPanel
-                  key={e.provider}
-                  title={`${providerLabel(e.provider)} unavailable`}
-                  message={e.message}
-                  onRetry={retry}
-                />
-              ))}
+              {acc.errors.map((e) =>
+                e.code === "scan_ceiling" ? (
+                  // The source answered every scanned page and hit the
+                  // documented limit: a partial answer, not an outage. No
+                  // retry — only narrower filters change the outcome.
+                  <ErrorPanel
+                    key={e.provider}
+                    title={`${providerLabel(e.provider)}: scan limit reached`}
+                    message={e.message}
+                  />
+                ) : (
+                  <ErrorPanel
+                    key={e.provider}
+                    title={`${providerLabel(e.provider)} unavailable`}
+                    message={e.message}
+                    onRetry={retry}
+                  />
+                ),
+              )}
               {acc.items.length === 0 ? (
                 // Empty is only claimed when no source failed: the error
                 // panels above carry the failures.
@@ -1493,10 +1553,13 @@ export function TitlesView() {
                   {!loading &&
                     error === null &&
                     !acc.hasMore &&
+                    acc.errors.length === 0 &&
                     acc.totalCountKnown &&
                     acc.total != null && (
-                      // Count only when the service attests a real total; a
-                      // capped total ends the scroll without a denominator.
+                      // Count only when the service attests a real total and
+                      // no source error stands: a capped total ends the
+                      // scroll without a denominator, and a standing error
+                      // may hide rows the exact number would deny.
                       <p className="mt-6 text-center text-sm text-muted">
                         {acc.total} titles
                       </p>
@@ -1616,13 +1679,13 @@ export function TitlesView() {
             onCommit={onDate}
           />
         )}
-        {/* Year and the date cutoff are TPDB-movie criteria; while either is
-            set only TPDB qualifies, and the note says so — never silently
-            ignored. */}
+        {/* Year and date apply to both sides: TPDB natively, StashDB with
+            the year checked locally, so scene totals are approximate. The
+            note says exactly that — never silently ignored. */}
         {movieSource !== "tmdb" && (year !== "" || date !== "") && (
           <p className="cat-note">
-            Year and release date apply to TPDB movies — while set, StashDB
-            scenes are left out.
+            Year and release date apply to TPDB movies and StashDB scenes; the
+            year is checked locally for scenes, so totals are approximate.
           </p>
         )}
         {studioStashdb !== "" && (
