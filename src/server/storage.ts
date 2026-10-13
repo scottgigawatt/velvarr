@@ -37,12 +37,16 @@ import type {
   Session,
   SessionGrant,
 } from "../lib/contracts.ts";
-import { AppError } from "./http.ts";
+import { AppError, setHttpPolicy } from "./http.ts";
+import {
+  defaultPersonalSettings,
+  parsePersonalSettings,
+} from "../lib/personalization.ts";
 import { DISCOVER_SHELVES, normalizeFacetName } from "../lib/contracts.ts";
 
 // Schema identity: application_id spells 'VLVR', user_version is the schema version.
 const APP_ID = 0x564c5652;
-const SCHEMA_VERSION = 12;
+const SCHEMA_VERSION = 13;
 // ponytail: fixed 7-day session TTL; make it an env knob only if an operator asks.
 const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const BUSY_TIMEOUT_MS = 5000;
@@ -432,6 +436,10 @@ const MIGRATIONS: Record<number, string> = {
     ALTER TABLE requests ADD COLUMN target_instance_id TEXT;
     CREATE INDEX requests_target ON requests (target_instance_id, provider, kind, external_id);
   `,
+  13: `
+    ALTER TABLE accounts ADD COLUMN personal_settings TEXT NOT NULL DEFAULT '{}'
+      CHECK (json_valid(personal_settings));
+  `,
 };
 
 let db: DatabaseSync | null = null;
@@ -705,10 +713,10 @@ function S(): Statements {
         "DELETE FROM performer_follows WHERE account_id = ? AND linked_provider = ? AND linked_external_id = ?",
       ),
       getPreferences: d.prepare(
-        "SELECT hidden_tags, discover_order FROM accounts WHERE id = ?",
+        "SELECT hidden_tags, discover_order, personal_settings FROM accounts WHERE id = ?",
       ),
       updatePreferences: d.prepare(
-        "UPDATE accounts SET hidden_tags = ?, discover_order = ? WHERE id = ?",
+        "UPDATE accounts SET hidden_tags = ?, discover_order = ?, personal_settings = ? WHERE id = ?",
       ),
     };
   }
@@ -1007,6 +1015,7 @@ function assertConfigShape(config: IntegrationConfig): void {
       !credentialOk(p.tpdbApiToken, 1024) ||
       !credentialOk(p.stashdbApiKey, 512) ||
       (p.judgmentProvider !== undefined &&
+        p.judgmentProvider !== "none" &&
         p.judgmentProvider !== "typesafe" &&
         p.judgmentProvider !== "ollama") ||
       (p.ollamaUrl !== undefined &&
@@ -1182,6 +1191,8 @@ function backfillApprovals(
 
 export function saveConfig(config: IntegrationConfig): void {
   assertConfigShape(config);
+  if (config.allowHttp !== undefined && typeof config.allowHttp !== "boolean")
+    throw new AppError(400, "invalid_config", "allowHttp must be a boolean");
   const d = open();
   inTransaction(d, () => {
     const existing = S().getConfig.get() as { data: Buffer } | undefined;
@@ -1231,6 +1242,7 @@ export function saveConfig(config: IntegrationConfig): void {
       Date.now(),
     );
   });
+  setHttpPolicy(config.allowHttp);
 }
 
 export function bootstrap(
@@ -1257,7 +1269,7 @@ export function bootstrap(
     );
   }
   const d = open();
-  return inTransaction(d, () => {
+  const grant = inTransaction(d, () => {
     // BEGIN IMMEDIATE serializes concurrent bootstraps; the single-owner unique
     // index is the second line of defense.
     if (S().hasConfig.get() || S().ownerExists.get()) {
@@ -1292,6 +1304,8 @@ export function bootstrap(
     );
     return issueSession(account, userToken);
   });
+  setHttpPolicy(resolved.allowHttp);
+  return grant;
 }
 
 export function importAccounts(users: ExternalUser[]): Account[] {
@@ -1591,6 +1605,7 @@ function isUniqueConflict(e: unknown, columns: readonly string[]): boolean {
 export function initializeStorage(): void {
   const d = open();
   const config = getConfig();
+  setHttpPolicy(config?.allowHttp);
   if (config?.whisparrInstances !== undefined) {
     inTransaction(d, () => backfillTargets(config, config));
     return;
@@ -2034,13 +2049,18 @@ function validTagSelection(s: unknown): s is CatalogTagSelection {
   return (
     nonemptyString(t.name, 120) &&
     t.name.trim().length > 0 &&
-    Object.keys(t).every((k) => ["name", "tpdb", "stashdb"].includes(k)) &&
+    Object.keys(t).every((k) =>
+      ["name", "tpdb", "stashdb", "tmdb"].includes(k),
+    ) &&
     (t.tpdb === undefined ||
       (typeof t.tpdb === "string" && UUID_RE.test(t.tpdb))) &&
     (t.stashdb === undefined ||
       (typeof t.stashdb === "string" && UUID_RE.test(t.stashdb))) &&
+    (t.tmdb === undefined ||
+      (typeof t.tmdb === "string" && isCatalogId("tmdb", t.tmdb))) &&
     (t.tpdb !== undefined ||
       t.stashdb !== undefined ||
+      t.tmdb !== undefined ||
       normalizeFacetName(t.name) !== "")
   );
 }
@@ -2061,6 +2081,9 @@ function consolidateTagSelections(
             name: prior.name,
             tpdb: prior.tpdb ?? s.tpdb,
             stashdb: prior.stashdb ?? s.stashdb,
+            ...((prior.tmdb ?? s.tmdb) !== undefined
+              ? { tmdb: prior.tmdb ?? s.tmdb }
+              : {}),
           }
         : s,
     );
@@ -2095,6 +2118,7 @@ export function parseTagSelections(input: unknown): CatalogTagSelection[] {
         typeof raw.name === "string" &&
         raw.tpdb === undefined &&
         raw.stashdb === undefined &&
+        raw.tmdb === undefined &&
         normalizeFacetName(raw.name) === "";
       throw new AppError(
         400,
@@ -2107,6 +2131,7 @@ export function parseTagSelections(input: unknown): CatalogTagSelection[] {
     // Plain copies: only name/tpdb/stashdb survive the boundary.
     items.push({
       name: raw.name.trim(),
+      ...(raw.tmdb !== undefined ? { tmdb: raw.tmdb } : {}),
       tpdb: raw.tpdb?.toLowerCase(),
       stashdb: raw.stashdb?.toLowerCase(),
     });
@@ -2183,6 +2208,7 @@ function parseStoredHiddenTags(json: string): CatalogTagSelection[] {
     (s) =>
       s.tpdb !== undefined ||
       s.stashdb !== undefined ||
+      s.tmdb !== undefined ||
       normalizeFacetName(s.name) !== "",
   );
 }
@@ -2191,7 +2217,8 @@ function parseStoredHiddenTags(json: string): CatalogTagSelection[] {
  * the session's own account; there is deliberately no list-everyone variant. */
 export function getContentPreferences(accountId: string): ContentPreferences {
   const row = S().getPreferences.get(accountId) as
-    { hidden_tags: string; discover_order: string } | undefined;
+    | { hidden_tags: string; discover_order: string; personal_settings: string }
+    | undefined;
   if (!row) {
     throw new AppError(404, "account_not_found", "account not found");
   }
@@ -2199,6 +2226,8 @@ export function getContentPreferences(accountId: string): ContentPreferences {
   return {
     hiddenTags: parseStoredHiddenTags(row.hidden_tags),
     discoverOrder: effectiveDiscoverOrder(JSON.parse(row.discover_order)),
+    ...defaultPersonalSettings(),
+    ...JSON.parse(row.personal_settings),
   };
 }
 
@@ -2212,42 +2241,64 @@ export function saveContentPreferences(
   accountId: string,
   input: unknown,
 ): ContentPreferences {
-  const account = S().getAccount.get(accountId) as AccountRow | undefined;
-  if (!account) {
-    throw new AppError(404, "account_not_found", "account not found");
-  }
-  if (!input || typeof input !== "object" || Array.isArray(input)) {
+  const current = getContentPreferences(accountId);
+  if (!input || typeof input !== "object" || Array.isArray(input))
     throw new AppError(
       400,
       "invalid_preferences",
-      "preferences must be an object with hiddenTags and/or discoverOrder",
+      "Preferences must be an object",
     );
-  }
   const doc = input as Record<string, unknown>;
-  const hasTags = "hiddenTags" in doc;
-  const hasOrder = "discoverOrder" in doc;
+  const allowed = [
+    "hiddenTags",
+    "discoverOrder",
+    "includeTags",
+    "applyIncludeTags",
+    "personalizeDiscover",
+    "browseRowLimit",
+    "appearance",
+  ];
   if (
-    (!hasTags && !hasOrder) ||
-    Object.keys(doc).some((k) => k !== "hiddenTags" && k !== "discoverOrder")
-  ) {
+    Object.keys(doc).length === 0 ||
+    Object.keys(doc).some((key) => !allowed.includes(key))
+  )
     throw new AppError(
       400,
       "invalid_preferences",
-      "preferences must be an object with hiddenTags and/or discoverOrder",
+      "Unknown or empty preferences patch",
+    );
+  const hiddenTags =
+    "hiddenTags" in doc
+      ? parseTagSelections(doc.hiddenTags)
+      : current.hiddenTags;
+  const discoverOrder =
+    "discoverOrder" in doc
+      ? parseDiscoverOrder(doc.discoverOrder)
+      : current.discoverOrder;
+  const includeTags =
+    "includeTags" in doc
+      ? parseTagSelections(doc.includeTags)
+      : current.includeTags;
+  let settings;
+  try {
+    settings = {
+      ...parsePersonalSettings({ ...current, ...doc }),
+      includeTags,
+    };
+  } catch (error) {
+    throw new AppError(
+      400,
+      "invalid_preferences",
+      error instanceof Error ? error.message : "Invalid preferences",
     );
   }
-  const hiddenTags = hasTags
-    ? parseTagSelections(doc.hiddenTags)
-    : parseStoredHiddenTags(account.hidden_tags);
-  const discoverOrder = hasOrder
-    ? parseDiscoverOrder(doc.discoverOrder)
-    : (JSON.parse(account.discover_order) as DiscoverShelfId[]);
   S().updatePreferences.run(
     JSON.stringify(hiddenTags),
     JSON.stringify(discoverOrder),
+    JSON.stringify(settings),
     accountId,
   );
-  return { hiddenTags, discoverOrder: effectiveDiscoverOrder(discoverOrder) };
+  return getContentPreferences(accountId);
 }
 
 /** Durable request view, filtered by the viewer's role: requesters see only
@@ -2791,6 +2842,7 @@ export function recoverAbandonedWork(): void {
 }
 
 export function closeStorage(): void {
+  setHttpPolicy(undefined);
   stmts = null;
   if (db) {
     try {

@@ -25,7 +25,7 @@ export function tagMatches(
 ): boolean {
   const nativeId =
     detail.reference.provider === "tmdb"
-      ? undefined
+      ? sel.tmdb
       : detail.reference.provider === "tpdb"
         ? sel.tpdb
         : sel.stashdb;

@@ -104,6 +104,10 @@ const metadata = createServer((req, res) => {
     });
     return;
   }
+  if (/^\/3\/movie\/\d+\/keywords$/.test(url.pathname)) {
+    json({ keywords: [] });
+    return;
+  }
   if (url.pathname === "/3/movie/404") {
     res.statusCode = 404;
     json({});
@@ -459,7 +463,7 @@ test("legacy approvals and claims survive a real schema-11 upgrade and keep Main
   const db = new DatabaseSync(dbPath);
   // Remove the new column/index to reconstruct the pre-feature requests shape.
   db.exec(
-    "DROP INDEX requests_target; ALTER TABLE requests DROP COLUMN target_instance_id; PRAGMA user_version = 11;",
+    "ALTER TABLE accounts DROP COLUMN personal_settings; DROP INDEX requests_target; ALTER TABLE requests DROP COLUMN target_instance_id; PRAGMA user_version = 11;",
   );
   db.close();
   storage.initializeStorage();

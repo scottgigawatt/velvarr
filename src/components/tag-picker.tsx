@@ -35,20 +35,27 @@ function realTag(t: CatalogTagSelection): boolean {
     t.name.trim().length > 0 &&
     t.name.length <= 120 &&
     ((typeof t.tpdb === "string" && UUID_RE.test(t.tpdb)) ||
-      (typeof t.stashdb === "string" && UUID_RE.test(t.stashdb)))
+      (typeof t.stashdb === "string" && UUID_RE.test(t.stashdb)) ||
+      (typeof t.tmdb === "string" && /^[1-9][0-9]*$/.test(t.tmdb)))
   );
 }
 
 /** The typed term itself: a selection with no provider id, workable only
  * where matching runs locally. */
 function isFreeText(t: CatalogTagSelection): boolean {
-  return t.tpdb === undefined && t.stashdb === undefined;
+  return (
+    t.tpdb === undefined && t.stashdb === undefined && t.tmdb === undefined
+  );
 }
 
 /** Where a tag exists, in library terms: TPDB publishes movies, StashDB
  * scenes; both references means both. */
 function sources(t: CatalogTagSelection): string {
-  return [t.tpdb !== undefined && "Movies", t.stashdb !== undefined && "Scenes"]
+  return [
+    t.tpdb !== undefined && "TPDB",
+    t.stashdb !== undefined && "StashDB",
+    t.tmdb !== undefined && "TMDB",
+  ]
     .filter((s): s is string => typeof s === "string")
     .join(", ");
 }
@@ -61,6 +68,7 @@ export function TagPicker({
   description,
   disabled,
   allowFreeText = false,
+  provider,
 }: {
   id: string;
   label: string;
@@ -77,7 +85,10 @@ export function TagPicker({
    * carries no provider id, so it can never travel as an exact native
    * tag. */
   allowFreeText?: boolean;
+  provider?: "tmdb" | "tpdb" | "stashdb";
 }) {
+  const [tagSource, setTagSource] = useState<"tmdb" | undefined>(undefined);
+  const effectiveProvider = provider ?? tagSource;
   const [term, setTerm] = useState("");
   const [open, setOpen] = useState(false);
   const [active, setActive] = useState(0);
@@ -101,8 +112,8 @@ export function TagPicker({
   const { data, error, loading } = useApiGet<BrowseTagsResponse>(
     disabled || capped || committed === null
       ? null
-      : `/api/browse/tags?q=${encodeURIComponent(committed)}`,
-    [committed],
+      : `/api/browse/tags?q=${encodeURIComponent(committed)}${effectiveProvider ? "&provider=" + effectiveProvider : ""}`,
+    [committed, effectiveProvider],
   );
 
   const picked = new Set(selected.map((s) => normalizeFacetName(s.name)));
@@ -186,6 +197,22 @@ export function TagPicker({
 
   return (
     <div>
+      {provider === undefined && (
+        <label className="label" htmlFor={id + "-source"}>
+          Tag catalog
+          <select
+            id={id + "-source"}
+            className="input"
+            value={tagSource ?? "combined"}
+            onChange={(event) =>
+              setTagSource(event.target.value === "tmdb" ? "tmdb" : undefined)
+            }
+          >
+            <option value="combined">TPDB and StashDB</option>
+            <option value="tmdb">TMDB keywords</option>
+          </select>
+        </label>
+      )}
       <label className="label" htmlFor={id}>
         {label}
       </label>

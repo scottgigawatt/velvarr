@@ -49,6 +49,7 @@ export function PreferencesView() {
   useEffect(() => {
     if (draft === null && loaded !== null)
       setDraft({
+        ...loaded,
         hiddenTags: loaded.hiddenTags,
         discoverOrder: loaded.discoverOrder,
       });
@@ -100,6 +101,10 @@ export function PreferencesView() {
         body: JSON.stringify({
           hiddenTags: draft.hiddenTags,
           discoverOrder: draft.discoverOrder,
+          includeTags: draft.includeTags,
+          applyIncludeTags: draft.applyIncludeTags,
+          personalizeDiscover: draft.personalizeDiscover,
+          browseRowLimit: draft.browseRowLimit,
         }),
       });
       setDraft(updated);
@@ -210,6 +215,72 @@ export function PreferencesView() {
           allowFreeText
           disabled={saving}
         />
+        <section className="preference-section">
+          <h3>Preferred tags</h3>
+          <p className="field-help">
+            Keep the tags you want to browse without entering them every time.
+            Hidden tags still take priority.
+          </p>
+          <TagPicker
+            id="pref-included-tags"
+            label="Always include"
+            selected={draft.includeTags}
+            allowFreeText
+            onChange={(includeTags) =>
+              setDraft((value) => (value ? { ...value, includeTags } : value))
+            }
+            description="Titles must match every preferred tag. Provider tags keep their own IDs; typed terms match tag names."
+          />
+          <label className="switch-label">
+            <input
+              type="checkbox"
+              className="check"
+              checked={draft.applyIncludeTags}
+              disabled={saving}
+              onChange={(event) =>
+                setDraft({ ...draft, applyIncludeTags: event.target.checked })
+              }
+            />
+            Apply preferred tags while browsing
+          </label>
+          <label className="switch-label">
+            <input
+              type="checkbox"
+              className="check"
+              checked={draft.personalizeDiscover}
+              disabled={saving}
+              onChange={(event) =>
+                setDraft({
+                  ...draft,
+                  personalizeDiscover: event.target.checked,
+                })
+              }
+            />
+            Use hidden and preferred tags on Discover
+          </label>
+        </section>
+        <section className="preference-section">
+          <h3>Browse results</h3>
+          <label className="label" htmlFor="pref-row-limit">
+            Results in each movie or scene row
+          </label>
+          <input
+            className="input"
+            id="pref-row-limit"
+            type="number"
+            min={10}
+            max={100}
+            value={draft.browseRowLimit}
+            disabled={saving}
+            onChange={(event) =>
+              setDraft({ ...draft, browseRowLimit: Number(event.target.value) })
+            }
+          />
+          <p className="field-help">
+            10 to 100 results per row. Default: 50. Movies and scenes get
+            independent limits.
+          </p>
+        </section>
         {orderList}
         <div className="mt-4 flex flex-wrap items-center gap-2">
           <button type="submit" className="btn" disabled={!dirty || saving}>
@@ -349,5 +420,23 @@ export function PreferencesDialog({
       </div>
       {open && <PreferencesView />}
     </dialog>
+  );
+}
+
+export function PreferencesPage() {
+  return (
+    <section className="preferences-page" aria-label="Your preferences">
+      <header className="page-heading">
+        <div>
+          <h1 className="page-title">Your preferences</h1>
+          <p className="page-description">
+            Shape what you browse and discover.
+          </p>
+        </div>
+      </header>
+      <div className="settings-group">
+        <PreferencesView />
+      </div>
+    </section>
   );
 }

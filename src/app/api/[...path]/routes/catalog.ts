@@ -1,3 +1,7 @@
+import { searchTmdbFacets } from "../../../../server/tmdb.ts";
+import { tmdbGet } from "../../../../server/providers.ts";
+import { shelfError } from "./discover.ts";
+import { parseTagSelections } from "../../../../server/storage.ts";
 import {
   queryInt,
   parseCatalogProvider,
@@ -487,8 +491,19 @@ export async function browseRoute(
   request: Request,
   ctx: AuthContext,
 ): Promise<Response> {
-  const hiddenTags = getContentPreferences(ctx.account.id).hiddenTags;
-  const parsedQuery = parseBrowseQuery(new URL(request.url).searchParams);
+  const preferences = getContentPreferences(ctx.account.id);
+  const hiddenTags = preferences.hiddenTags;
+  const params = new URL(request.url).searchParams;
+  const parsedQuery = parseBrowseQuery(params);
+  const preferred =
+    params.get("preferredTags") === "1" ||
+    (preferences.applyIncludeTags && params.get("preferredTags") !== "0")
+      ? preferences.includeTags
+      : [];
+  parsedQuery.include = parseTagSelections([
+    ...parsedQuery.include,
+    ...preferred,
+  ]);
   // Only StashDB-side identities can match — TPDB has no multi-performer
   // criterion (ponytail: TPDB-only follows are invisible to this filter; N
   // filmography streams if movies ever need it).
@@ -506,15 +521,89 @@ export async function browseRoute(
           ),
         ]
       : [];
+  if (params.get("grouped") === "1" && parsedQuery.type === "all") {
+    const limit = params.has("rowLimit")
+      ? Number(params.get("rowLimit"))
+      : preferences.browseRowLimit;
+    if (!Number.isInteger(limit) || limit < 10 || limit > 100)
+      throw new AppError(
+        400,
+        "invalid_query",
+        "Results per row must be between 10 and 100",
+      );
+    const queries = [
+      {
+        ...parsedQuery,
+        type: "movie" as const,
+        perPage: limit,
+        sort:
+          parsedQuery.sort ??
+          (parsedQuery.q ? ("relevance" as const) : ("recency" as const)),
+        direction: parsedQuery.sort
+          ? parsedQuery.direction
+          : parsedQuery.q
+            ? undefined
+            : ("desc" as const),
+      },
+      {
+        ...parsedQuery,
+        type: "scene" as const,
+        movieSource: "tpdb" as const,
+        perPage: limit,
+        sort:
+          parsedQuery.sort === "trending"
+            ? ("trending" as const)
+            : parsedQuery.sort === "relevance"
+              ? undefined
+              : (parsedQuery.sort ??
+                (parsedQuery.q ? ("title" as const) : ("date" as const))),
+        direction: parsedQuery.sort
+          ? parsedQuery.direction
+          : parsedQuery.q
+            ? ("asc" as const)
+            : ("desc" as const),
+      },
+    ];
+    const settled = await Promise.allSettled(
+      queries.map((query) =>
+        browseTitles(query, hiddenTags, starredPerformerIds),
+      ),
+    );
+    return json({
+      rowLimit: limit,
+      hiddenTagCount: hiddenTags.length,
+      preferredTagCount: preferred.length,
+      groups: settled.map((result, index) => ({
+        title: index === 0 ? "Movies" : "Scenes",
+        source: index === 0 ? (parsedQuery.movieSource ?? "tpdb") : "stashdb",
+        type: index === 0 ? "movie" : "scene",
+        ...(result.status === "fulfilled"
+          ? result.value
+          : { error: shelfError(result.reason) }),
+      })),
+    });
+  }
   const page = await browseTitles(parsedQuery, hiddenTags, starredPerformerIds);
-  return json({ ...page, hiddenTagCount: hiddenTags.length });
+  return json({
+    ...page,
+    hiddenTagCount: hiddenTags.length,
+    preferredTagCount: preferred.length,
+  });
 }
 
 // Tag facet lookup for the browse filter UI: provider-published tags with
 // per-source errors, never invented ones.
 export async function browseTagsRoute(request: Request): Promise<Response> {
   const q = (new URL(request.url).searchParams.get("q") ?? "").trim();
-  return json(await searchBrowseTags(q));
+  const provider = new URL(request.url).searchParams.get("provider");
+  if (provider !== null && !["tmdb", "tpdb", "stashdb"].includes(provider))
+    throw new AppError(400, "invalid_query", "Unknown tag provider");
+  return json(
+    await searchBrowseTags(
+      q,
+      provider === null ? undefined : (provider as CatalogProvider),
+    ),
+  );
 }
 
 // Related titles for one media reference, loaded separately from the detail
@@ -676,6 +765,27 @@ export async function catalogImage(request: Request): Promise<Response> {
 // resolved payload is never trusted.
 
 export const routes: RouteDef[] = [
+  {
+    method: "GET",
+    segments: ["browse", "facets"],
+    auth: "session",
+    run: async (_ctx, request) => {
+      const params = new URL(request.url).searchParams;
+      const kind = params.get("kind");
+      const term = (params.get("q") ?? "").trim();
+      if (
+        (kind !== "performer" && kind !== "studio") ||
+        term.length < 2 ||
+        term.length > 200
+      )
+        throw new AppError(
+          400,
+          "invalid_query",
+          "Choose a facet and enter 2 to 200 characters.",
+        );
+      return json({ items: await searchTmdbFacets(tmdbGet, kind, term) });
+    },
+  },
   {
     method: "GET",
     segments: ["catalog", "search"],

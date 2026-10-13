@@ -1,3 +1,4 @@
+import { defaultPersonalSettings } from "../src/lib/personalization.ts";
 import assert from "node:assert/strict";
 import test, { after } from "node:test";
 import { createCipheriv, createHash, randomBytes } from "node:crypto";
@@ -937,7 +938,11 @@ test("v1 database migrates in place preserving config, accounts, sessions, and g
   );
   assert.deepEqual(
     storage.getContentPreferences(owner.id),
-    { hiddenTags: [], discoverOrder: DEFAULT_ORDER },
+    {
+      ...defaultPersonalSettings(),
+      hiddenTags: [],
+      discoverOrder: DEFAULT_ORDER,
+    },
     "migrated accounts default to empty hidden tags and the default order",
   );
   assert.deepEqual(
@@ -960,7 +965,7 @@ test("v1 database migrates in place preserving config, accounts, sessions, and g
     raw.prepare("PRAGMA user_version").get() as { user_version: number }
   ).user_version;
   raw.close();
-  assert.equal(version, 12, "v1 database must migrate to schema 12");
+  assert.equal(version, 13, "v1 database must migrate to schema 13");
   // A v1 database never contained the removal tables (current migration 5
   // creates none), so nothing here can assert about them; the schema-10 test
   // below owns the claim that migration 11 drops them.
@@ -1096,7 +1101,9 @@ test("a schema-10 database migrates to 11: every removal object is dropped, rows
       "INSERT INTO removal_audit (id, execution_id, requester_id, approver_id, provider, kind, external_id, level, attempt_token, outcome, created_at) VALUES ('ra1', 're1', ?, ?, 'tpdb', 'movie', ?, 'drop', 'att1', 'done', ?)",
     )
     .run(ownerUser().id, ownerUser().id, MOVIE.id, now);
-  raw.exec("PRAGMA user_version = 10");
+  raw.exec(
+    "ALTER TABLE accounts DROP COLUMN personal_settings; PRAGMA user_version = 10",
+  );
   raw.close();
   storage.closeStorage();
 
@@ -1129,8 +1136,8 @@ test("a schema-10 database migrates to 11: every removal object is dropped, rows
   );
   assert.equal(
     versionRow.user_version,
-    12,
-    "schema 10 database must migrate to schema 12",
+    13,
+    "schema 10 database must migrate to schema 13",
   );
   assert.ok(
     grantRow !== null &&
@@ -2642,10 +2649,16 @@ test("content preferences persist per account, survive reopen, and never leak be
   const { owner, other } = prefSetup();
   assert.deepEqual(
     storage.getContentPreferences(owner),
-    { hiddenTags: [], discoverOrder: DEFAULT_ORDER },
+    {
+      ...defaultPersonalSettings(),
+      hiddenTags: [],
+      discoverOrder: DEFAULT_ORDER,
+    },
     "fresh accounts start empty",
   );
   assert.deepEqual(storage.getContentPreferences(other), {
+    ...defaultPersonalSettings(),
+    ...defaultPersonalSettings(),
     hiddenTags: [],
     discoverOrder: DEFAULT_ORDER,
   });
@@ -2658,13 +2671,19 @@ test("content preferences persist per account, survive reopen, and never leak be
   });
   // The same label from both providers consolidates into one selection.
   assert.deepEqual(saved, {
+    ...defaultPersonalSettings(),
+    ...defaultPersonalSettings(),
     hiddenTags: [{ name: "Rómance", tpdb: TAG_TPDB, stashdb: TAG_STASH }],
     discoverOrder: DEFAULT_ORDER,
   });
   assert.deepEqual(storage.getContentPreferences(owner), saved);
   assert.deepEqual(
     storage.getContentPreferences(other),
-    { hiddenTags: [], discoverOrder: DEFAULT_ORDER },
+    {
+      ...defaultPersonalSettings(),
+      hiddenTags: [],
+      discoverOrder: DEFAULT_ORDER,
+    },
     "another account is unaffected",
   );
 
@@ -2675,6 +2694,8 @@ test("content preferences persist per account, survive reopen, and never leak be
     "preferences survive close/reopen",
   );
   assert.deepEqual(storage.getContentPreferences(other), {
+    ...defaultPersonalSettings(),
+    ...defaultPersonalSettings(),
     hiddenTags: [],
     discoverOrder: DEFAULT_ORDER,
   });
@@ -2730,6 +2751,9 @@ test("malformed preferences are rejected atomically; unknown accounts are 404", 
   }
   // Every rejection above changed nothing.
   assert.deepEqual(storage.getContentPreferences(owner), {
+    ...defaultPersonalSettings(),
+    ...defaultPersonalSettings(),
+    ...defaultPersonalSettings(),
     hiddenTags: good.hiddenTags,
     discoverOrder: DEFAULT_ORDER,
   });
@@ -2796,6 +2820,8 @@ test("stored hidden tags that can never match are pruned on read and saved back 
 
   // Reads prune the dead rows; the live selection survives untouched.
   assert.deepEqual(storage.getContentPreferences(owner), {
+    ...defaultPersonalSettings(),
+    ...defaultPersonalSettings(),
     hiddenTags: [{ name: "Romance", tpdb: TAG_TPDB }],
     discoverOrder: DEFAULT_ORDER,
   });
@@ -2835,7 +2861,10 @@ test("discover order persists per account, isolates accounts, and partial saves 
   assert.deepEqual(reordered.discoverOrder, [
     "genres",
     "new-releases",
+    "new-scenes",
+    "tmdb-new",
     "trending",
+    "tmdb-trending",
     "jellyfin-recent",
     "velvarr-requests",
     "studios",
@@ -2861,6 +2890,8 @@ test("discover order persists per account, isolates accounts, and partial saves 
   );
   assert.deepEqual(reopened.hiddenTags, []);
   assert.deepEqual(storage.getContentPreferences(other), {
+    ...defaultPersonalSettings(),
+    ...defaultPersonalSettings(),
     hiddenTags: [],
     discoverOrder: DEFAULT_ORDER,
   });
@@ -2944,6 +2975,7 @@ test("discover order rejects duplicates, unknown ids, and non-strings without to
 
   // Every rejection above left both fields exactly as last saved.
   assert.deepEqual(storage.getContentPreferences(owner), {
+    ...defaultPersonalSettings(),
     hiddenTags: savedTags,
     discoverOrder: storedOrder,
   });
@@ -3001,7 +3033,11 @@ test("schema 9 preferences survive the schema 10 upgrade: hidden tags kept, orde
   );
   assert.deepEqual(
     storage.getContentPreferences(other),
-    { hiddenTags: [], discoverOrder: DEFAULT_ORDER },
+    {
+      ...defaultPersonalSettings(),
+      hiddenTags: [],
+      discoverOrder: DEFAULT_ORDER,
+    },
     "accounts that never saved preferences keep every default",
   );
 

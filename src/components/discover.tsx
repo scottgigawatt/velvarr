@@ -23,6 +23,8 @@ import type {
   Shelf,
 } from "../lib/contracts";
 import {
+  api,
+  messageOf,
   CardStatusBadge,
   type CardStatusKind,
   CardTypeBadge,
@@ -389,7 +391,7 @@ function LibraryTile({ item }: { item: LibraryItem }) {
 
 /* ---------- One shelf: header + body by kind ---------- */
 
-function ShelfSection({
+export function ShelfSection({
   shelf,
   busy,
   onRetry,
@@ -546,9 +548,12 @@ interface FacetDirectory {
  * facet tiles at directory size. A side that failed (StashDB refuses
  * empty-term tag searches on some tiers) is named — never a fabricated
  * list; the studios page states its real breadth (recent releases). */
-export function FacetsView() {
+export function FacetsView({
+  kindOverride,
+}: { kindOverride?: "studios" | "genres" } = {}) {
   const params = useSearchParams();
-  const kind = params.get("kind") === "studios" ? "studios" : "genres";
+  const kind =
+    kindOverride ?? (params.get("kind") === "studios" ? "studios" : "genres");
   const title = kind === "studios" ? "Studios" : "Genres";
   const { data, error, err, loading, reload } = useApiGet<FacetDirectory>(
     `/api/discovery/facets?kind=${kind}`,
@@ -615,6 +620,11 @@ export function FacetsView() {
 }
 
 export function DiscoverShelves() {
+  const preferences = useApiGet<
+    import("../lib/contracts.ts").ContentPreferences
+  >("/api/me/preferences", []);
+  const [personalizing, setPersonalizing] = useState(false);
+  const [preferenceError, setPreferenceError] = useState<string | null>(null);
   const setP = useParamsSetter();
   // The page rides useApiGet's per-tab cache: cleared on sign-out and on any
   // 401, and revalidated on every mount, so no snapshot outlives its account.
@@ -668,6 +678,43 @@ export function DiscoverShelves() {
   if (!page) return null;
   return (
     <section aria-label="Discover">
+      <header className="page-heading">
+        <div>
+          <h1 className="page-title">Discover</h1>
+          <p className="page-description">
+            New releases and trending titles, with every source in view.
+          </p>
+        </div>
+        <label className="switch-label">
+          <input
+            type="checkbox"
+            className="check"
+            disabled={personalizing || !preferences.data}
+            checked={preferences.data?.personalizeDiscover ?? true}
+            onChange={async (event) => {
+              setPersonalizing(true);
+              setPreferenceError(null);
+              try {
+                await api("/api/me/preferences", {
+                  method: "PATCH",
+                  body: JSON.stringify({
+                    personalizeDiscover: event.target.checked,
+                  }),
+                });
+                preferences.reload();
+                reload();
+                window.dispatchEvent(new Event(PREFERENCES_CHANGED));
+              } catch (error) {
+                setPreferenceError(messageOf(error));
+              } finally {
+                setPersonalizing(false);
+              }
+            }}
+          />
+          Use my tag preferences
+        </label>
+      </header>
+      {preferenceError && <ErrorPanel message={preferenceError} />}
       {/* A failed reload keeps the loaded shelves by design (useApiGet only
           drops cache-hit data); the panel says they are stale instead of
           reading as current. */}

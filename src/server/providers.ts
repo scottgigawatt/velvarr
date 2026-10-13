@@ -1,4 +1,9 @@
-import { searchTmdb, detailTmdb, type TmdbQuery } from "./tmdb.ts";
+import {
+  searchTmdb,
+  detailTmdb,
+  searchTmdbKeywords,
+  type TmdbQuery,
+} from "./tmdb.ts";
 // Metadata provider catalog reads: TPDB (movies, scenes, performers) and
 // StashDB (scenes, performers). Strictly read-only; returns validated
 // CatalogDetail records and paged search results. No provider payload or
@@ -603,19 +608,24 @@ export function resolveSort(
     if (
       !spec ||
       kind !== "movie" ||
-      (sort === "relevance" && direction !== undefined)
+      ((sort === "relevance" || sort === "trending") && direction !== undefined)
     )
       throw new AppError(
         400,
         "invalid_search",
         "Unsupported TMDB movie order.",
       );
-    return sort === "relevance"
-      ? { key: sort, upstream: "relevance" }
+    return sort === "relevance" || sort === "trending"
+      ? {
+          key: sort,
+          upstream: sort === "trending" ? "trending.week" : "relevance",
+        }
       : {
           key: sort,
           direction: direction ?? "desc",
-          upstream: `primary_release_date.${direction ?? "desc"}`,
+          upstream:
+            (sort === "popularity" ? "popularity." : "primary_release_date.") +
+            (direction ?? "desc"),
         };
   }
   if (provider === "tpdb") {
@@ -1785,12 +1795,7 @@ export async function searchCatalogTags(
   provider: CatalogProvider,
   term: string,
 ): Promise<{ id: string; name: string }[]> {
-  if (provider === "tmdb")
-    throw new AppError(
-      400,
-      "unsupported_catalog",
-      "TMDB genre browsing is not exposed as a tag catalog.",
-    );
+  if (provider === "tmdb") return searchTmdbKeywords(tmdbGet, term);
   const q = cleanQueryTerm(term);
   if (q === undefined) {
     throw new AppError(

@@ -268,14 +268,19 @@ export type CatalogTagSelection = {
   name: string;
   tpdb?: string;
   stashdb?: string;
+  /** TMDB keyword IDs remain scoped to TMDB. */
+  tmdb?: string;
 };
 
 /** The Discover carousels in their default display order. Shared vocabulary:
  * the server orders present shelves by the saved per-account order, the UI
  * renders titles from here, and storage validates saved ids against it. */
 export const DISCOVER_SHELVES = [
-  { id: "new-releases", title: "New releases" },
-  { id: "trending", title: "Trending" },
+  { id: "new-releases", title: "New movies · TPDB" },
+  { id: "new-scenes", title: "New scenes · StashDB" },
+  { id: "tmdb-new", title: "New movies · TMDB" },
+  { id: "trending", title: "Trending scenes · StashDB" },
+  { id: "tmdb-trending", title: "Trending movies · TMDB" },
   { id: "jellyfin-recent", title: "Recently added" },
   { id: "velvarr-requests", title: "Recent requests" },
   { id: "studios", title: "Studios" },
@@ -293,6 +298,17 @@ export type DiscoverShelfId = (typeof DISCOVER_SHELVES)[number]["id"];
 export type ContentPreferences = {
   hiddenTags: CatalogTagSelection[];
   discoverOrder: DiscoverShelfId[];
+  includeTags: CatalogTagSelection[];
+  applyIncludeTags: boolean;
+  personalizeDiscover: boolean;
+  browseRowLimit: number;
+  appearance: AppearancePreferences;
+};
+
+export type AppearancePreferences = {
+  mode: "dark" | "light" | "system";
+  preset: "velvet" | "ocean" | "forest" | "amber" | "violet" | "custom";
+  accent: string;
 };
 
 export type RequestDecision = "pending" | "approved" | "declined" | "cancelled";
@@ -545,9 +561,11 @@ export function isCatalogId(provider: CatalogProvider, id: string): boolean {
     : UUID_RE.test(id);
 }
 
-export type JudgmentProvider = "typesafe" | "ollama";
+export type JudgmentProvider = "none" | "typesafe" | "ollama";
 
 export type IntegrationConfig = {
+  /** Administrator policy; absent values retain the environment fallback. */
+  allowHttp?: boolean;
   jellyfin: {
     url: string;
     externalUrl: string;

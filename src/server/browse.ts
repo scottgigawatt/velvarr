@@ -1,3 +1,4 @@
+import type { TmdbQuery } from "./tmdb.ts";
 // User-visible catalog composition: one Browse destination over TPDB movies
 // and StashDB scenes, with personal hidden tags and tag include/exclude
 // filters layered on top of provider-native search. The metadata cache in
@@ -53,6 +54,7 @@ import {
   CATALOG_YEAR_MAX,
   CATALOG_YEAR_MIN,
   normalizeFacetName,
+  isCatalogId,
 } from "../lib/contracts.ts";
 import { BROWSE_MIXED_SORTS, SORT_KEYS, sortSpec } from "../lib/sorts.ts";
 import type {
@@ -72,6 +74,8 @@ export type BrowseType = "all" | "movie" | "scene";
 export type BrowseQuery = {
   type: BrowseType;
   movieSource?: "tpdb" | "tmdb";
+  tmdbPerformer?: string;
+  tmdbStudio?: string;
   adultOnly?: boolean;
   q?: string;
   include: CatalogTagSelection[];
@@ -190,6 +194,11 @@ export function parseBrowseQuery(params: URLSearchParams): BrowseQuery {
   if (direction !== undefined && sort === undefined) {
     throw invalidQuery("direction requires an explicit sort.");
   }
+  for (const key of ["tmdbPerformer", "tmdbStudio"]) {
+    const value = params.get(key);
+    if (value !== null && !isCatalogId("tmdb", value))
+      throw invalidQuery("Invalid TMDB cast or company ID.");
+  }
   const date = params.get("date")?.trim() ?? "";
   const dateOperation = parseEnum(
     params.get("date_operation"),
@@ -238,6 +247,12 @@ export function parseBrowseQuery(params: URLSearchParams): BrowseQuery {
   );
   return {
     type: type ?? "all",
+    ...(params.get("tmdbPerformer")
+      ? { tmdbPerformer: params.get("tmdbPerformer")! }
+      : {}),
+    ...(params.get("tmdbStudio")
+      ? { tmdbStudio: params.get("tmdbStudio")! }
+      : {}),
     ...(params.has("movieSource")
       ? {
           movieSource: parseEnum(
@@ -984,24 +999,39 @@ export async function browseTitles(
       query.studioTpdb ||
       query.studioStashdb ||
       query.performerStarred ||
-      query.date ||
-      query.include.length ||
-      query.exclude.length
+      false
     )
       throw invalidQuery(
-        "TMDB movie search supports title, year, and adult-only filters. Clear the other filters first.",
+        "TMDB supports title, year, date, and keywords. Performer and studio filters are unavailable.",
       );
-    if (query.sort && query.sort !== "relevance" && query.sort !== "recency")
-      throw invalidQuery("TMDB supports relevance or release recency.");
+    if (
+      query.sort &&
+      !["relevance", "recency", "popularity", "trending"].includes(query.sort)
+    )
+      throw invalidQuery(
+        "TMDB supports relevance, release date, popularity, or weekly trending.",
+      );
     const result = await searchVisibleCatalog(
       {
         provider: "tmdb",
         kind: "movie",
         query: query.q,
         year: query.year,
-        adultOnly: query.adultOnly,
-        sort: query.sort,
-        direction: query.direction,
+        adultOnly: query.adultOnly ?? true,
+        cast: query.tmdbPerformer,
+        company: query.tmdbStudio,
+        includeTags: query.include,
+        excludeTags: [...query.exclude, ...hiddenTags],
+        ...(query.date
+          ? {
+              releaseDate: {
+                cutoff: query.date,
+                operation: query.dateOperation!,
+              },
+            }
+          : {}),
+        sort: query.sort as TmdbQuery["sort"],
+        direction: query.sort === "trending" ? undefined : query.direction,
         page: query.page,
         perPage: query.perPage,
       },
@@ -1257,6 +1287,7 @@ export async function searchVisibleCatalog(
  * suggestion path proposes real provider tags (never invented ones). */
 export async function searchBrowseTags(
   term: string,
+  selectedProvider?: CatalogProvider,
 ): Promise<BrowseTagsResponse> {
   const q = term.trim();
   if (q.length < 2) {
@@ -1266,7 +1297,9 @@ export async function searchBrowseTags(
       "Enter at least 2 characters to search.",
     );
   }
-  const providers: CatalogProvider[] = ["tpdb", "stashdb"];
+  const providers: CatalogProvider[] = selectedProvider
+    ? [selectedProvider]
+    : ["tpdb", "stashdb"];
   const settled = await Promise.allSettled(
     providers.map((p) => searchCatalogTags(p, q)),
   );
@@ -1291,17 +1324,24 @@ export async function searchBrowseTags(
       if (existing === undefined) {
         const selection: CatalogTagSelection = { name: row.name };
         if (provider === "tpdb") selection.tpdb = row.id;
+        else if (provider === "tmdb") selection.tmdb = row.id;
         else selection.stashdb = row.id;
         byLabel.set(label, selection);
         tags.push(selection);
       } else if (provider === "tpdb" && existing.tpdb === undefined) {
         existing.tpdb = row.id;
+      } else if (provider === "tmdb" && existing.tmdb === undefined) {
+        existing.tmdb = row.id;
       } else if (provider === "stashdb" && existing.stashdb === undefined) {
         existing.stashdb = row.id;
       }
     }
   }
-  if (tags.length === 0 && errors.length < providers.length) {
+  if (
+    selectedProvider !== "tmdb" &&
+    tags.length === 0 &&
+    errors.length < providers.length
+  ) {
     try {
       const settings = getConfig()?.providers;
       if (judgmentConfigured(settings)) {

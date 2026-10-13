@@ -3600,7 +3600,14 @@ test("every sort-table row is observable: membership, direction rule, offers", (
         assert.equal(applied.key, spec.key);
         assert.equal(applied.direction, spec.directional ? "asc" : undefined);
         const tab = provider !== "stashdb" ? "movie" : "scene";
-        assert.equal(browseSortIsDirectional(tab, spec.key), spec.directional);
+        assert.equal(
+          browseSortIsDirectional(
+            tab,
+            spec.key,
+            provider === "tmdb" ? "tmdb" : "tpdb",
+          ),
+          spec.directional,
+        );
       }
     }
   }

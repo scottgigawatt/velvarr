@@ -1,4 +1,6 @@
 "use client";
+import { AppearanceSync, AppearanceView } from "./appearance.tsx";
+import { PreferencesPage } from "./preferences.tsx";
 
 import {
   useCallback,
@@ -712,6 +714,9 @@ function LoginView({ onSignedIn }: { onSignedIn: () => void }) {
 const VIEWS = [
   "discover",
   "facets",
+  "studios",
+  "preferences",
+  "appearance",
   "titles",
   "following",
   "search",
@@ -929,6 +934,19 @@ function Shell() {
       icon: "performer",
       group: "browse",
     },
+    { id: "studios", label: "Studios", icon: "studio", group: "browse" },
+    {
+      id: "preferences",
+      label: "Preferences",
+      icon: "settings",
+      group: "manage",
+    },
+    {
+      id: "appearance",
+      label: "Appearance",
+      icon: "appearance",
+      group: "manage",
+    },
     { id: "library", label: "Library", icon: "library", group: "manage" },
     { id: "requests", label: "Requests", icon: "requests", group: "manage" },
     { id: "admin", label: "Users", icon: "users", group: "admin" },
@@ -1001,6 +1019,7 @@ function Shell() {
 
   return (
     <div className="app-shell">
+      <AppearanceSync />
       <a className="skip-link" href="#main-content">
         Skip to content
       </a>
@@ -1059,6 +1078,9 @@ function Shell() {
       <main className="app-main" id="main-content" tabIndex={-1}>
         {view === "discover" && <DiscoverShelves />}
         {view === "facets" && <FacetsView />}
+        {view === "studios" && <FacetsView kindOverride="studios" />}
+        {view === "preferences" && <PreferencesPage />}
+        {view === "appearance" && <AppearanceView />}
         {view === "titles" && <TitlesView />}
         {view === "following" && <FollowingView />}
         {view === "library" && <LibraryView />}
@@ -1070,7 +1092,11 @@ function Shell() {
       </main>
       <nav className="mobile-bottom-nav" aria-label="Quick navigation">
         {visibleNav
-          .filter((item) => item.group === "browse" || item.id === "requests")
+          .filter(
+            (item) =>
+              (item.group === "browse" && item.id !== "studios") ||
+              item.id === "requests",
+          )
           .map((item) => (
             <a
               key={item.id}
