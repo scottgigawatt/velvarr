@@ -37,7 +37,10 @@ import {
   studioCounterpart,
   tagCounterpart,
 } from "../src/server/providers.ts";
-import type { CatalogSearchQuery } from "../src/server/providers.ts";
+import type {
+  CatalogSearchQuery,
+  TagReference,
+} from "../src/server/providers.ts";
 import type { CatalogDetail } from "../src/lib/contracts.ts";
 import { normalizeFacetName } from "../src/lib/contracts.ts";
 
@@ -1006,7 +1009,7 @@ test("stashdb graphql resolver failures read as outages, not absence", async () 
       id: CANON_PERFORMER_ID,
     });
     assert.equal(performer?.title, "Anna");
-    // A whole-body data:null with errors is an unusable response, not a 404.
+    // A whole-body data:null with errors is a named outage, not a 404.
     await assert.rejects(
       getCatalogDetail({
         provider: "stashdb",
@@ -1026,7 +1029,7 @@ test("stashdb graphql resolver failures read as outages, not absence", async () 
 
 test("graphql error bodies are never cached; stale fallback keeps the last good payload", async () => {
   const restore = setEnv({ STASHDB_API_KEY: STASH_TOKEN });
-  let mode: "errors" | "good" | "outage" = "errors";
+  let mode: "errors" | "data-null" | "no-data" | "good" | "outage" = "errors";
   const fixture = await startFixture((_req, res, body) => {
     const parsed = JSON.parse(body) as { query: string };
     if (!parsed.query.includes("findScene")) {
@@ -1039,6 +1042,13 @@ test("graphql error bodies are never cached; stale fallback keeps the last good 
         data: { findScene: null },
         errors: [{ message: "boom" }],
       });
+    } else if (mode === "data-null") {
+      // A failed non-null root field (queryScenes/queryTags are non-null
+      // types) zeroes the whole data object instead of the one key.
+      sendJson(res, 200, { data: null, errors: [{ message: "boom" }] });
+    } else if (mode === "no-data") {
+      // A request-level failure omits data entirely.
+      sendJson(res, 200, { errors: [{ message: "boom" }] });
     } else if (mode === "good") {
       sendJson(res, 200, {
         data: {
@@ -1064,18 +1074,27 @@ test("graphql error bodies are never cached; stale fallback keeps the last good 
     });
   try {
     process.env.STASHDB_BASE_URL = fixture.origin;
-    // The error body is named as an outage, and a second read within the
+    // Every error shape is named as an outage, and a repeat read within the
     // TTL re-requests instead of replaying the cached error.
     await assert.rejects(detail(), (err: unknown) => {
       assertProviderError(err, 502, "upstream_bad_response");
       assert.match((err as AppError).message, /boom/);
       return true;
     });
+    // Whole-body data:null carries the first GraphQL error message too.
+    mode = "data-null";
+    await assert.rejects(detail(), (err: unknown) => {
+      assertProviderError(err, 502, "upstream_bad_response");
+      assert.match((err as AppError).message, /boom/);
+      return true;
+    });
+    // So does a body with no data object at all.
+    mode = "no-data";
     await assert.rejects(detail(), (err: unknown) => {
       assertProviderError(err, 502, "upstream_bad_response");
       return true;
     });
-    assert.equal(fixture.log.length, 2);
+    assert.equal(fixture.log.length, 3);
     // The mocked clock starts at epoch 0, so it must be running before the
     // good read stamps the cache entry's timestamp.
     mock.timers.enable({ apis: ["Date"] });
@@ -1083,17 +1102,17 @@ test("graphql error bodies are never cached; stale fallback keeps the last good 
     mode = "good";
     const good = await detail();
     assert.equal(good?.reference.id, STASH_SCENE_ID);
-    assert.equal(fixture.log.length, 3);
+    assert.equal(fixture.log.length, 4);
     // Fresh within the TTL: no new upstream call.
     assert.equal((await detail())?.reference.id, STASH_SCENE_ID);
-    assert.equal(fixture.log.length, 3);
+    assert.equal(fixture.log.length, 4);
     // Past the 10-minute TTL the outage serves the last good payload stale —
     // the error body never replaced it.
     mode = "outage";
     mock.timers.tick(10 * 60_000 + 1);
     const stale = await detail();
     assert.equal(stale?.reference.id, STASH_SCENE_ID);
-    assert.equal(fixture.log.length, 4);
+    assert.equal(fixture.log.length, 5);
   } finally {
     mock.timers.reset();
     await fixture.close();
@@ -2024,11 +2043,17 @@ test("tagCounterpart pairs only exact normalized names and rejects on upstream f
       },
     });
   });
-  let paired: { provider: string; id: string } | undefined;
+  let paired: TagReference | undefined;
   try {
     process.env.STASHDB_BASE_URL = stashFixture.origin;
     paired = await tagCounterpart("tpdb", "All Sex");
-    assert.deepEqual(paired, { provider: "stashdb", id: STASH_CROSS_ID });
+    // native:true now rides every reference (fix(browse): uuid-less
+    // exact-label matches report native:false instead of vanishing).
+    assert.deepEqual(paired, {
+      provider: "stashdb",
+      id: STASH_CROSS_ID,
+      native: true,
+    });
 
     // Near-misses only: normalization never bends "Anal" into a longer name.
     assert.equal(await tagCounterpart("tpdb", "Anal"), undefined);
@@ -2051,15 +2076,31 @@ test("tagCounterpart pairs only exact normalized names and rejects on upstream f
   const tpdbFixture = await startFixture((req, res) => {
     const params = queryOf(req.url ?? "");
     assert.equal(params.get("per_page"), "50");
-    sendJson(res, 200, {
-      data: [{ id: 70, uuid: TPDB_TAG_A, name: "All Sex" }],
-    });
+    // The search honours its term: "all-sex" holds a uuid-less row beside
+    // the UUID row (the UUID stays the preferred native counterpart);
+    // "legacy" holds a uuid-less row only — deliberate contract flip
+    // (fix(browse)): the label exists, so the reference reports
+    // native:false with no id; undefined would claim an absence the
+    // provider never showed.
+    const rows =
+      params.get("q") === "all-sex"
+        ? [
+            { id: 305, name: "All Sex" },
+            { id: 70, uuid: TPDB_TAG_A, name: "All Sex" },
+          ]
+        : [{ id: 305, name: "Legacy" }];
+    sendJson(res, 200, { data: rows });
   });
   try {
     process.env.TPDB_BASE_URL = tpdbFixture.origin;
     assert.deepEqual(await tagCounterpart("stashdb", "all-sex"), {
       provider: "tpdb",
       id: TPDB_TAG_A,
+      native: true,
+    });
+    assert.deepEqual(await tagCounterpart("stashdb", "legacy"), {
+      provider: "tpdb",
+      native: false,
     });
   } finally {
     await tpdbFixture.close();

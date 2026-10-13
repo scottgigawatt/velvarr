@@ -501,15 +501,18 @@ test("guardMutation enforces exact configured origin and safe transport", () => 
 });
 
 // One failed login, the way routes/auth.ts runs it: the attempt reserves
-// its account slot before the upstream call, and a credential rejection
-// keeps that slot and feeds the global spray cap. A full global cap
-// surfaces 429 to the route, but the account charge stands either way.
-function failedLogin(name: string): void {
-  security.reserveLoginAttempt(name); // refund dropped: this was a guess
-  try {
-    security.recordLoginFailure();
-  } catch {
-    // global spray cap full — the reservation's charge already landed
+// its slots before the upstream call. A non-admitted guess holds its global
+// spray slot from the reservation; an admitted name is exempt from the
+// reservation and charges the cap on the rejection instead. A credential
+// rejection never refunds.
+function failedLogin(name: string, admitted = false): void {
+  security.reserveLoginAttempt(name, admitted); // refund dropped: this was a guess
+  if (admitted) {
+    try {
+      security.recordLoginFailure();
+    } catch {
+      // global spray cap full — nothing left to record
+    }
   }
 }
 
@@ -583,7 +586,7 @@ test("login limiter: the spray cap binds strangers, admitted names ride past it"
   security.resetLoginBuckets();
   // The per-account bucket still binds an admitted name even with admitted
   // set: brute force on a real account stays throttled.
-  for (let i = 0; i < 5; i++) failedLogin("locked-owner");
+  for (let i = 0; i < 5; i++) failedLogin("locked-owner", true);
   assert.throws(
     () => security.assertLoginAllowed("locked-owner", true),
     (e: { code: string }) => e.code === "too_many_attempts",
@@ -624,11 +627,14 @@ test("login limiter: the spray cap binds strangers, admitted names ride past it"
   // The old global-first charge skipped the account charge once the spray
   // cap was full, leaving admitted names unbounded.
   security.assertLoginAllowed("brute-target", true);
-  for (let i = 0; i < 5; i++) failedLogin("brute-target");
+  // These guesses go through login with hasAccountNamed=true, so the helper
+  // must state admitted: the reservation skips the full global bucket and
+  // the rejection feeds it, exactly as the route runs it.
+  for (let i = 0; i < 5; i++) failedLogin("brute-target", true);
   // The sixth guess is refused by its own account bucket, not the spray
   // cap: global full no longer means unlimited guesses.
   assert.throws(
-    () => failedLogin("brute-target"),
+    () => failedLogin("brute-target", true),
     (e: { code: string }) => e.code === "too_many_attempts",
   );
   assert.throws(
@@ -638,6 +644,57 @@ test("login limiter: the spray cap binds strangers, admitted names ride past it"
   // An untouched admitted name is exempt from the spray cap only, not
   // unlocked: a full global bucket locks no admitted name by itself.
   security.assertLoginAllowed("brute-bystander", true);
+});
+
+test("login limiter: reserve→refund cycles on distinct names leave the bucket map bounded", () => {
+  // Regression guard for the f29b9d2 leak: a non-credential outcome refunded
+  // the count but left an account:<name> bucket in the map forever, and
+  // consumeBucket's insert path skipped the MAX_BUCKETS sweep. A cheap
+  // invalid-credentials path (a 201..512-character password rejected before
+  // any upstream call) drove the map ~309 bytes per attempt with no cap
+  // charge; the refund must delete a bucket that reaches zero.
+  security.resetLoginBuckets();
+  const before = security.loginBucketCount();
+  for (let i = 0; i < 2000; i++) {
+    security.reserveLoginAttempt(`spray-${i}`)();
+  }
+  assert.equal(
+    security.loginBucketCount(),
+    before,
+    "a reserve→refund cycle must not leave a bucket behind",
+  );
+});
+
+test("login limiter: a rotating-name concurrent burst stops at GLOBAL_LIMIT (300)", async () => {
+  // The spray cap must bind a burst of rotating names, not just a sequence:
+  // the global slot lands in the same synchronous step as the reservation,
+  // before any upstream round-trip, so one burst cannot slip past the
+  // read-only gate's check-then-await.
+  security.resetLoginBuckets();
+  const results = await Promise.allSettled(
+    Array.from({ length: 320 }, async (_, i) => {
+      security.reserveLoginAttempt(`rot-${i}`);
+      return true;
+    }),
+  );
+  const passed = results.filter((r) => r.status === "fulfilled");
+  const refused = results.filter(
+    (r) =>
+      r.status === "rejected" &&
+      r.reason instanceof AppError &&
+      r.reason.code === "too_many_attempts",
+  );
+  assert.equal(
+    passed.length,
+    300,
+    `the burst must stop at GLOBAL_LIMIT (300), got ${passed.length}`,
+  );
+  assert.equal(refused.length, 20, "the surplus guesses must be refused");
+  assert.throws(
+    () => security.assertLoginAllowed("rot-unserved"),
+    (e: { code: string }) => e.code === "too_many_attempts",
+    "the global bucket must be what stopped the burst",
+  );
 });
 
 test("session cookie flags follow request transport and clear correctly", () => {
@@ -1686,7 +1743,12 @@ test("a URL change carries imported approvals forward and still delivers never-d
   assert.ok(importedRow);
   storage.recordAcquisitionObservation(importedRow.id, {
     state: "imported",
-    item: { monitored: true },
+    item: {
+      whisparrId: 42,
+      path: "/data/whisparr/movie.mkv",
+      title: "Carried Movie",
+      monitored: true,
+    },
   });
 
   // Approved but never dispatched: delivery must still happen after the move.
@@ -1700,12 +1762,212 @@ test("a URL change carries imported approvals forward and still delivers never-d
   const carried = storage.getAcquisitionByReference(MOVIE);
   assert.ok(carried);
   assert.equal(carried.state, "imported", "imported survives the URL change");
+  assert.equal(carried.whisparrId, 42, "whisparrId survives the URL change");
+  assert.equal(
+    carried.whisparrPath,
+    "/data/whisparr/movie.mkv",
+    "the path survives the URL change",
+  );
+  assert.equal(
+    carried.whisparrTitle,
+    "Carried Movie",
+    "the title survives the URL change",
+  );
+  assert.equal(
+    carried.whisparrMonitored,
+    true,
+    "monitored survives the URL change",
+  );
+  assert.ok(carried.lastObservedAt, "lastObservedAt survives the URL change");
+  assert.equal(
+    carried.dueAt,
+    null,
+    "a carried imported row is never rescheduled",
+  );
 
   const due = storage.listDueAcquisitions(Date.now() + 60_000);
   assert.deepEqual(
     due.map((a) => [a.media.id, a.state]),
     [[SCENE.id, "unsent"]],
     "only the never-dispatched approval is due after the change",
+  );
+});
+
+test("boot repair restores facts a URL change dropped from a carried imported row", () => {
+  freshDir();
+  storage.bootstrap(deliveryConfig(true), ownerUser(), "jf-owner-token");
+  const owner = storage.getAccount(ownerUser().id) as Account;
+
+  const done = storage.createRequest(owner.id, MOVIE);
+  storage.decideRequest(owner, done.id, "approved");
+  const observed = storage.getAcquisitionByReference(MOVIE);
+  assert.ok(observed);
+  storage.recordAcquisitionObservation(observed.id, {
+    state: "imported",
+    item: {
+      whisparrId: 42,
+      path: "/data/whisparr/movie.mkv",
+      title: "Carried Movie",
+      monitored: true,
+    },
+  });
+
+  const moved = deliveryConfig(true);
+  moved.whisparr = { ...moved.whisparr!, url: "http://127.0.0.1:6970" };
+  storage.saveConfig(moved);
+  const carried = storage.getAcquisitionByReference(MOVIE);
+  assert.ok(carried);
+
+  // Simulate a build that carried the state without the observed facts.
+  storage.closeStorage();
+  const raw = new DatabaseSync(join(currentDir, "velvarr.sqlite"));
+  raw
+    .prepare(
+      "UPDATE acquisitions SET last_observed_at = NULL, whisparr_id = NULL, whisparr_path = NULL, whisparr_title = NULL, whisparr_monitored = NULL WHERE id = ?",
+    )
+    .run(carried.id);
+  raw.close();
+
+  storage.initializeStorage();
+  const repaired = storage.getAcquisitionByReference(MOVIE);
+  assert.ok(repaired);
+  assert.equal(repaired.state, "imported");
+  assert.equal(repaired.whisparrId, 42, "repair restores whisparrId");
+  assert.equal(
+    repaired.whisparrPath,
+    "/data/whisparr/movie.mkv",
+    "repair restores the path",
+  );
+  assert.equal(
+    repaired.whisparrTitle,
+    "Carried Movie",
+    "repair restores the title",
+  );
+  assert.equal(repaired.whisparrMonitored, true, "repair restores monitored");
+  assert.ok(repaired.lastObservedAt, "repair restores lastObservedAt");
+  assert.equal(
+    repaired.dueAt,
+    null,
+    "repair never reschedules an imported row",
+  );
+
+  // Idempotent: a second boot leaves the repaired row untouched.
+  const updatedAt = repaired.updatedAt;
+  storage.initializeStorage();
+  assert.equal(
+    storage.getAcquisitionByReference(MOVIE)?.updatedAt,
+    updatedAt,
+    "a second boot must not touch the repaired row",
+  );
+});
+
+test("boot repair only heals the current identity so a retired row never hijacks the next carry", () => {
+  freshDir();
+  storage.bootstrap(deliveryConfig(true), ownerUser(), "jf-owner-token");
+  const owner = storage.getAccount(ownerUser().id) as Account;
+
+  // In flight on the current identity: delivered, observed, monitoring.
+  const request = storage.createRequest(owner.id, MOVIE);
+  storage.decideRequest(owner, request.id, "approved");
+  const current = storage.getAcquisitionByReference(MOVIE);
+  assert.ok(current);
+  storage.recordAcquisitionObservation(current.id, {
+    state: "monitoring",
+    item: {
+      whisparrId: 7,
+      path: "/data/whisparr/new/M.mkv",
+      title: "M",
+      monitored: true,
+    },
+  });
+
+  // Retired rows only the untagged 193ea58..7a6939b builds can leave behind:
+  // identity A imported with observed facts, identity B the same import
+  // carried without its facts. Their updated_at predates the current row.
+  storage.closeStorage();
+  const raw = new DatabaseSync(join(currentDir, "velvarr.sqlite"));
+  const retired = 1_000_000_000_000;
+  const insert = raw.prepare(
+    `INSERT INTO acquisitions
+       (id, instance_id, provider, kind, external_id, state,
+        created_at, updated_at, last_observed_at,
+        whisparr_id, whisparr_path, whisparr_title, whisparr_monitored)
+     VALUES (?, ?, 'tpdb', 'movie', ?, 'imported', ?, ?, ?, ?, ?, ?, ?)`,
+  );
+  insert.run(
+    "retired-a",
+    "retired-a-instance",
+    MOVIE.id,
+    retired,
+    retired,
+    retired,
+    42,
+    "/data/whisparr/old/M.mkv",
+    "M",
+    1,
+  );
+  insert.run(
+    "retired-b",
+    "retired-b-instance",
+    MOVIE.id,
+    retired,
+    retired,
+    null,
+    null,
+    null,
+    null,
+  );
+  raw.close();
+
+  // Boot: the repair must leave retired rows alone. Unscoped, it healed B
+  // and stamped it with the boot time, so B became the
+  // latestAcquisitionForReference the next URL change carries from.
+  storage.initializeStorage();
+  storage.closeStorage();
+  const after = new DatabaseSync(join(currentDir, "velvarr.sqlite"));
+  const healed = after
+    .prepare(
+      "SELECT updated_at, whisparr_path FROM acquisitions WHERE id = 'retired-b'",
+    )
+    .get() as { updated_at: number; whisparr_path: string | null };
+  after.close();
+  assert.equal(
+    healed.updated_at,
+    retired,
+    "a retired row is never touched by boot repair",
+  );
+  assert.equal(
+    healed.whisparr_path,
+    null,
+    "a retired row gains no facts from boot repair",
+  );
+
+  // The next URL change must re-enqueue the in-flight title on the new
+  // identity, not replay identity A's stale import as a finished one.
+  const moved = deliveryConfig(true);
+  moved.whisparr = { ...moved.whisparr!, url: "http://127.0.0.1:6970" };
+  storage.saveConfig(moved);
+  const carried = storage.getAcquisitionByReference(MOVIE);
+  assert.ok(carried);
+  assert.equal(
+    carried.state,
+    "unsent",
+    "the in-flight title is re-enqueued, not carried as a stale import",
+  );
+  assert.ok(carried.dueAt, "the re-enqueued row is due");
+  assert.deepEqual(
+    storage.listDueAcquisitions(Date.now() + 60_000).map((a) => a.state),
+    ["unsent"],
+    "only the re-enqueued work is due on the new identity",
+  );
+
+  // A second boot changes nothing.
+  const updatedAt = carried.updatedAt;
+  storage.initializeStorage();
+  assert.equal(
+    storage.getAcquisitionByReference(MOVIE)?.updatedAt,
+    updatedAt,
+    "a second boot must not touch the re-enqueued row",
   );
 });
 

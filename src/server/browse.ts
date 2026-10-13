@@ -343,14 +343,14 @@ function visiblePredicate(
  * criterion — a title satisfying the term AND must carry each of these
  * tags), `anyOf` the smallest free-text expansion (any-of criterion — a
  * valid pre-filter only, sent when no singleton or anchored id exists and
- * the expansion is complete and fits the native id cap). `localFree`
- * holds the free-text terms the visible predicate must still re-check
- * locally: several terms AND together, which one upstream tag criterion
- * cannot express. */
+ * the expansion is complete and fits the native id cap). `localInclude`
+ * holds the selections the visible predicate must still re-check locally:
+ * free-text terms (several AND together, which one upstream tag
+ * criterion cannot express). Picked tags never resolve on another provider. */
 type ResolvedIncludes = {
   allOf: string[];
   anyOf: string[];
-  localFree: CatalogTagSelection[];
+  localInclude: CatalogTagSelection[];
   /** True when at least one free-text term rides the native tag criterion
    * (a singleton expansion in `allOf`, or the `anyOf` group): at the scan
    * ceiling such a stream degrades softly — its pages were productive and
@@ -377,11 +377,16 @@ async function includeIdsForSide(
     free.push(sel);
   }
   if (free.length === 0 || !expandFree) {
-    return { allOf, anyOf: [], localFree: free, freeTextNative: false };
+    return {
+      allOf,
+      anyOf: [],
+      localInclude: free,
+      freeTextNative: false,
+    };
   }
   // Every term expands before the decision: the tag listing behind
   // expandCatalogTagTerm is memoized, so reading every term costs no extra
-  // upstream traffic, and complete term indexes keep localFree aligned
+  // upstream traffic, and complete term indexes keep localInclude aligned
   // with the caller's selections. The ride-local-or-native decision
   // itself lives in resolveIncludeCriteria.
   const expansions: TagExpansion[] = [];
@@ -392,7 +397,7 @@ async function includeIdsForSide(
   return {
     allOf: criteria.allOf,
     anyOf: criteria.anyOf,
-    localFree: criteria.localTermIndexes.map((i) => free[i]!),
+    localInclude: criteria.localTermIndexes.map((i) => free[i]!),
     freeTextNative: criteria.freeTextNative,
   };
 }
@@ -1093,10 +1098,10 @@ export async function browseTitles(
       localFiltered:
         hiddenTags.some((tag) => tagAppliesToProvider(tag, "tpdb")) ||
         query.exclude.some((tag) => tagAppliesToProvider(tag, "tpdb")) ||
-        tpdbIncludes.localFree.length > 0 ||
+        tpdbIncludes.localInclude.length > 0 ||
         (filmography &&
           query.include.some((tag) => tagAppliesToProvider(tag, "tpdb"))),
-      localInclude: filmography ? query.include : tpdbIncludes.localFree,
+      localInclude: filmography ? query.include : tpdbIncludes.localInclude,
       localYear: undefined,
     });
   }
@@ -1124,9 +1129,9 @@ export async function browseTitles(
       localFiltered:
         hiddenTags.some((tag) => tagAppliesToProvider(tag, "stashdb")) ||
         query.exclude.some((tag) => tagAppliesToProvider(tag, "stashdb")) ||
-        stashIncludes.localFree.length > 0 ||
+        stashIncludes.localInclude.length > 0 ||
         query.year !== undefined,
-      localInclude: stashIncludes.localFree,
+      localInclude: stashIncludes.localInclude,
       localYear: query.year,
       performerIds:
         query.performerStarred === true ? starredPerformerIds : undefined,

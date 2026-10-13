@@ -1717,6 +1717,7 @@ test("request and body validation bounds", async () => {
     "start=-1",
     `search=${"x".repeat(201)}`,
     "start=100001",
+    "sort=bogus",
   ]) {
     const res = await call("GET", `/api/library?${query}`, { cookie: member });
     await errorShape(res);
@@ -3742,7 +3743,7 @@ interface FixtureShelf {
   }[];
   /** Per-source partial-failure evidence; coexists with items. */
   errors?: { provider: string; code: string; message: string }[];
-  error?: { code: string };
+  error?: { code: string; message: string };
 }
 
 // Facet tiles: projected to the pinned wire fields for set comparison.
@@ -3987,6 +3988,12 @@ test("discover: mixed new releases, honest trending, facets, grants, not-configu
     ITEM_MOVIE,
   ]);
   assert.equal(JSON.stringify(library).includes(ITEM_SHOW), false);
+  // The shelf's arrow lands on the library view pre-sorted by date added —
+  // the same ordering the shelf itself shows.
+  assert.deepEqual(library?.browse, {
+    view: "library",
+    params: { sort: "dateAdded" },
+  });
 
   // Requests shelf: storage role-filters; member (requester) sees own only.
   assert.ok((requests?.items?.length ?? 0) > 0);
@@ -5660,6 +5667,36 @@ test("followed rail names the provider when one performer's filmography fails", 
       (shelf.items ?? []).map((item) => refOf(item)?.id),
       [TPDB_MOVIE6],
     );
+
+    // The survivor's only title carries a hidden tag: nothing visible
+    // remains and no side rejected outright, yet the rail must still name
+    // the failing provider — never a generic internal error.
+    const hidden = await call("PATCH", "/api/me/preferences", {
+      cookie: member2,
+      body: { hiddenTags: [{ name: "Fixture Tag A", tpdb: TAG_A }] },
+    });
+    assert.equal(hidden.status, 200);
+    try {
+      resetMetaCache();
+      const hiddenPage = await call("GET", "/api/discover", {
+        cookie: member2,
+      });
+      assert.equal(hiddenPage.status, 200);
+      const hiddenShelf = (await shelvesOf(hiddenPage)).find(
+        (s) => s.id === "followed-titles",
+      );
+      assert.ok(hiddenShelf, "the error-only rail still renders");
+      assert.equal(hiddenShelf.items, undefined);
+      assert.equal(hiddenShelf.errors, undefined);
+      assert.match(hiddenShelf.error?.code ?? "", /unavailable/);
+      assert.match(hiddenShelf.error?.message ?? "", /TPDB/);
+    } finally {
+      const restored = await call("PATCH", "/api/me/preferences", {
+        cookie: member2,
+        body: { hiddenTags: [] },
+      });
+      assert.equal(restored.status, 200);
+    }
   } finally {
     tpdbFx.failPaths = [];
   }
@@ -6093,6 +6130,96 @@ test("availability: cached sweep serves repeated calls; removed title reads miss
   assert.ok(fx.sweepHits > recheckBefore, "cached miss was re-checked live");
 
   // Restore the fixture for later tests.
+  removeProbe();
+  resetSweepCache();
+});
+
+test("a Whisparr URL change keeps imported titles available", async () => {
+  resetSweepCache();
+  const probeId = "2a2b3c4d-0000-0000-0000-0000000000c4";
+  const probeItem = "4".repeat(32);
+
+  const req = await call("POST", "/api/requests", {
+    cookie: member,
+    body: { media: { provider: "tpdb", kind: "movie", id: probeId } },
+  });
+  assert.equal(req.status, 201);
+  const created = (await req.json()) as { request: { id: string } };
+  const reqId = created.request.id;
+  await call("PATCH", `/api/requests/${reqId}`, {
+    cookie: owner,
+    body: { decision: "approved" },
+  });
+  const acq = getAcquisitionByReference({
+    provider: "tpdb",
+    kind: "movie",
+    id: probeId,
+  });
+  assert.ok(acq);
+  recordAcquisitionObservation(acq.id, {
+    state: "imported",
+    item: { whisparrId: 502, path: `/data/whisparr/${probeItem}.mkv` },
+  });
+  fx.items.push({
+    Id: probeItem,
+    Name: "URL Move Probe Movie",
+    libraryId: MOVIES_LIB,
+  });
+  const removeProbe = () => {
+    const at = fx.items.findIndex((item) => item.Id === probeItem);
+    if (at !== -1) fx.items.splice(at, 1);
+  };
+
+  const before = await call("GET", `/api/availability/tpdb/movie/${probeId}`, {
+    cookie: member,
+  });
+  assert.equal((await outcomeOf(before)).outcome, "available");
+
+  // The settings card re-sends delivery and pathMappings on every save: the
+  // route preserves only what the body carries. Mirror that contract here.
+  const shape = (await (
+    await call("GET", "/api/admin/integrations", { cookie: owner })
+  ).json()) as {
+    whisparr: { delivery: unknown; pathMappings: unknown };
+  };
+  const whisparrFields = {
+    delivery: shape.whisparr.delivery,
+    pathMappings: shape.whisparr.pathMappings,
+  };
+
+  // The same-origin URL move rotates the Whisparr identity; the imported
+  // row's observed facts must ride along, or the title reads awaiting_scan.
+  const move = await call("PATCH", "/api/admin/integrations", {
+    cookie: owner,
+    body: {
+      jellyfinUrl,
+      jellyfinExternalUrl: jellyfinUrl,
+      whisparrUrl: `${whisparrUrl}/wh`,
+      ...whisparrFields,
+    },
+  });
+  assert.equal(move.status, 200);
+  resetSweepCache();
+  const after = await call("GET", `/api/availability/tpdb/movie/${probeId}`, {
+    cookie: member,
+  });
+  assert.equal(
+    (await outcomeOf(after)).outcome,
+    "available",
+    "an imported title stays available across a URL change",
+  );
+
+  // Restore the working config and the fixture for later tests.
+  const restore = await call("PATCH", "/api/admin/integrations", {
+    cookie: owner,
+    body: {
+      jellyfinUrl,
+      jellyfinExternalUrl: jellyfinUrl,
+      whisparrUrl,
+      ...whisparrFields,
+    },
+  });
+  assert.equal(restore.status, 200);
   removeProbe();
   resetSweepCache();
 });
@@ -7799,7 +7926,12 @@ test("failed sign-in attempts leave an audit line with the reported client ip", 
   }
   const line = lines.find((entry) => entry.includes("failed sign-in attempt"));
   assert.ok(line, "a credential rejection must leave an audit line");
-  assert.ok(line.includes("ip=203.0.113.7"), "first forwarded hop wins");
+  // The ip moved to the account field's encoding: JSON.stringify keeps a
+  // proxy-appended or client-forged value on one line and inside one field.
+  assert.ok(
+    line.includes(`ip=${JSON.stringify("203.0.113.7")}`),
+    "first forwarded hop wins, JSON-encoded",
+  );
   assert.ok(
     line.includes(`account=${JSON.stringify("member")}`),
     "the attempted name is logged injection-safe",
@@ -7807,5 +7939,38 @@ test("failed sign-in attempts leave an audit line with the reported client ip", 
   assert.ok(
     !line.includes("pass-guess-9"),
     "the password stays out of the log",
+  );
+});
+
+test("audit line encodes a hostile X-Forwarded-For value", async () => {
+  // CWE-117: appending proxies (nginx $proxy_add_x_forwarded_for) keep the
+  // client's value first, so a raw ip field let
+  // `X-Forwarded-For: 10.0.0.5 account="owner"` forge fields into the line.
+  // The ip is JSON-encoded exactly like the account field.
+  resetLoginBuckets();
+  const lines: string[] = [];
+  const originalWarn = console.warn;
+  console.warn = (line?: unknown) => {
+    lines.push(String(line));
+  };
+  const forwarded = '10.0.0.5 account="owner"';
+  try {
+    const res = await call("POST", "/api/login", {
+      headers: { "x-forwarded-for": forwarded },
+      body: { username: "member", password: "pass-guess-9" },
+    });
+    assert.equal(res.status, 502);
+  } finally {
+    console.warn = originalWarn;
+  }
+  const line = lines.find((entry) => entry.includes("failed sign-in attempt"));
+  assert.ok(line, "a credential rejection must leave an audit line");
+  assert.ok(
+    line.includes(`ip=${JSON.stringify(forwarded)}`),
+    "the forwarded value must be JSON-encoded on the line",
+  );
+  assert.ok(
+    !line.includes("ip=10.0.0.5 account="),
+    "a forwarded value must not add raw fields to the line",
   );
 });

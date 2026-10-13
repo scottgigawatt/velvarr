@@ -314,32 +314,42 @@ function notConfigured(provider: "tpdb" | "stashdb"): AppError {
 
 // gqlgen (stash-box) answers a failed resolver with HTTP 200, partial data
 // and a non-empty errors array: { data: { findScene: null }, errors: [...] }.
-// A null/absent dataKey beside errors is an outage, never an authoritative
-// absence — it is named here, before the body can be cached, so the next
-// read re-requests instead of replaying the error for the whole TTL. A null
-// dataKey WITHOUT errors stays the documented absence signal for find*
+// A null/missing data object — a failed non-null root field zeroes the whole
+// object (queryScenes, queryTags are non-null types) and a request-level
+// error omits it — and a null dataKey beside errors are outages, never
+// authoritative absence: named here, before the body can be cached, so the
+// next read re-requests instead of replaying the error for the whole TTL. A
+// null dataKey WITHOUT errors stays the documented absence signal for find*
 // queries. Errors beside a POPULATED dataKey are failures elsewhere in the
 // document: the requested record resolved, so the partial payload is used.
+function stashGraphQlFailureError(errors: unknown): AppError {
+  const first = Array.isArray(errors)
+    ? (errors[0] as { message?: unknown } | undefined)
+    : undefined;
+  const detail =
+    typeof first?.message === "string" && first.message !== ""
+      ? `: ${first.message}`
+      : "";
+  return new AppError(
+    502,
+    "upstream_bad_response",
+    `StashDB reported a GraphQL failure${detail}`,
+  );
+}
+
 function rejectStashGraphQlFailure(parsed: unknown, dataKey: string): void {
   if (parsed === null || typeof parsed !== "object") return;
   const body = parsed as {
     data?: Record<string, unknown> | null;
     errors?: unknown;
   };
-  if (body.data === null || body.data === undefined) return;
+  if (body.data === null || body.data === undefined) {
+    throw stashGraphQlFailureError(body.errors);
+  }
   const value = body.data[dataKey];
   if (value !== null && value !== undefined) return;
   if (Array.isArray(body.errors) && body.errors.length > 0) {
-    const first = body.errors[0] as { message?: unknown } | undefined;
-    const detail =
-      typeof first?.message === "string" && first.message !== ""
-        ? `: ${first.message}`
-        : "";
-    throw new AppError(
-      502,
-      "upstream_bad_response",
-      `StashDB reported a GraphQL failure${detail}`,
-    );
+    throw stashGraphQlFailureError(body.errors);
   }
 }
 
@@ -369,11 +379,12 @@ async function stashQuery(
     validate: (parsed) => rejectStashGraphQlFailure(parsed, dataKey),
   });
   // HTTP-level failures (401 auth, 422 schema, 5xx outage) already surfaced
-  // by the transport with upstreamStatus. A null dataKey beside GraphQL
-  // errors already surfaced as upstream_bad_response before caching; what
-  // reaches here is a clean body, partial data whose errors sit beside a
-  // populated dataKey, or a null dataKey with no errors — the documented
-  // authoritative-absence signal for find* queries.
+  // by the transport with upstreamStatus. A null/missing data object and a
+  // null dataKey beside GraphQL errors already surfaced as
+  // upstream_bad_response before caching; what reaches here is a clean body,
+  // partial data whose errors sit beside a populated dataKey, or a null
+  // dataKey with no errors — the documented authoritative-absence signal for
+  // find* queries.
   if (
     body === null ||
     typeof body !== "object" ||
@@ -1659,9 +1670,21 @@ interface TagListing {
 
 // Process-lifetime listing memo, keyed by provider: the walk is one bounded
 // burst of paged reads whose answer feeds every free-text expansion, and
-// published vocabularies change slowly. Incomplete walks memoize too —
-// retrying per request would re-pay the burst for the same capped answer.
-const tagListingMemo = new Map<CatalogProvider, TagListing>();
+// published vocabularies change slowly. Entries carry their read time and
+// are re-walked once older than the window: a tag the provider publishes,
+// renames or deletes after the first walk must reach expansions that still
+// claim complete, and a Velvarr container runs for weeks. Incomplete walks
+// memoize too, under the same window — retrying per request would re-pay
+// the burst for the same capped answer. The 10-minute page cache and
+// metaInFlight keep a re-walk cheap. ponytail: fixed one-hour window on
+// the wall clock (worst-case staleness ~70min with the page cache);
+// per-provider windows or conditional GETs only if a real vocabulary
+// churns faster.
+const TAG_LISTING_TTL_MS = 60 * 60_000;
+const tagListingMemo = new Map<
+  CatalogProvider,
+  { at: number; listing: TagListing }
+>();
 
 /** Shared StashDB tag-row parsing for the flat [Tag] {id, name} shapes
  * (searchTag, queryTags): validated, deduplicated by id. */
@@ -1686,13 +1709,16 @@ function stashTagRows(rows: unknown[]): { id: string; name: string }[] {
  * match with prefix and fuzzy distance on name/aliases, TPDB's `q` is
  * documented only as a "search query" — which guarantees neither mid-word
  * substrings nor every row below its cap. `complete` is false when the walk
- * hit its row cap; callers must then treat the rows as possibly missing
+ * hit its row cap or ended on a rows-less page the provider's own end
+ * signal contradicts; callers must then treat the rows as possibly missing
  * matches. */
 async function catalogTagListing(
   provider: CatalogProvider,
 ): Promise<TagListing> {
   const memo = tagListingMemo.get(provider);
-  if (memo !== undefined) return memo;
+  if (memo !== undefined && Date.now() - memo.at < TAG_LISTING_TTL_MS) {
+    return memo.listing;
+  }
   const rows: { id: string; name: string }[] = [];
   let complete = true;
   if (provider === "tpdb") {
@@ -1751,7 +1777,16 @@ async function catalogTagListing(
       }
       const batch = stashTagRows(res.tags);
       rows.push(...batch);
-      if (batch.length === 0 || rows.length >= count) break;
+      // A rows-less page while `count` still claims more is a walk the
+      // provider did not finish: stop and report the rows as possibly
+      // incomplete (the TPDB loop's rule for a rows-less page beside a
+      // next link). A misreported count must never read as a complete
+      // expansion.
+      if (batch.length === 0) {
+        complete = false;
+        break;
+      }
+      if (rows.length >= count) break;
       if (rows.length >= TAG_EXPANSION_MAX_ROWS) {
         complete = false;
         break;
@@ -1759,7 +1794,7 @@ async function catalogTagListing(
     }
   }
   const listing: TagListing = { rows: dedupeBy(rows, (t) => t.id), complete };
-  tagListingMemo.set(provider, listing);
+  tagListingMemo.set(provider, { at: Date.now(), listing });
   return listing;
 }
 
@@ -2058,10 +2093,17 @@ export async function studioCounterpart(
   }
 }
 
-/** A tag reference: provider plus native id, no `kind`. Tags are labels, not
- * entities — CatalogKind is for entities, and widening it would claim a
- * cross-provider identity a label does not have. */
-export type TagReference = { provider: CatalogProvider; id: string };
+/** A tag reference: provider, no `kind`. Tags are labels, not entities —
+ * CatalogKind is for entities, and widening it would claim a cross-provider
+ * identity a label does not have. `native: true` carries the UUID id that
+ * can ride a native tag filter; `native: false` marks a uuid-less
+ * exact-label match (TPDB sometimes emits numeric-string tag ids): the tag
+ * exists there and matches titles by label, but its id can never ride a
+ * native criterion — cleanTagIds would 400 the query — so no id is
+ * reported. */
+export type TagReference =
+  | { provider: CatalogProvider; id: string; native: true }
+  | { provider: CatalogProvider; native: false };
 
 /** The other provider's tag with an exactly-equal normalized name. Exact
  * name equality (after normalizeFacetName) is honest for tags because a tag
@@ -2069,9 +2111,12 @@ export type TagReference = { provider: CatalogProvider; id: string };
  * one documented deterministic pairing that needs no published URL. It is
  * deliberately NOT used for studios or performers: those are entities whose
  * identity comes only from provider-published URLs, and equal names there
- * would be a guess. A successful search with no exact normalized match →
- * undefined; an upstream failure throws so callers record the outage
- * instead of reading it as absence. */
+ * would be a guess. A UUID row is preferred as the native counterpart; when
+ * only a uuid-less row matches (TPDB numeric-string ids), the reference
+ * reports `native: false` — the label exists on the other provider, but its
+ * id can never ride a native tag filter. No exact-label match at all →
+ * undefined: the one honest absence. An upstream failure throws so callers
+ * record the outage instead of reading it as absence. */
 export async function tagCounterpart(
   from: CatalogProvider,
   name: string,
@@ -2081,14 +2126,16 @@ export async function tagCounterpart(
   if (target === "") return undefined; // an empty label identifies nothing
   const other: CatalogProvider = from === "tpdb" ? "stashdb" : "tpdb";
   const rows = await searchCatalogTags(other, name);
-  // A uuid-less label match (TPDB sometimes emits numeric-string tag ids)
-  // is unresolvable: the id can never ride a native tag filter, and
-  // cleanTagIds would 400 the whole query. Callers treat undefined as an
-  // unresolvable anchored tag and disqualify the side.
-  const row = rows.find(
+  const nativeRow = rows.find(
     (r) => normalizeFacetName(r.name) === target && isUuid(r.id),
   );
-  return row === undefined ? undefined : { provider: other, id: row.id };
+  if (nativeRow !== undefined) {
+    return { provider: other, id: nativeRow.id, native: true };
+  }
+  const labelRow = rows.find((r) => normalizeFacetName(r.name) === target);
+  return labelRow === undefined
+    ? undefined
+    : { provider: other, native: false };
 }
 
 /** Tag-label normalization lives in lib/contracts.ts (shared with storage

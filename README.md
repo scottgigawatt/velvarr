@@ -45,6 +45,8 @@ To upgrade, bump the image tag in `compose.yaml`, then `docker compose pull && d
 
 Container images are published after CI checks pass. Stable releases provide exact tags such as `v0.37.0` and `0.37.0`, a minor alias such as `0.37`, and `latest`. Releases from version 1 onward also provide a major alias such as `1`. For development builds, use `ghcr.io/skare69/velvarr:edge`, which follows `main`. Prereleases provide exact version tags without updating stable aliases. Every published build also has a `sha-<commit>` tag.
 
+The container health check reads `/api/status`. The container becomes `unhealthy` when Velvarr cannot open its data directory (`/data`); run `docker compose logs velvarr` to see the cause. A new instance that waits for owner setup stays healthy.
+
 **From source** (Node 24.21+, Bun 1.3.14+):
 
 ```sh
@@ -132,6 +134,8 @@ Opening a Jellyfin library item resolves its identity against Whisparr's complet
 If the collection still exceeds the allowance, measure its decoded size and set `VELVARR_WHISPARR_LIBRARY_LIMIT_MIB` above that measurement, with headroom, up to 256 MiB. This is a response-size ceiling, not a container memory limit; parsing large JSON also consumes memory. Authentication checks, redirect restrictions, and the existing request timeout remain in place.
 
 Pass the setting into the container's runtime environment and recreate the container after changing it. Compose `.env` files only supply interpolation values unless the chart also forwards the variable under `environment` or uses `env_file`. For the upstream chart's `.env.local`, add the setting there. No library titles, paths, API keys, or complete JSON responses are needed to diagnose the size limit.
+
+Each failed sign-in writes one warning line to the server log: `[auth] failed sign-in attempt: account="<name>" ip="<address>"`. The password is never logged. The address is the first `X-Forwarded-For` entry, or `unknown` when no proxy sends the header. A client can set this header, so trust the address only when your proxy replaces `X-Forwarded-For` instead of appending to it.
 
 ## Backup and recovery
 
