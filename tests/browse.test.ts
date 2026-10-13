@@ -598,130 +598,96 @@ test("browse All merges movies and scenes by release recency with native AND inc
   );
 });
 
-// --- missing counterpart disqualifies the source; never unfiltered ---
+// --- picked includes constrain only their own provider ---
 
-test("an include without a resolvable StashDB id drops the scene source instead of running it unfiltered", async () => {
-  const TPDB_TAG = { id: 11, uuid: uuid(101), name: "Unpaired" };
-  const sceneCalls: number[] = [];
-  await runBrowse(
-    scriptedUpstream({
-      tagRows: [TPDB_TAG],
-      moviePages: [
-        {
-          rows: [tpdbRow(uuid(1), "Only Movie", "2024-01-01", [TPDB_TAG])],
-          next: null,
-          total: 1,
+for (const searchTagStatus of [200, 500]) {
+  test(`a TPDB include leaves scenes unconstrained without a counterpart lookup (${searchTagStatus})`, async () => {
+    const tag = { id: 11, uuid: uuid(101), name: "Selected" };
+    const sceneInputs: Record<string, unknown>[] = [];
+    await runBrowse(
+      scriptedUpstream({
+        tagRows: [tag],
+        stashTagRows: [{ id: uuid(201), name: "Selected" }],
+        searchTagStatus,
+        moviePages: [
+          {
+            rows: [tpdbRow(uuid(1), "Matched movie", "2024-01-01", [tag])],
+            next: null,
+            total: 1,
+          },
+        ],
+        scenes: {
+          count: 1,
+          rows: [stashRow(uuid(3), "Unrelated scene", "2024-06-01")],
         },
-      ],
-      scenes: {
-        count: 5,
-        rows: [stashRow(uuid(3), "Unfiltered?", "2024-06-01")],
-      },
-      onScenesRequest: () => sceneCalls.push(1),
-    }),
-    async () => {
-      const page = await browseTitles(
-        {
-          type: "all",
-          include: [{ name: "Unpaired", tpdb: TPDB_TAG.uuid }],
-          exclude: [],
-          studioMode: "exact",
-          page: 1,
-          perPage: 10,
-        },
-        [],
-      );
-      // searchTag ran (counterpart lookup) but queryScenes never did.
-      assert.equal(sceneCalls.length, 0);
-      assert.deepEqual(
-        page.items.map((d) => d.reference.provider),
-        ["tpdb"],
-      );
-      assert.equal(page.totalCountKnown, true);
-    },
-  );
-});
-
-// --- a broken counterpart lookup is an outage, never absence ---
-
-test("a failed StashDB tag search keeps the movie page but names the outage instead of an exact TPDB-only total", async () => {
-  const TPDB_TAG = { id: 11, uuid: uuid(101), name: "Unpaired" };
-  const sceneCalls: number[] = [];
-  await runBrowse(
-    scriptedUpstream({
-      tagRows: [TPDB_TAG],
-      moviePages: [
-        {
-          rows: [tpdbRow(uuid(1), "Only Movie", "2024-01-01", [TPDB_TAG])],
-          next: null,
-          total: 1,
-        },
-      ],
-      scenes: {
-        count: 5,
-        rows: [stashRow(uuid(3), "Unqueried", "2024-06-01")],
-      },
-      searchTagStatus: 500,
-      onScenesRequest: () => sceneCalls.push(1),
-    }),
-    async () => {
-      const page = await browseTitles(
-        {
-          type: "all",
-          include: [{ name: "Unpaired", tpdb: TPDB_TAG.uuid }],
-          exclude: [],
-          studioMode: "exact",
-          page: 1,
-          perPage: 10,
-        },
-        [],
-      );
-      // The scene side is dropped (never run unfiltered) and its outage is
-      // named beside the movie results that did survive.
-      assert.equal(sceneCalls.length, 0);
-      assert.deepEqual(
-        page.items.map((d) => d.reference.provider),
-        ["tpdb"],
-      );
-      assert.equal(page.errors.length, 1);
-      assert.equal(page.errors[0]!.provider, "stashdb");
-      assert.equal(page.errors[0]!.code, "upstream_unavailable");
-      // A wanted side is dark: the surviving side's count is not the
-      // catalog total, so it must not read as exact.
-      assert.equal(page.totalCountKnown, false);
-    },
-  );
-});
-
-test("when every wanted side's include lookup fails, browse is a 502 instead of an exact empty catalog", async () => {
-  await runBrowse(
-    scriptedUpstream({
-      tagRows: [],
-      tpdbTagsStatus: 500,
-      searchTagStatus: 500,
-      moviePages: [{ rows: [], next: null, total: 0 }],
-      scenes: { count: 0, rows: [] },
-    }),
-    async () => {
-      // Each selection anchors only the other side, so both sides need a
-      // counterpart lookup and both lookups are down.
-      await assert.rejects(
-        browseTitles(
+        onScenesRequest: (input) => sceneInputs.push(input),
+      }),
+      async () => {
+        const page = await browseTitles(
           {
             type: "all",
-            include: [
-              { name: "Only Stash", stashdb: uuid(201) },
-              { name: "Only Tpdb", tpdb: uuid(101) },
-            ],
+            include: [{ name: "Selected", tpdb: tag.uuid }],
             exclude: [],
             studioMode: "exact",
             page: 1,
             perPage: 10,
           },
           [],
-        ),
-        appError(502, "provider_unavailable"),
+        );
+        assert.deepEqual(
+          page.items.map((item) => item.reference.provider),
+          ["stashdb", "tpdb"],
+        );
+        assert.equal(sceneInputs.length, 1);
+        assert.equal(sceneInputs[0]!.tags, undefined);
+        assert.equal(page.total, 2);
+        assert.equal(page.totalCountKnown, true);
+        assert.deepEqual(page.errors, []);
+      },
+    );
+  });
+}
+
+test("a TMDB include leaves both TPDB and StashDB streams unconstrained", async () => {
+  const movieQueries: string[] = [];
+  const sceneInputs: Record<string, unknown>[] = [];
+  await runBrowse(
+    scriptedUpstream({
+      tagRows: [],
+      tpdbTagsStatus: 500,
+      searchTagStatus: 500,
+      moviePages: [
+        {
+          rows: [tpdbRow(uuid(1), "Unrelated movie", "2024-01-01")],
+          next: null,
+          total: 1,
+        },
+      ],
+      scenes: {
+        count: 1,
+        rows: [stashRow(uuid(3), "Unrelated scene", "2024-06-01")],
+      },
+      onMovieRequest: (_page, qs) => movieQueries.push(qs.toString()),
+      onScenesRequest: (input) => sceneInputs.push(input),
+    }),
+    async () => {
+      const page = await browseTitles(
+        {
+          type: "all",
+          include: [{ name: "Selected", tmdb: "44" }],
+          exclude: [],
+          studioMode: "exact",
+          page: 1,
+          perPage: 10,
+        },
+        [],
       );
+      assert.equal(page.items.length, 2);
+      assert.equal(movieQueries.length, 1);
+      assert.ok(!movieQueries[0]!.includes("tags"));
+      assert.equal(sceneInputs[0]!.tags, undefined);
+      assert.deepEqual(page.errors, []);
+      assert.equal(page.totalCountKnown, true);
     },
   );
 });
@@ -1557,7 +1523,7 @@ test("a free-text term matching only uuid-less TPDB tags runs the movie side loc
   );
 });
 
-test("an anchored include whose TPDB counterpart is uuid-less drops the movie side instead of 400ing", async () => {
+test("a StashDB include leaves TPDB movies unconstrained even when a same-named tag exists", async () => {
   const LEGACY_NUM = { id: 305, name: "Legacy" }; // uuid-less TPDB row
   const STASH_TAG = uuid(201);
   let moviesCalled = 0;
@@ -1596,16 +1562,13 @@ test("an anchored include whose TPDB counterpart is uuid-less drops the movie si
         },
         [],
       );
-      // The anchored StashDB id cannot pair with a TPDB tag: the label
-      // match is uuid-less, which counts as unresolvable, so the movie side
-      // is dropped — never run unfiltered, never 400ed. The scene side
-      // carries its own anchored id natively.
-      assert.equal(moviesCalled, 0);
+      // No tag lookup or translation is required on the other provider.
+      assert.equal(moviesCalled, 1);
       assert.deepEqual(
         page.items.map((d) => d.reference.provider),
-        ["stashdb"],
+        ["stashdb", "tpdb"],
       );
-      assert.equal(page.total, 1);
+      assert.equal(page.total, 2);
       assert.equal(page.totalCountKnown, true);
     },
   );
@@ -2774,7 +2737,7 @@ test("searchVisibleCatalog keeps paging when the exhausted stream leaves a visib
 
 // --- searchBrowseTags ---
 
-test("searchBrowseTags merges same labels across providers and reports outages", async () => {
+test("searchBrowseTags keeps same-named provider selections separate and reports outages", async () => {
   const SHARED_T = uuid(302);
   const SHARED_S = uuid(303);
   const handler: FixtureHandler = (req, res, body) => {
@@ -2823,12 +2786,12 @@ test("searchBrowseTags merges same labels across providers and reports outages",
       ["anal", "stash only"],
     );
 
-    // Both sources healthy: the same label under different casing merges
-    // into ONE selection carrying both native ids.
+    // Same labels stay independently selectable with their own provider IDs.
     const merged = await searchBrowseTags("shared");
     assert.deepEqual(merged.errors, []);
     assert.deepEqual(merged.tags, [
-      { name: "shared", tpdb: SHARED_T, stashdb: SHARED_S },
+      { name: "shared", tpdb: SHARED_T },
+      { name: "Shared", stashdb: SHARED_S },
     ]);
   });
 });

@@ -208,6 +208,7 @@ export function PreferencesView() {
         <TagPicker
           id="pref-hidden-tags"
           label="Hidden tags"
+          description="Picked tags hide results only from their provider. Free-text terms apply across providers."
           selected={draft.hiddenTags}
           onChange={(hiddenTags) =>
             setDraft((d) => (d === null ? d : { ...d, hiddenTags }))
@@ -229,7 +230,7 @@ export function PreferencesView() {
             onChange={(includeTags) =>
               setDraft((value) => (value ? { ...value, includeTags } : value))
             }
-            description="Titles must match every preferred tag. Provider tags keep their own IDs; typed terms match tag names."
+            description="Titles must match every preferred tag from their provider. Picked tags apply only to that provider; free-text terms apply across providers."
           />
           <label className="switch-label">
             <input

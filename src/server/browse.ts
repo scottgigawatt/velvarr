@@ -33,7 +33,6 @@ import {
   listCatalogTags,
   searchCatalog,
   searchCatalogTags,
-  tagCounterpart,
   expandCatalogTagTerm,
 } from "./providers.ts";
 import {
@@ -56,6 +55,8 @@ import {
   CATALOG_YEAR_MAX,
   CATALOG_YEAR_MIN,
   normalizeFacetName,
+  tagAppliesToProvider,
+  tagSelectionKey,
   isCatalogId,
 } from "../lib/contracts.ts";
 import { BROWSE_MIXED_SORTS, SORT_KEYS, sortSpec } from "../lib/sorts.ts";
@@ -302,7 +303,11 @@ export function parseBrowseQuery(params: URLSearchParams): BrowseQuery {
  * resolution and the visible predicate must agree on it, or a free-text
  * include 400s or disqualifies a side again. */
 function isFreeTextSelection(sel: CatalogTagSelection): boolean {
-  return sel.tpdb === undefined && sel.stashdb === undefined;
+  return (
+    sel.tpdb === undefined &&
+    sel.stashdb === undefined &&
+    sel.tmdb === undefined
+  );
 }
 
 function visiblePredicate(
@@ -318,9 +323,11 @@ function visiblePredicate(
     if (exclude.some((sel) => tagMatches(d, sel, "family"))) return false;
     if (
       include.length > 0 &&
-      !include.every((sel) =>
-        tagMatches(d, sel, isFreeTextSelection(sel) ? "substring" : "exact"),
-      )
+      !include
+        .filter((sel) => tagAppliesToProvider(sel, d.reference.provider))
+        .every((sel) =>
+          tagMatches(d, sel, isFreeTextSelection(sel) ? "substring" : "exact"),
+        )
     ) {
       return false;
     }
@@ -351,26 +358,8 @@ type ResolvedIncludes = {
   freeTextNative: boolean;
 };
 
-/** Resolves the native include criteria for one provider side. Anchored
- * selections resolve as before: a selection already carrying the side's
- * UUID uses it; otherwise the counterpart id is resolved through the
- * providers' own published label pairing, and an unresolvable anchored tag
- * — including a uuid-less match (TPDB numeric-string id) — disqualifies the
- * whole side (undefined) — it is NEVER allowed to run unfiltered.
- * Free-text includes expand on THIS side's complete published tag listing
- * (expandCatalogTagTerm), anchored ids or not. Every term's expansion must
- * be complete and native — no capped walk, no uuid-less rows — before
- * anything free travels: a partial criterion would silently drop titles,
- * and an empty expansion is never proof the side is empty, so the side is
- * never skipped for one; anything incomplete keeps the WHOLE free group on
- * the local substring re-check with the side's approximate totals. Of a
- * complete group set, the most selective valid pre-filter travels: every
- * singleton group joins the anchored ids in the all-of criterion (an AND
- * match must carry each of those tags), and with no singleton and no
- * anchored id the smallest group rides alone as any-of while the other
- * terms keep filtering locally. A lookup that fails
- * throws; browseTitles records the side as a failed source instead of
- * reading the outage as absence. */
+/** Resolve native IDs only on the provider they were selected from.
+ * Label-only terms expand against this provider's own published tags. */
 async function includeIdsForSide(
   selections: CatalogTagSelection[],
   side: "tpdb" | "stashdb",
@@ -384,17 +373,7 @@ async function includeIdsForSide(
       if (!allOf.includes(direct)) allOf.push(direct);
       continue;
     }
-    if (!isFreeTextSelection(sel)) {
-      // tagCounterpart searches the OTHER provider by exact normalized
-      // label.
-      const counterpart = await tagCounterpart(
-        side === "tpdb" ? "stashdb" : "tpdb",
-        sel.name,
-      );
-      if (counterpart === undefined) return undefined;
-      if (!allOf.includes(counterpart.id)) allOf.push(counterpart.id);
-      continue;
-    }
+    if (!isFreeTextSelection(sel)) continue;
     free.push(sel);
   }
   if (free.length === 0 || !expandFree) {
@@ -1112,10 +1091,11 @@ export async function browseTitles(
       freeTextNative: tpdbIncludes.freeTextNative,
       excludeIds: [], // TPDB has no native exclude criterion
       localFiltered:
-        hiddenTags.length > 0 ||
-        query.exclude.length > 0 ||
+        hiddenTags.some((tag) => tagAppliesToProvider(tag, "tpdb")) ||
+        query.exclude.some((tag) => tagAppliesToProvider(tag, "tpdb")) ||
         tpdbIncludes.localFree.length > 0 ||
-        (filmography && query.include.length > 0),
+        (filmography &&
+          query.include.some((tag) => tagAppliesToProvider(tag, "tpdb"))),
       localInclude: filmography ? query.include : tpdbIncludes.localFree,
       localYear: undefined,
     });
@@ -1142,8 +1122,8 @@ export async function browseTitles(
             // Keep excess and label-family exclusions in the local predicate.
             .slice(0, TAG_FILTER_ID_CAP),
       localFiltered:
-        hiddenTags.length > 0 ||
-        query.exclude.length > 0 ||
+        hiddenTags.some((tag) => tagAppliesToProvider(tag, "stashdb")) ||
+        query.exclude.some((tag) => tagAppliesToProvider(tag, "stashdb")) ||
         stashIncludes.localFree.length > 0 ||
         query.year !== undefined,
       localInclude: stashIncludes.localFree,
@@ -1246,6 +1226,9 @@ export async function searchVisibleCatalog(
   hiddenTags: CatalogTagSelection[],
   scanBudget?: CatalogScanBudget,
 ): Promise<CatalogSearchPage> {
+  hiddenTags = hiddenTags.filter((tag) =>
+    tagAppliesToProvider(tag, query.provider),
+  );
   // TMDB already filters keywords/adult/date while scanning native pages.
   // A second visible-page fill loop could multiply the scan budget.
   if (query.provider === "tmdb")
@@ -1299,8 +1282,8 @@ export async function searchVisibleCatalog(
 
 // --- unified tag picker search ---
 
-/** Both providers searched in parallel; selections group by the existing
- * exact normalized label rule, carrying each provider's native id. Missing
+/** Both providers searched in parallel; selections retain
+ * their provider identity even when labels are identical. Missing
  * sources and partial failures come back as errors — never silently dropped.
  * When no provider matches and a TypeSafe key exists, the existing judged
  * suggestion path proposes real provider tags (never invented ones). */
@@ -1324,7 +1307,7 @@ export async function searchBrowseTags(
   );
   const errors: SourceError[] = [];
   const tags: CatalogTagSelection[] = [];
-  const byLabel = new Map<string, CatalogTagSelection>();
+  const seen = new Set<string>();
   for (let i = 0; i < settled.length; i++) {
     const result = settled[i]!;
     const provider = providers[i]!;
@@ -1339,20 +1322,14 @@ export async function searchBrowseTags(
       if (provider === "tpdb" && !isUuid(row.id)) continue;
       const label = normalizeFacetName(row.name);
       if (label === "") continue;
-      const existing = byLabel.get(label);
-      if (existing === undefined) {
-        const selection: CatalogTagSelection = { name: row.name };
-        if (provider === "tpdb") selection.tpdb = row.id;
-        else if (provider === "tmdb") selection.tmdb = row.id;
-        else selection.stashdb = row.id;
-        byLabel.set(label, selection);
+      const selection: CatalogTagSelection = {
+        name: row.name,
+        [provider]: row.id,
+      };
+      const key = tagSelectionKey(selection);
+      if (!seen.has(key)) {
+        seen.add(key);
         tags.push(selection);
-      } else if (provider === "tpdb" && existing.tpdb === undefined) {
-        existing.tpdb = row.id;
-      } else if (provider === "tmdb" && existing.tmdb === undefined) {
-        existing.tmdb = row.id;
-      } else if (provider === "stashdb" && existing.stashdb === undefined) {
-        existing.stashdb = row.id;
       }
     }
   }
@@ -1390,11 +1367,7 @@ export async function searchBrowseTags(
           if (candidate.provider === "tpdb") selection.tpdb = candidate.id;
           else selection.stashdb = candidate.id;
           if (
-            !tags.some(
-              (t) =>
-                normalizeFacetName(t.name) ===
-                normalizeFacetName(candidate.name),
-            )
+            !tags.some((t) => tagSelectionKey(t) === tagSelectionKey(selection))
           ) {
             tags.push(selection);
           }

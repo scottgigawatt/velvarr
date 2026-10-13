@@ -5,7 +5,7 @@ import type {
   CatalogReference,
   CatalogTagSelection,
 } from "../lib/contracts.ts";
-import { isCatalogId } from "../lib/contracts.ts";
+import { isCatalogId, tagAppliesToProvider } from "../lib/contracts.ts";
 import type { CatalogSearchPage } from "./providers.ts";
 import { AppError } from "./http.ts";
 import { tagMatches } from "./catalog-visibility.ts";
@@ -197,8 +197,12 @@ export async function searchTmdb(
     if (query.cast) params.set("with_cast", query.cast);
     if (query.company) params.set("with_companies", query.company);
   }
-  const includes = query.includeTags ?? [];
-  const excludes = query.excludeTags ?? [];
+  const includes = (query.includeTags ?? []).filter((tag) =>
+    tagAppliesToProvider(tag, "tmdb"),
+  );
+  const excludes = (query.excludeTags ?? []).filter((tag) =>
+    tagAppliesToProvider(tag, "tmdb"),
+  );
   const filtered = Boolean(
     includes.length ||
     excludes.length ||

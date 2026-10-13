@@ -13,7 +13,10 @@ import type {
   ShelfItems,
   SourceError,
 } from "../../../../lib/contracts.ts";
-import { normalizeFacetName } from "../../../../lib/contracts.ts";
+import {
+  normalizeFacetName,
+  tagAppliesToProvider,
+} from "../../../../lib/contracts.ts";
 import {
   getContentPreferences,
   listFollowsByProvider,
@@ -140,13 +143,17 @@ export async function followedShelf(
         ...side.value.items.filter(
           (item) =>
             !isHiddenTitle(item, hiddenTags) &&
-            includeTags.every((tag) =>
-              tagMatches(
-                item,
-                tag,
-                tag.tpdb || tag.stashdb || tag.tmdb ? "exact" : "substring",
+            includeTags
+              .filter((tag) =>
+                tagAppliesToProvider(tag, item.reference.provider),
+              )
+              .every((tag) =>
+                tagMatches(
+                  item,
+                  tag,
+                  tag.tpdb || tag.stashdb || tag.tmdb ? "exact" : "substring",
+                ),
               ),
-            ),
         ),
       );
       // A partial side keeps its survivors and still names the provider.

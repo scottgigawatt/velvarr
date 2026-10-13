@@ -6672,7 +6672,7 @@ test("content preferences are session-only, self-owned, and atomic on malformed 
     {
       hiddenTags: Array.from({ length: 26 }, (_, i) => ({
         name: `Tag ${i}`,
-        tpdb: TAG_A,
+        tpdb: `00000000-0000-4000-8000-${String(i).padStart(12, "0")}`,
       })),
     },
     { hiddenTags: [], extra: true },
@@ -6692,7 +6692,7 @@ test("content preferences are session-only, self-owned, and atomic on malformed 
     discoverOrder: DEFAULT_ORDER,
   });
 
-  // Both provider references on one tag is the normal cross-provider pick.
+  // Existing selections carrying both native references keep both explicit scopes.
   const both = await call("PATCH", "/api/me/preferences", {
     cookie: member,
     body: {

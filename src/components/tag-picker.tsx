@@ -12,6 +12,7 @@
 import { useEffect, useRef, useState, type KeyboardEvent } from "react";
 import {
   normalizeFacetName,
+  tagSelectionKey,
   type BrowseTagsResponse,
   type CatalogTagSelection,
 } from "../lib/contracts.ts";
@@ -116,11 +117,9 @@ export function TagPicker({
     [committed, effectiveProvider],
   );
 
-  const picked = new Set(selected.map((s) => normalizeFacetName(s.name)));
+  const picked = new Set(selected.map(tagSelectionKey));
   const take = (rows: CatalogTagSelection[] | undefined) =>
-    (rows ?? []).filter(
-      (r) => realTag(r) && !picked.has(normalizeFacetName(r.name)),
-    );
+    (rows ?? []).filter((r) => realTag(r) && !picked.has(tagSelectionKey(r)));
   // A failed search hides the previous list; a partial source failure keeps
   // the returned tags and says so below.
   const current = committed === t && !loading;
@@ -138,7 +137,7 @@ export function TagPicker({
     t.length >= 2 &&
     t.length <= 120 &&
     normalizeFacetName(t) !== "" &&
-    !picked.has(normalizeFacetName(t))
+    !picked.has(tagSelectionKey({ name: t }))
       ? { name: t }
       : null;
   // Exact real-tag matches go above the pinned free-text row: the default
@@ -162,7 +161,7 @@ export function TagPicker({
   const showList = open && choices.length > 0;
 
   function pick(tag: CatalogTagSelection) {
-    if (disabled || capped || picked.has(normalizeFacetName(tag.name))) return;
+    if (disabled || capped || picked.has(tagSelectionKey(tag))) return;
     onChange([...selected, tag]);
     setTerm("");
     setOpen(false);
@@ -284,14 +283,7 @@ export function TagPicker({
                 // loaded tag; the label-only row needs its own key.
                 const free = isFreeText(tag);
                 return (
-                  <li
-                    key={
-                      free
-                        ? `free:${normalizeFacetName(tag.name)}`
-                        : normalizeFacetName(tag.name)
-                    }
-                    role="presentation"
-                  >
+                  <li key={tagSelectionKey(tag)} role="presentation">
                     <button
                       type="button"
                       role="option"
@@ -336,7 +328,7 @@ export function TagPicker({
           aria-label={`Selected ${label}`}
         >
           {selected.map((tag, i) => (
-            <li key={normalizeFacetName(tag.name)}>
+            <li key={tagSelectionKey(tag)}>
               <button
                 type="button"
                 className="chip"
@@ -349,7 +341,11 @@ export function TagPicker({
                 {isFreeText(tag) && (
                   <span className="text-muted">Free text:</span>
                 )}
-                {tag.name} <span aria-hidden="true">×</span>
+                {tag.name}{" "}
+                {!isFreeText(tag) && (
+                  <span className="text-muted">({sources(tag)})</span>
+                )}{" "}
+                <span aria-hidden="true">×</span>
               </button>
             </li>
           ))}

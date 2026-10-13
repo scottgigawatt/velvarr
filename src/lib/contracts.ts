@@ -73,10 +73,9 @@ export function mergeTagCounts(
 /** Where a performer-page tag chip's browse jump must land. With a linked
  * performer on the other provider, the jump is a union: both of her ids
  * ride (primary `id` plus `counterpart`) and browse lands on All — her TPDB
- * movies plus her StashDB scenes in one page. No side can lie: a side whose
- * include tag cannot resolve itself self-disqualifies server-side
- * (`includeIdsForSide` resolves labels via `tagCounterpart`, exact
- * normalized name). Without a linked counterpart the old single-side rules
+ * movies plus her StashDB scenes in one page. Tags filter only the providers
+ * whose IDs they carry; the other side stays unconstrained by that tag.
+ * Without a linked counterpart the old single-side rules
  * stand: an own-side tag keeps the page performer; an other-side tag would
  * land on a provably empty page (a TPDB performer query never runs the
  * scene side), so it travels as a bare tag filter. */
@@ -262,8 +261,8 @@ export type PerformerFollow = {
   linked: CatalogReference | null;
 };
 
-/** One provider tag a user picked by its real published label. Ids are the
- * provider's own UUIDs; at least one must be present. */
+/** A picked tag carries its provider-native IDs; a label-only selection is
+ * an explicit free-text filter across providers. */
 export type CatalogTagSelection = {
   name: string;
   tpdb?: string;
@@ -271,6 +270,29 @@ export type CatalogTagSelection = {
   /** TMDB keyword IDs remain scoped to TMDB. */
   tmdb?: string;
 };
+
+/** Picked tags apply only to providers whose native IDs they carry.
+ * Explicit label-only terms remain filters across all providers. */
+export function tagAppliesToProvider(
+  tag: CatalogTagSelection,
+  provider: CatalogProvider,
+): boolean {
+  return (
+    tag[provider] !== undefined ||
+    (tag.tmdb === undefined &&
+      tag.tpdb === undefined &&
+      tag.stashdb === undefined)
+  );
+}
+
+/** Native provider identity keeps same-named tags independently selectable.
+ * Label-only terms deduplicate by their normalized text instead. */
+export function tagSelectionKey(tag: CatalogTagSelection): string {
+  const ids = (["tmdb", "tpdb", "stashdb"] as const).flatMap((provider) =>
+    tag[provider] === undefined ? [] : [`${provider}:${tag[provider]}`],
+  );
+  return ids.length ? ids.join("|") : `text:${normalizeFacetName(tag.name)}`;
+}
 
 /** The Discover carousels in their default display order. Shared vocabulary:
  * the server orders present shelves by the saved per-account order, the UI

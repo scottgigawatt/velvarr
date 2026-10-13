@@ -6,7 +6,7 @@ import type { CatalogProvider, SourceError } from "./contracts.ts";
  * any-of) and which terms stay on the local substring re-check, when a
  * locally split free-text AND degrades softly at the scan ceiling instead of
  * 422ing, and the native tag criterion's own id cap. No IO — the callers
- * keep the tag searches and counterpart lookups. */
+ * keep the provider-scoped tag searches. */
 
 /** The native tag criterion caps at this many ids and silently ignores the
  * tail past it, so callers must never send more (browse re-routes oversized

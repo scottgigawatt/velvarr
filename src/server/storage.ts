@@ -42,7 +42,11 @@ import {
   defaultPersonalSettings,
   parsePersonalSettings,
 } from "../lib/personalization.ts";
-import { DISCOVER_SHELVES, normalizeFacetName } from "../lib/contracts.ts";
+import {
+  DISCOVER_SHELVES,
+  normalizeFacetName,
+  tagSelectionKey,
+} from "../lib/contracts.ts";
 
 // Schema identity: application_id spells 'VLVR', user_version is the schema version.
 const APP_ID = 0x564c5652;
@@ -2065,30 +2069,16 @@ function validTagSelection(s: unknown): s is CatalogTagSelection {
   );
 }
 
-/** One selection per exact folded label, sharing the catalog's tag identity
- * rule. First published spelling wins; both provider ids survive. */
+/** Deduplicate native selections without merging unrelated same-named tags. */
 function consolidateTagSelections(
   items: CatalogTagSelection[],
 ): CatalogTagSelection[] {
-  const byLabel = new Map<string, CatalogTagSelection>();
-  for (const s of items) {
-    const key = normalizeFacetName(s.name) || s.name.trim().toLowerCase();
-    const prior = byLabel.get(key);
-    byLabel.set(
-      key,
-      prior
-        ? {
-            name: prior.name,
-            tpdb: prior.tpdb ?? s.tpdb,
-            stashdb: prior.stashdb ?? s.stashdb,
-            ...((prior.tmdb ?? s.tmdb) !== undefined
-              ? { tmdb: prior.tmdb ?? s.tmdb }
-              : {}),
-          }
-        : s,
-    );
+  const byIdentity = new Map<string, CatalogTagSelection>();
+  for (const selection of items) {
+    const key = tagSelectionKey(selection);
+    if (!byIdentity.has(key)) byIdentity.set(key, selection);
   }
-  return [...byLabel.values()];
+  return [...byIdentity.values()];
 }
 
 /** Shared trust boundary for picker-supplied tag lists: the browse API's
@@ -2096,7 +2086,7 @@ function consolidateTagSelections(
  * no database access, safe before storage is initialized. Any wrong type,
  * unknown field, or a label-only selection whose label normalizes to
  * nothing (it can never match a tag) is invalid_preferences; valid
- * duplicates consolidate and the consolidated list is capped at 25. */
+ * duplicates consolidate by provider identity and the list is capped at 25. */
 export function parseTagSelections(input: unknown): CatalogTagSelection[] {
   if (!Array.isArray(input)) {
     throw new AppError(
@@ -2128,7 +2118,7 @@ export function parseTagSelections(input: unknown): CatalogTagSelection[] {
           : "each tag selection needs a label of 1..120 characters",
       );
     }
-    // Plain copies: only name/tpdb/stashdb survive the boundary.
+    // Plain copies retain only the label and its explicit provider IDs.
     items.push({
       name: raw.name.trim(),
       ...(raw.tmdb !== undefined ? { tmdb: raw.tmdb } : {}),

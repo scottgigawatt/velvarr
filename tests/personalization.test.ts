@@ -754,3 +754,164 @@ test("Discover applies its small budget to every provider row and retains honest
     },
   );
 });
+
+test("foreign picked tags do not trigger TMDB keyword reads or change its native totals", async () => {
+  const paths: string[] = [];
+  const read = async <T>(path: string): Promise<T> => {
+    paths.push(path);
+    return (
+      path.startsWith("/3/genre/movie/list")
+        ? { genres: [] }
+        : {
+            page: 1,
+            total_pages: 1,
+            total_results: 1,
+            results: [{ id: 1, title: "Unrelated TMDB movie" }],
+          }
+    ) as T;
+  };
+  const foreign = [
+    { name: "Missing", tpdb: "00000000-0000-4000-8000-000000000001" },
+    { name: "Missing", stashdb: "00000000-0000-4000-8000-000000000002" },
+  ];
+  const page = await searchTmdb(read, {
+    provider: "tmdb",
+    kind: "movie",
+    includeTags: foreign,
+    excludeTags: foreign,
+  });
+  assert.equal(page.items.length, 1);
+  assert.equal(page.total, 1);
+  assert.equal(page.totalCountKnown, true);
+  assert.ok(
+    paths.every(
+      (path) =>
+        !path.includes("/keywords") &&
+        !path.includes("with_keywords") &&
+        !path.includes("without_keywords"),
+    ),
+  );
+});
+
+test("saved TMDB preferences filter TMDB rows without filtering TPDB or StashDB Browse and Discover", async () => {
+  await withFixture(
+    (req, res, body) => {
+      const path = pathOf(req.url ?? "");
+      if (path === "/3/genre/movie/list") sendJson(res, 200, { genres: [] });
+      else if (path.endsWith("/keywords"))
+        sendJson(res, 200, { keywords: [{ id: 44, name: "Wanted" }] });
+      else if (path.startsWith("/3/"))
+        sendJson(res, 200, {
+          page: 1,
+          total_pages: 1,
+          total_results: 1,
+          results: [{ id: 1, title: "TMDB match", release_date: "2020-01-01" }],
+        });
+      else if (path === "/movies")
+        sendJson(res, 200, {
+          data: [
+            {
+              id: "00000000-0000-4000-8000-000000000011",
+              title: "TPDB unrelated",
+              date: "2020-01-01",
+              tags: [],
+              performers: [],
+              scenes: [],
+              movies: [],
+              posters: {},
+              background: {},
+            },
+          ],
+          links: { next: null },
+          meta: { total: 1 },
+        });
+      else if (path === "/graphql") {
+        const gql = JSON.parse(body) as {
+          variables: { f?: { tags?: unknown } };
+        };
+        assert.equal(
+          gql.variables.f?.tags,
+          undefined,
+          "TMDB preferences must not become StashDB tag criteria",
+        );
+        sendJson(res, 200, {
+          data: {
+            queryScenes: {
+              count: 1,
+              scenes: [
+                {
+                  id: "00000000-0000-4000-8000-000000000022",
+                  title: "StashDB unrelated",
+                  date: "2020-01-01",
+                  tags: [],
+                  performers: [],
+                  studio: null,
+                  urls: [],
+                  images: [],
+                },
+              ],
+            },
+          },
+        });
+      } else sendJson(res, 404, {});
+    },
+    async (fixture) => {
+      const keys = [
+        "TMDB_BASE_URL",
+        "TPDB_BASE_URL",
+        "STASHDB_BASE_URL",
+      ] as const;
+      const previous = keys.map((key) => process.env[key]);
+      for (const key of keys) process.env[key] = fixture.origin;
+      try {
+        const ctx = fresh({
+          ...base,
+          providers: {
+            tmdbReadToken: "fixture-key",
+            tpdbApiToken: "fixture-token",
+            stashdbApiKey: "fixture-key",
+          },
+        });
+        storage.saveContentPreferences(owner.id, {
+          includeTags: [{ name: "Wanted", tmdb: "44" }],
+          hiddenTags: [{ name: "Unrelated", tmdb: "55" }],
+        });
+        for (const source of ["tmdb", "tpdb"]) {
+          resetMetaCache();
+          const response = await browseRoute(
+            new Request(
+              `http://localhost/api/browse?grouped=1&movieSource=${source}`,
+            ),
+            ctx,
+          );
+          const page = await response.json();
+          assert.equal(page.groups[0].items.length, 1);
+          assert.equal(page.groups[1].items.length, 1);
+          assert.deepEqual(page.groups[1].errors, []);
+        }
+        resetMetaCache();
+        const response = await discover(ctx);
+        const page = await response.json();
+        for (const shelfId of [
+          "new-releases",
+          "new-scenes",
+          "tmdb-new",
+          "trending",
+          "tmdb-trending",
+        ]) {
+          const shelf = page.shelves.find(
+            (s: { id: string }) => s.id === shelfId,
+          );
+          assert.ok(shelf, shelfId);
+          assert.equal(shelf.items.length, 1, shelfId);
+        }
+      } finally {
+        keys.forEach((key, index) => {
+          if (previous[index] === undefined) delete process.env[key];
+          else process.env[key] = previous[index];
+        });
+        resetMetaCache();
+      }
+    },
+  );
+});

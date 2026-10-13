@@ -2669,11 +2669,14 @@ test("content preferences persist per account, survive reopen, and never leak be
       { name: "ro-mance", stashdb: TAG_STASH },
     ],
   });
-  // The same label from both providers consolidates into one selection.
+  // Same-named tags remain independent selections from their own providers.
   assert.deepEqual(saved, {
     ...defaultPersonalSettings(),
     ...defaultPersonalSettings(),
-    hiddenTags: [{ name: "Rómance", tpdb: TAG_TPDB, stashdb: TAG_STASH }],
+    hiddenTags: [
+      { name: "Rómance", tpdb: TAG_TPDB },
+      { name: "ro-mance", stashdb: TAG_STASH },
+    ],
     discoverOrder: DEFAULT_ORDER,
   });
   assert.deepEqual(storage.getContentPreferences(owner), saved);
@@ -2736,7 +2739,7 @@ test("malformed preferences are rejected atomically; unknown accounts are 404", 
       {
         hiddenTags: Array.from({ length: 26 }, (_, i) => ({
           name: `Tag ${i}`,
-          tpdb: TAG_TPDB,
+          tpdb: `00000000-0000-4000-8000-${String(i).padStart(12, "0")}`,
         })),
       },
     ],
@@ -2768,12 +2771,12 @@ test("malformed preferences are rejected atomically; unknown accounts are 404", 
   assert.equal(labelOnly[0]!.tpdb, undefined);
   assert.equal(labelOnly[0]!.stashdb, undefined);
 
-  // 25 consolidated selections pass; the label rule keeps the dupes out.
+  // Native identity deduplicates a repeat while keeping the 25-tag cap.
   const capped: CatalogTagSelection[] = Array.from({ length: 25 }, (_, i) => ({
     name: `Tag ${i}`,
-    tpdb: TAG_TPDB,
+    tpdb: `00000000-0000-4000-8000-${String(i).padStart(12, "0")}`,
   }));
-  capped.push({ name: "TAG 0", stashdb: TAG_STASH });
+  capped.push({ name: "TAG 0", tpdb: capped[0]!.tpdb });
   assert.equal(
     storage.saveContentPreferences(other, { hiddenTags: capped }).hiddenTags
       .length,
@@ -2781,8 +2784,7 @@ test("malformed preferences are rejected atomically; unknown accounts are 404", 
   );
   assert.deepEqual(storage.getContentPreferences(other).hiddenTags[0], {
     name: "Tag 0",
-    tpdb: TAG_TPDB,
-    stashdb: TAG_STASH,
+    tpdb: capped[0]!.tpdb,
   });
 
   assert.throws(

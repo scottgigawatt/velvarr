@@ -1657,7 +1657,7 @@ function SingleTitlesView() {
             selected={include}
             onChange={onInclude}
             allowFreeText
-            description="Match every included tag. Type a term or choose a published tag."
+            description="Match every included tag from the result’s provider. Free-text terms apply across providers."
           />
           <TagPicker
             id="titles-exclude"
@@ -1666,7 +1666,7 @@ function SingleTitlesView() {
             selected={exclude}
             onChange={onExclude}
             allowFreeText
-            description="Leave out titles matching any excluded tag. Exclusions take priority."
+            description="Exclude matches from each picked tag’s provider. Free-text terms apply across providers. Exclusions take priority."
           />
           {!(type === "movie" && movieSource === "tmdb") && (
             <PerformerPicker
@@ -2092,7 +2092,7 @@ function GroupedTitlesView() {
           onChange={(tags) =>
             patch({ include: tags.length ? JSON.stringify(tags) : null })
           }
-          description="Match every included tag."
+          description="Match every included tag from this provider. Free-text terms apply across providers."
         />
         <TagPicker
           id="all-exclude"
@@ -2103,7 +2103,7 @@ function GroupedTitlesView() {
           onChange={(tags) =>
             patch({ exclude: tags.length ? JSON.stringify(tags) : null })
           }
-          description="Leave out matching titles. Exclusions win."
+          description="Exclude matching titles from the tag’s provider. Free-text terms apply across providers. Exclusions win."
         />
         {source === "tmdb" && (
           <>

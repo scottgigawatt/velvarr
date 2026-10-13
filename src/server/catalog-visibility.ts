@@ -2,7 +2,11 @@
 // title matches a tag selection (tagMatches) and whether an account's hidden
 // tags hide it (isHiddenTitle). Pure move out of server/browse.ts.
 
-import { facetTokens, normalizeFacetName } from "../lib/contracts.ts";
+import {
+  facetTokens,
+  normalizeFacetName,
+  tagAppliesToProvider,
+} from "../lib/contracts.ts";
 import type { CatalogDetail, CatalogTagSelection } from "../lib/contracts.ts";
 
 // --- tag matching: provider UUID first, then label by mode ("exact" folded
@@ -23,6 +27,7 @@ export function tagMatches(
   sel: CatalogTagSelection,
   mode: "exact" | "family" | "substring",
 ): boolean {
+  if (!tagAppliesToProvider(sel, detail.reference.provider)) return false;
   const nativeId =
     detail.reference.provider === "tmdb"
       ? sel.tmdb
