@@ -295,7 +295,7 @@ test("an authentication failure on one Whisparr does not hide another instance o
     },
   );
 });
-test("TMDB keywords are native, bounded, and applied alongside adult filtering and dates", async () => {
+test("TMDB tags and dates include matching titles regardless of adult classification", async () => {
   const paths: string[] = [];
   const read = async <T>(path: string): Promise<T> => {
     paths.push(path);
@@ -320,7 +320,7 @@ test("TMDB keywords are native, bounded, and applied alongside adult filtering a
                 },
                 {
                   id: 2,
-                  title: "Not adult",
+                  title: "Unflagged match",
                   adult: false,
                   genre_ids: [18],
                   release_date: "2026-01-01",
@@ -344,7 +344,6 @@ test("TMDB keywords are native, bounded, and applied alongside adult filtering a
   const page = await searchTmdb(read, {
     provider: "tmdb",
     kind: "movie",
-    adultOnly: true,
     sort: "popularity",
     includeTags: [{ name: "Wanted", tmdb: "44" }],
     releaseDate: { cutoff: "2026-01-01", operation: "<=" },
@@ -352,7 +351,7 @@ test("TMDB keywords are native, bounded, and applied alongside adult filtering a
   });
   assert.deepEqual(
     page.items.map((item) => item.reference.id),
-    ["1"],
+    ["1", "2"],
   );
   assert.equal(page.totalCountKnown, false);
   assert.ok(paths.some((path) => path.includes("with_keywords=44")));
@@ -367,7 +366,6 @@ test("TMDB keywords are native, bounded, and applied alongside adult filtering a
     provider: "tmdb",
     kind: "movie",
     sort: "trending",
-    adultOnly: false,
   });
   assert.ok(paths.some((path) => path.startsWith("/3/trending/movie/week?")));
 });
@@ -386,7 +384,7 @@ test("All browse gives TMDB movies an independent saved row limit and preserves 
           results: Array.from({ length: 20 }, (_, i) => ({
             id: (page - 1) * 20 + i + 1,
             title: "Fixture " + i,
-            adult: true,
+            adult: i % 2 === 0,
           })),
         });
       }
@@ -402,7 +400,9 @@ test("All browse gives TMDB movies an independent saved row limit and preserves 
         storage.saveContentPreferences(owner.id, { browseRowLimit: 15 });
         resetMetaCache();
         const response = await browseRoute(
-          new Request("http://localhost/api/browse?grouped=1&movieSource=tmdb"),
+          new Request(
+            "http://localhost/api/browse?grouped=1&movieSource=tmdb&adultOnly=1",
+          ),
           ctx,
         );
         const body = await response.json();
@@ -411,7 +411,23 @@ test("All browse gives TMDB movies an independent saved row limit and preserves 
         assert.equal(body.groups[0].source, "tmdb");
         assert.equal(body.groups[0].items.length, 15);
         assert.ok(
-          body.groups[0].items.every((item: { adult: boolean }) => item.adult),
+          body.groups[0].items.some(
+            (item: { adult: boolean }) => item.adult === false,
+          ),
+        );
+        const legacy = await browseRoute(
+          new Request(
+            "http://localhost/api/browse?type=movie&movieSource=tmdb&adultOnly=1&perPage=5",
+          ),
+          ctx,
+        );
+        const legacyBody = await legacy.json();
+        assert.equal(legacy.status, 200);
+        assert.ok(
+          legacyBody.items.some(
+            (item: { adult: boolean }) => item.adult === false,
+          ),
+          "old adultOnly bookmarks no longer discard unflagged titles",
         );
         assert.equal(body.groups[1].source, "stashdb");
         assert.ok(body.groups[1].error);
@@ -529,7 +545,7 @@ test("TMDB cast and studio choices use native IDs and title searches verify both
   );
 });
 
-test("sparse TMDB previews have one bounded native scan with adult and hidden filtering intact", async () => {
+test("sparse TMDB previews preserve tag filters and unflagged matches within one bounded scan", async () => {
   let listingPages = 0;
   let keywords = 0;
   await withFixture(
@@ -541,7 +557,9 @@ test("sparse TMDB previews have one bounded native scan with adult and hidden fi
         keywords++;
         const movieId = Number(url.pathname.split("/")[3]);
         return sendJson(res, 200, {
-          keywords: movieId === 21 ? [] : [{ id: 4, name: "Hidden" }],
+          keywords: [21, 43].includes(movieId)
+            ? []
+            : [{ id: 4, name: "Hidden" }],
         });
       }
       listingPages++;
@@ -576,14 +594,14 @@ test("sparse TMDB previews have one bounded native scan with adult and hidden fi
         assert.equal(listingPages, 3);
         assert.equal(
           keywords,
-          6,
-          "metadata is hydrated only for adult candidates in the bounded listing window",
+          60,
+          "keyword checks stay within the three-page candidate window",
         );
         assert.deepEqual(
           page.items.map((item) => item.reference.id),
-          ["21"],
+          ["21", "43"],
         );
-        assert.equal(page.items[0]?.adult, true);
+        assert.equal(page.items[1]?.adult, false);
         assert.equal(page.errors[0]?.code, "scan_ceiling");
         assert.equal(page.totalCountKnown, false);
         assert.equal(page.hasMore, false);
@@ -673,6 +691,8 @@ test("Discover applies its small budget to every provider row and retains honest
       }
       if (url.pathname.startsWith("/3/genre"))
         return sendJson(res, 200, { genres: [] });
+      if (url.pathname.endsWith("/keywords"))
+        return sendJson(res, 200, { keywords: [{ id: 4, name: "Hidden" }] });
       if (url.pathname.startsWith("/3/")) {
         if (url.pathname.includes("trending")) counts.tmdbTrending++;
         else counts.tmdbNew++;
@@ -681,7 +701,7 @@ test("Discover applies its small budget to every provider row and retains honest
           page,
           total_pages: 100,
           total_results: 2000,
-          results: [{ id: page, title: "Not adult", adult: false }],
+          results: [{ id: page, title: "Unflagged match", adult: false }],
         });
       }
       if (url.pathname === "/tags")

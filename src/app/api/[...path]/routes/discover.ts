@@ -636,11 +636,10 @@ export async function discover(ctx: AuthContext): Promise<Response> {
       id: "tmdb-new",
       title: "New movies · TMDB",
       source: "tmdb" as const,
-      description: "Newest TMDB releases, adult-flagged by default.",
+      description: "Newest TMDB releases, filtered by your tag preferences.",
       params: {
         type: "movie",
         movieSource: "tmdb",
-        adultOnly: "1",
         sort: "recency",
         direction: "desc",
         date: today,
@@ -658,11 +657,11 @@ export async function discover(ctx: AuthContext): Promise<Response> {
       id: "tmdb-trending",
       title: "Trending movies · TMDB",
       source: "tmdb" as const,
-      description: "TMDB's weekly movie trends, adult-flagged by default.",
+      description:
+        "TMDB's weekly movie trends, filtered by your tag preferences.",
       params: {
         type: "movie",
         movieSource: "tmdb",
-        adultOnly: "1",
         sort: "trending",
       },
     },

@@ -16,7 +16,6 @@ export type TmdbQuery = {
   kind: "movie";
   query?: string;
   year?: number;
-  adultOnly?: boolean;
   sort?: "relevance" | "recency" | "popularity" | "trending";
   cast?: string;
   company?: string;
@@ -118,10 +117,9 @@ export async function searchTmdb(
   )
     throw new AppError(400, "invalid_search", "Invalid TMDB page.");
   if (
-    (query.adultOnly !== undefined && typeof query.adultOnly !== "boolean") ||
-    (query.direction !== undefined &&
-      query.direction !== "asc" &&
-      query.direction !== "desc")
+    query.direction !== undefined &&
+    query.direction !== "asc" &&
+    query.direction !== "desc"
   )
     throw new AppError(
       400,
@@ -202,7 +200,6 @@ export async function searchTmdb(
   const includes = query.includeTags ?? [];
   const excludes = query.excludeTags ?? [];
   const filtered = Boolean(
-    query.adultOnly ||
     includes.length ||
     excludes.length ||
     query.releaseDate ||
@@ -264,18 +261,16 @@ export async function searchTmdb(
       );
     total = Number(data.total_results);
     more = false;
-    let candidates = rows(data.results)
-      .filter((r) => !query.adultOnly || r.adult === true)
-      .flatMap((r) => {
-        const d = movie(r, genres);
-        if (!d)
-          throw new AppError(
-            502,
-            "upstream_bad_response",
-            "TMDB returned an unusable movie row.",
-          );
-        return [d];
-      });
+    let candidates = rows(data.results).flatMap((r) => {
+      const d = movie(r, genres);
+      if (!d)
+        throw new AppError(
+          502,
+          "upstream_bad_response",
+          "TMDB returned an unusable movie row.",
+        );
+      return [d];
+    });
     if ((q || query.sort === "trending") && (query.cast || query.company)) {
       const qualified = await Promise.all(
         candidates.map(async (detail) => {

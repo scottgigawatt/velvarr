@@ -78,7 +78,6 @@ export type BrowseQuery = {
   movieSource?: "tpdb" | "tmdb";
   tmdbPerformer?: string;
   tmdbStudio?: string;
-  adultOnly?: boolean;
   q?: string;
   include: CatalogTagSelection[];
   exclude: CatalogTagSelection[];
@@ -262,12 +261,6 @@ export function parseBrowseQuery(params: URLSearchParams): BrowseQuery {
             ["tpdb", "tmdb"],
             "movieSource",
           ),
-        }
-      : {}),
-    ...(params.has("adultOnly")
-      ? {
-          adultOnly:
-            parseEnum(params.get("adultOnly"), ["0", "1"], "adultOnly") === "1",
         }
       : {}),
     ...(q !== undefined && q !== "" ? { q } : {}),
@@ -1028,7 +1021,6 @@ export async function browseTitles(
         kind: "movie",
         query: query.q,
         year: query.year,
-        adultOnly: query.adultOnly ?? true,
         cast: query.tmdbPerformer,
         company: query.tmdbStudio,
         includeTags: query.include,

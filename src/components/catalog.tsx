@@ -718,7 +718,6 @@ function parseTags(v: string | null): CatalogTagSelection[] {
  * state under endless scroll. An outage is an error, never an empty page. */
 function browsePath(f: {
   movieSource?: "tpdb" | "tmdb";
-  adultOnly?: boolean;
   preferredTags?: string | null;
   tmdbPerformer?: string | null;
   tmdbStudio?: string | null;
@@ -765,8 +764,6 @@ function browsePath(f: {
   }
   if (f.movieSource === "tmdb" && f.type === "movie")
     qs.set("movieSource", "tmdb");
-  if (f.movieSource === "tmdb" && f.type === "movie")
-    qs.set("adultOnly", f.adultOnly ? "1" : "0");
   if (!f.sort && !f.performerTpdb) {
     const defaultSort =
       f.type === "scene"
@@ -885,7 +882,6 @@ function SingleTitlesView() {
   // Anything that is not movie/scene reads as the `all` default.
   const type = typeRaw === "movie" || typeRaw === "scene" ? typeRaw : "all";
   const movieSource = params.get("movieSource") === "tmdb" ? "tmdb" : "tpdb";
-  const adultOnly = params.get("adultOnly") !== "0";
   const preferredTags = params.get("preferredTags");
   const tmdbPerformer = params.get("tmdbPerformer");
   const tmdbStudio = params.get("tmdbStudio");
@@ -979,7 +975,6 @@ function SingleTitlesView() {
       browsePath({
         type,
         movieSource,
-        adultOnly,
         preferredTags,
         tmdbPerformer,
         tmdbStudio,
@@ -1002,7 +997,6 @@ function SingleTitlesView() {
     [
       type,
       movieSource,
-      adultOnly,
       preferredTags,
       tmdbPerformer,
       tmdbStudio,
@@ -1277,8 +1271,7 @@ function SingleTitlesView() {
       include,
       exclude,
     }) +
-    (type === "movie" && movieSource === "tmdb" ? 1 : 0) +
-    (type === "movie" && adultOnly ? 1 : 0);
+    (type === "movie" && movieSource === "tmdb" ? 1 : 0);
 
   // `name` is display-only (never queried) — a forged label can misname the
   // heading but never change results.
@@ -1314,14 +1307,6 @@ function SingleTitlesView() {
             { push: true },
           )
         }
-      />,
-    );
-  if (type === "movie" && adultOnly)
-    chips.push(
-      <FilterChip
-        key="adult"
-        label="Adult-flagged only"
-        onRemove={() => setP({ adultOnly: null }, { push: true })}
       />,
     );
   if (q) {
@@ -1520,7 +1505,7 @@ function SingleTitlesView() {
                   movieSource: source,
                   tmdbPerformer: null,
                   tmdbStudio: null,
-                  adultOnly: source === "tmdb" ? "1" : null,
+                  adultOnly: null,
                   sort: null,
                   direction: null,
                   performerTpdb: null,
@@ -1657,28 +1642,6 @@ function SingleTitlesView() {
         count={filterCount}
         onClear={clearFilters}
       >
-        {type === "movie" && movieSource === "tmdb" && (
-          <label className="switch-label">
-            <input
-              type="checkbox"
-              className="check"
-              checked={adultOnly}
-              onChange={(event) =>
-                setP(
-                  { adultOnly: event.target.checked ? "1" : "0" },
-                  { push: true },
-                )
-              }
-            />
-            Adult-flagged movies only
-          </label>
-        )}
-        {type === "movie" && movieSource === "tmdb" && (
-          <p className="field-help">
-            On by default. Turn off to broaden your search beyond TMDB's adult
-            classification.
-          </p>
-        )}
         <SearchBox
           id="titles-q"
           label="Title search"
@@ -1841,7 +1804,6 @@ function GroupedTitlesView() {
   const setP = useParamsSetter();
   const browseTo = useBrowseTo();
   const source = params.get("movieSource") === "tmdb" ? "tmdb" : "tpdb";
-  const adultOnly = params.get("adultOnly") !== "0";
   const q = params.get("q") ?? "";
   const year = params.get("year") ?? "";
   const include = parseTags(params.get("include"));
@@ -1855,7 +1817,6 @@ function GroupedTitlesView() {
     "year",
     "include",
     "exclude",
-    "adultOnly",
     "sort",
     "direction",
     "date",
@@ -1896,8 +1857,7 @@ function GroupedTitlesView() {
     Number(Boolean(q)) +
     Number(Boolean(year)) +
     include.length +
-    exclude.length +
-    Number(source === "tmdb" && adultOnly);
+    exclude.length;
   const limit = Number(
     params.get("rowLimit") ??
       page.data?.rowLimit ??
@@ -1955,7 +1915,7 @@ function GroupedTitlesView() {
             movieSource,
             tmdbPerformer: null,
             tmdbStudio: null,
-            adultOnly: movieSource === "tmdb" ? "1" : null,
+            adultOnly: null,
             sort: null,
             direction: null,
             performerTpdb: null,
@@ -2119,19 +2079,6 @@ function GroupedTitlesView() {
           })
         }
       >
-        {source === "tmdb" && (
-          <label className="switch-label">
-            <input
-              type="checkbox"
-              className="check"
-              checked={adultOnly}
-              onChange={(event) =>
-                patch({ adultOnly: event.target.checked ? "1" : "0" })
-              }
-            />
-            Adult-flagged movies only
-          </label>
-        )}
         <p className="field-help">
           Movie filters use {source.toUpperCase()}; scenes use StashDB. Each row
           applies compatible criteria independently.

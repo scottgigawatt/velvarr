@@ -228,9 +228,6 @@ export function catalogSearchQuery(url: URL): CatalogSearchQuery {
     const direction = params.get("direction");
     if (direction !== null && direction !== "asc" && direction !== "desc")
       throw new AppError(400, "invalid_query", "Invalid TMDB sort direction.");
-    const adultOnly = params.get("adultOnly");
-    if (adultOnly !== null && adultOnly !== "0" && adultOnly !== "1")
-      throw new AppError(400, "invalid_query", "adultOnly must be 0 or 1.");
     if (
       ["performer", "studio", "tags", "date", "date_operation"].some((k) =>
         params.has(k),
@@ -239,7 +236,7 @@ export function catalogSearchQuery(url: URL): CatalogSearchQuery {
       throw new AppError(
         400,
         "invalid_query",
-        "TMDB movie search supports title, year, and adult classification only.",
+        "This TMDB search endpoint supports title and year. Use Browse for tag filters.",
       );
     return {
       provider: "tmdb",
@@ -252,7 +249,6 @@ export function catalogSearchQuery(url: URL): CatalogSearchQuery {
         : undefined,
       sort: sort ?? undefined,
       direction: direction ?? undefined,
-      adultOnly: adultOnly === "1",
     };
   }
   if (provider === "stashdb") {
