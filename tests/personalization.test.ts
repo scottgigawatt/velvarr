@@ -1020,3 +1020,143 @@ test("a missing TMDB keyword record skips only that title while provider failure
       error instanceof AppError && error.upstreamStatus === 404,
   );
 });
+
+for (const matchingPages of [[], [1, 20]]) {
+  test(`filtered TMDB Trending retains sparse matches at its limit (${matchingPages.join(",") || "none"})`, async () => {
+    let listings = 0;
+    const read = async <T>(path: string): Promise<T> => {
+      const url = new URL(path, "http://fixture");
+      const movieId = Number(url.pathname.split("/")[3]);
+      const nativePage = Number(url.searchParams.get("page"));
+      if (url.pathname === "/3/genre/movie/list") return { genres: [] } as T;
+      if (url.pathname.endsWith("/keywords"))
+        return {
+          keywords: [
+            {
+              id: matchingPages.includes(movieId) ? 44 : 55,
+              name: matchingPages.includes(movieId) ? "Wanted" : "Other",
+            },
+          ],
+        } as T;
+      listings++;
+      assert.equal(url.pathname, "/3/trending/movie/week");
+      assert.equal(
+        url.searchParams.has("with_keywords"),
+        false,
+        "Trending cannot accept native keyword filters",
+      );
+      return {
+        page: nativePage,
+        total_pages: 100,
+        total_results: 100,
+        results: [{ id: nativePage, title: "Fixture " + nativePage }],
+      } as T;
+    };
+    const result = await searchTmdb(read, {
+      provider: "tmdb",
+      kind: "movie",
+      sort: "trending",
+      includeTags: [{ name: "Wanted", tmdb: "44" }],
+      perPage: 24,
+    });
+    assert.deepEqual(
+      result.items.map((item) => item.reference.id),
+      matchingPages.map(String),
+    );
+    assert.equal(listings, 40);
+    assert.equal(result.hasMore, false);
+    assert.equal(result.totalCountKnown, false);
+    assert.equal(result.total, undefined);
+    assert.equal(result.errors?.[0]?.code, "scan_ceiling");
+    assert.match(result.errors![0]!.message, /weekly trending list/);
+    assert.match(result.errors![0]!.message, /Popularity/);
+  });
+}
+
+test("TMDB Trending filters year locally because the endpoint ignores discover parameters", async () => {
+  const read = async <T>(path: string): Promise<T> => {
+    const url = new URL(path, "http://fixture");
+    if (url.pathname === "/3/genre/movie/list") return { genres: [] } as T;
+    assert.equal(url.searchParams.has("primary_release_year"), false);
+    return {
+      page: 1,
+      total_pages: 1,
+      total_results: 3,
+      results: [
+        { id: 1, title: "Correct year", release_date: "2020-01-01" },
+        { id: 2, title: "Wrong year", release_date: "2021-01-01" },
+        { id: 3, title: "Unknown year" },
+      ],
+    } as T;
+  };
+  const result = await searchTmdb(read, {
+    provider: "tmdb",
+    kind: "movie",
+    sort: "trending",
+    year: 2020,
+  });
+  assert.deepEqual(
+    result.items.map((item) => item.reference.id),
+    ["1"],
+  );
+});
+
+test("TMDB Trending combines keyword, exclusion, year, date, cast and company filters without widening results", async () => {
+  const read = async <T>(path: string): Promise<T> => {
+    const url = new URL(path, "http://fixture");
+    const movieId = Number(url.pathname.split("/")[3]);
+    if (url.pathname === "/3/genre/movie/list") return { genres: [] } as T;
+    if (url.pathname.endsWith("/keywords"))
+      return {
+        keywords: [
+          { id: 44, name: "Wanted" },
+          ...(movieId === 4 ? [{ id: 55, name: "Hidden" }] : []),
+        ],
+      } as T;
+    if (url.pathname.startsWith("/3/movie/")) {
+      if (movieId === 5)
+        throw new AppError(404, "upstream_not_found", "Removed movie", 404);
+      return {
+        id: movieId,
+        credits: { cast: [{ id: movieId === 3 ? 6 : 5 }] },
+        production_companies: [{ id: 8 }],
+      } as T;
+    }
+    assert.equal(url.pathname, "/3/trending/movie/week");
+    for (const key of [
+      "with_keywords",
+      "without_keywords",
+      "primary_release_year",
+      "with_cast",
+      "with_companies",
+      "primary_release_date.lte",
+    ])
+      assert.equal(url.searchParams.has(key), false);
+    return {
+      page: 1,
+      total_pages: 1,
+      total_results: 6,
+      results: Array.from({ length: 6 }, (_, i) => ({
+        id: i + 1,
+        title: "Fixture " + i,
+        release_date:
+          i === 1 ? "2021-01-01" : i === 5 ? "2020-02-01" : "2020-01-01",
+      })),
+    } as T;
+  };
+  const result = await searchTmdb(read, {
+    provider: "tmdb",
+    kind: "movie",
+    sort: "trending",
+    year: 2020,
+    cast: "5",
+    company: "8",
+    releaseDate: { cutoff: "2020-01-01", operation: "<=" },
+    includeTags: [{ name: "Wanted", tmdb: "44" }],
+    excludeTags: [{ name: "Hidden", tmdb: "55" }],
+  });
+  assert.deepEqual(
+    result.items.map((item) => item.reference.id),
+    ["1"],
+  );
+});

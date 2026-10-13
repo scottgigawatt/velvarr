@@ -543,6 +543,17 @@ export function ShelfSection({
               {e.message}
             </p>
           ))}
+          {shelf.source === "tmdb" &&
+            shelf.browse?.params.sort === "trending" &&
+            shelf.errors?.some((error) => error.code === "scan_ceiling") && (
+              <Link
+                className="btn mt-2"
+                href={`/?${new URLSearchParams({ view: "titles", ...shelf.browse.params, sort: "popularity", direction: "desc" })}`}
+                prefetch={false}
+              >
+                Browse matching movies by popularity
+              </Link>
+            )}
         </div>
       )}
       {body}

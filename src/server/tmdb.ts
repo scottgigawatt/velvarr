@@ -1,4 +1,8 @@
-import { previewLimitError, type CatalogScanBudget } from "./catalog-budget.ts";
+import {
+  previewLimitError,
+  trendingLimitError,
+  type CatalogScanBudget,
+} from "./catalog-budget.ts";
 // TMDB movie reads only. Search pages stay lightweight; details are fetched on demand.
 import type {
   CatalogDetail,
@@ -177,7 +181,8 @@ export async function searchTmdb(
   if (query.year !== undefined) {
     if (!Number.isInteger(query.year) || query.year < 1900 || query.year > 2100)
       throw new AppError(400, "invalid_search", "Invalid TMDB release year.");
-    params.set("primary_release_year", String(query.year));
+    if (query.sort !== "trending")
+      params.set("primary_release_year", String(query.year));
   }
   const genreData = await read<Row>("/3/genre/movie/list?language=en-US");
   if (!Array.isArray(genreData.genres))
@@ -208,7 +213,8 @@ export async function searchTmdb(
     excludes.length ||
     query.releaseDate ||
     query.cast ||
-    query.company,
+    query.company ||
+    (query.sort === "trending" && query.year !== undefined),
   );
   const nativeKeywords = !q && query.sort !== "trending";
   if (nativeKeywords && includes.length && includes.every((tag) => tag.tmdb))
@@ -275,12 +281,25 @@ export async function searchTmdb(
         );
       return [d];
     });
+    // Trending ignores discover parameters, so year filtering stays local.
+    if (query.sort === "trending" && query.year !== undefined) {
+      candidates = candidates.filter(
+        (detail) => detail.releaseDate?.slice(0, 4) === String(query.year),
+      );
+    }
     if ((q || query.sort === "trending") && (query.cast || query.company)) {
       const qualified = await Promise.all(
         candidates.map(async (detail) => {
-          const metadata = await read<Row>(
-            "/3/movie/" + detail.reference.id + "?append_to_response=credits",
-          );
+          let metadata: Row;
+          try {
+            metadata = await read<Row>(
+              "/3/movie/" + detail.reference.id + "?append_to_response=credits",
+            );
+          } catch (error) {
+            if (error instanceof AppError && error.upstreamStatus === 404)
+              return null;
+            throw error;
+          }
           if (id(metadata.id) !== detail.reference.id)
             throw new AppError(
               502,
@@ -387,7 +406,7 @@ export async function searchTmdb(
         ...(!filtered && Number(data.total_pages) <= 500 ? { total } : {}),
       };
   }
-  if (query.scanBudget)
+  if (query.scanBudget || query.sort === "trending")
     return {
       provider: "tmdb",
       kind: "movie",
@@ -397,7 +416,11 @@ export async function searchTmdb(
       sort: appliedSort,
       hasMore: false,
       totalCountKnown: false,
-      errors: [previewLimitError("tmdb")],
+      errors: [
+        query.sort === "trending"
+          ? trendingLimitError()
+          : previewLimitError("tmdb"),
+      ],
     };
   throw new AppError(
     422,

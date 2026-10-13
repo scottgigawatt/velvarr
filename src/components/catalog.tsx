@@ -11,7 +11,11 @@ import {
 import { useSearchParams } from "next/navigation";
 import "./catalog.css";
 import { RailSkeleton } from "./discover.tsx";
-import type { ContentPreferences, ShelfError } from "../lib/contracts.ts";
+import type {
+  ContentPreferences,
+  ShelfError,
+  SourceError,
+} from "../lib/contracts.ts";
 import { TagPicker } from "./tag-picker.tsx";
 import {
   api,
@@ -1564,7 +1568,28 @@ function SingleTitlesView() {
           ) : (
             <>
               {acc.errors.map((e) =>
-                e.code === "scan_ceiling" ? (
+                e.code === "scan_ceiling" &&
+                e.provider === "tmdb" &&
+                sort === "trending" ? (
+                  <div
+                    key={e.provider}
+                    className="panel p-4 text-sm text-muted"
+                    role="note"
+                  >
+                    <p>{e.message}</p>
+                    <button
+                      className="btn mt-2"
+                      onClick={() =>
+                        setP(
+                          { sort: "popularity", direction: "desc" },
+                          { push: true },
+                        )
+                      }
+                    >
+                      Browse matching movies by popularity
+                    </button>
+                  </div>
+                ) : e.code === "scan_ceiling" ? (
                   // The source answered every scanned page and hit the
                   // documented limit: a partial answer, not an outage. No
                   // retry — only narrower filters change the outcome.
@@ -1814,7 +1839,7 @@ type BrowseGroup = {
   hasMore?: boolean;
   total?: number;
   totalCountKnown?: boolean;
-  errors?: { message: string }[];
+  errors?: SourceError[];
   error?: ShelfError;
 };
 
@@ -2064,9 +2089,29 @@ function GroupedTitlesView() {
               />
             ) : (
               <>
-                {group.errors?.map((error, index) => (
-                  <ErrorPanel key={index} message={error.message} />
-                ))}
+                {group.errors?.map((error, index) =>
+                  error.code === "scan_ceiling" &&
+                  group.source === "tmdb" &&
+                  params.get("sort") === "trending" ? (
+                    <div
+                      key={index}
+                      className="panel p-4 text-sm text-muted"
+                      role="note"
+                    >
+                      <p>{error.message}</p>
+                      <button
+                        className="btn mt-2"
+                        onClick={() =>
+                          patch({ sort: "popularity", direction: "desc" })
+                        }
+                      >
+                        Browse matching movies by popularity
+                      </button>
+                    </div>
+                  ) : (
+                    <ErrorPanel key={index} message={error.message} />
+                  ),
+                )}
                 {!group.items?.length ? (
                   <p className="panel p-5 text-muted">
                     No matching {group.title.toLowerCase()}. Try broadening your
