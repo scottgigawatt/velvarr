@@ -365,9 +365,9 @@ test("TMDB tags and dates include matching titles regardless of adult classifica
   await searchTmdb(read, {
     provider: "tmdb",
     kind: "movie",
-    sort: "trending",
+    sort: "popularity",
   });
-  assert.ok(paths.some((path) => path.startsWith("/3/trending/movie/week?")));
+  assert.ok(paths.some((path) => path.startsWith("/3/discover/movie?")));
 });
 test("All browse gives TMDB movies an independent saved row limit and preserves a scene-source failure", async () => {
   await withFixture(
@@ -584,7 +584,7 @@ test("sparse TMDB previews preserve tag filters and unflagged matches within one
         const page = await browseTitles(
           parseBrowseQuery(
             new URLSearchParams(
-              "type=movie&movieSource=tmdb&sort=trending&perPage=12",
+              "type=movie&movieSource=tmdb&sort=popularity&perPage=12",
             ),
           ),
           [{ name: "Hidden", tmdb: "4" }],
@@ -691,10 +691,22 @@ test("Discover applies its small budget to every provider row and retains honest
       }
       if (url.pathname.startsWith("/3/genre"))
         return sendJson(res, 200, { genres: [] });
+      if (url.pathname === "/3/search/keyword")
+        return sendJson(res, 200, {
+          results:
+            url.searchParams.get("query") === "pornography"
+              ? [{ id: 445, name: "pornography" }]
+              : [],
+        });
       if (url.pathname.endsWith("/keywords"))
-        return sendJson(res, 200, { keywords: [{ id: 4, name: "Hidden" }] });
+        return sendJson(res, 200, {
+          keywords: [
+            { id: 4, name: "Hidden" },
+            { id: 445, name: "pornography" },
+          ],
+        });
       if (url.pathname.startsWith("/3/")) {
-        if (url.pathname.includes("trending")) counts.tmdbTrending++;
+        if (url.searchParams.has("release_date.gte")) counts.tmdbTrending++;
         else counts.tmdbNew++;
         const page = Number(url.searchParams.get("page"));
         return sendJson(res, 200, {
@@ -798,8 +810,22 @@ test("three provider preferences produce scoped Discover links and Browse counts
     (req, res, body) => {
       const path = pathOf(req.url ?? "");
       if (path === "/3/genre/movie/list") sendJson(res, 200, { genres: [] });
+      else if (path === "/3/search/keyword")
+        sendJson(res, 200, {
+          results:
+            new URL(req.url ?? "/", "http://fixture").searchParams.get(
+              "query",
+            ) === "pornography"
+              ? [{ id: 445, name: "pornography" }]
+              : [],
+        });
       else if (path.endsWith("/keywords"))
-        sendJson(res, 200, { keywords: [{ id: 44, name: "Wanted" }] });
+        sendJson(res, 200, {
+          keywords: [
+            { id: 44, name: "Wanted" },
+            { id: 445, name: "pornography" },
+          ],
+        });
       else if (path.startsWith("/3/"))
         sendJson(res, 200, {
           page: 1,
@@ -991,7 +1017,7 @@ test("a missing TMDB keyword record skips only that title while provider failure
   const query = {
     provider: "tmdb" as const,
     kind: "movie" as const,
-    sort: "trending" as const,
+    sort: "popularity" as const,
     includeTags: [{ name: "Wanted", tmdb: "44" }],
   };
   const result = await searchTmdb(read, query);
@@ -1012,151 +1038,11 @@ test("a missing TMDB keyword record skips only that title while provider failure
   }
   await assert.rejects(
     searchTmdb(async <T>(path: string): Promise<T> => {
-      if (path.startsWith("/3/trending/"))
+      if (path.startsWith("/3/discover/"))
         throw new AppError(404, "upstream_not_found", "Missing listing", 404);
       return read<T>(path);
     }, query),
     (error: unknown) =>
       error instanceof AppError && error.upstreamStatus === 404,
-  );
-});
-
-for (const matchingPages of [[], [1, 20]]) {
-  test(`filtered TMDB Trending retains sparse matches at its limit (${matchingPages.join(",") || "none"})`, async () => {
-    let listings = 0;
-    const read = async <T>(path: string): Promise<T> => {
-      const url = new URL(path, "http://fixture");
-      const movieId = Number(url.pathname.split("/")[3]);
-      const nativePage = Number(url.searchParams.get("page"));
-      if (url.pathname === "/3/genre/movie/list") return { genres: [] } as T;
-      if (url.pathname.endsWith("/keywords"))
-        return {
-          keywords: [
-            {
-              id: matchingPages.includes(movieId) ? 44 : 55,
-              name: matchingPages.includes(movieId) ? "Wanted" : "Other",
-            },
-          ],
-        } as T;
-      listings++;
-      assert.equal(url.pathname, "/3/trending/movie/week");
-      assert.equal(
-        url.searchParams.has("with_keywords"),
-        false,
-        "Trending cannot accept native keyword filters",
-      );
-      return {
-        page: nativePage,
-        total_pages: 100,
-        total_results: 100,
-        results: [{ id: nativePage, title: "Fixture " + nativePage }],
-      } as T;
-    };
-    const result = await searchTmdb(read, {
-      provider: "tmdb",
-      kind: "movie",
-      sort: "trending",
-      includeTags: [{ name: "Wanted", tmdb: "44" }],
-      perPage: 24,
-    });
-    assert.deepEqual(
-      result.items.map((item) => item.reference.id),
-      matchingPages.map(String),
-    );
-    assert.equal(listings, 40);
-    assert.equal(result.hasMore, false);
-    assert.equal(result.totalCountKnown, false);
-    assert.equal(result.total, undefined);
-    assert.equal(result.errors?.[0]?.code, "scan_ceiling");
-    assert.match(result.errors![0]!.message, /weekly trending list/);
-    assert.match(result.errors![0]!.message, /Popularity/);
-  });
-}
-
-test("TMDB Trending filters year locally because the endpoint ignores discover parameters", async () => {
-  const read = async <T>(path: string): Promise<T> => {
-    const url = new URL(path, "http://fixture");
-    if (url.pathname === "/3/genre/movie/list") return { genres: [] } as T;
-    assert.equal(url.searchParams.has("primary_release_year"), false);
-    return {
-      page: 1,
-      total_pages: 1,
-      total_results: 3,
-      results: [
-        { id: 1, title: "Correct year", release_date: "2020-01-01" },
-        { id: 2, title: "Wrong year", release_date: "2021-01-01" },
-        { id: 3, title: "Unknown year" },
-      ],
-    } as T;
-  };
-  const result = await searchTmdb(read, {
-    provider: "tmdb",
-    kind: "movie",
-    sort: "trending",
-    year: 2020,
-  });
-  assert.deepEqual(
-    result.items.map((item) => item.reference.id),
-    ["1"],
-  );
-});
-
-test("TMDB Trending combines keyword, exclusion, year, date, cast and company filters without widening results", async () => {
-  const read = async <T>(path: string): Promise<T> => {
-    const url = new URL(path, "http://fixture");
-    const movieId = Number(url.pathname.split("/")[3]);
-    if (url.pathname === "/3/genre/movie/list") return { genres: [] } as T;
-    if (url.pathname.endsWith("/keywords"))
-      return {
-        keywords: [
-          { id: 44, name: "Wanted" },
-          ...(movieId === 4 ? [{ id: 55, name: "Hidden" }] : []),
-        ],
-      } as T;
-    if (url.pathname.startsWith("/3/movie/")) {
-      if (movieId === 5)
-        throw new AppError(404, "upstream_not_found", "Removed movie", 404);
-      return {
-        id: movieId,
-        credits: { cast: [{ id: movieId === 3 ? 6 : 5 }] },
-        production_companies: [{ id: 8 }],
-      } as T;
-    }
-    assert.equal(url.pathname, "/3/trending/movie/week");
-    for (const key of [
-      "with_keywords",
-      "without_keywords",
-      "primary_release_year",
-      "with_cast",
-      "with_companies",
-      "primary_release_date.lte",
-    ])
-      assert.equal(url.searchParams.has(key), false);
-    return {
-      page: 1,
-      total_pages: 1,
-      total_results: 6,
-      results: Array.from({ length: 6 }, (_, i) => ({
-        id: i + 1,
-        title: "Fixture " + i,
-        release_date:
-          i === 1 ? "2021-01-01" : i === 5 ? "2020-02-01" : "2020-01-01",
-      })),
-    } as T;
-  };
-  const result = await searchTmdb(read, {
-    provider: "tmdb",
-    kind: "movie",
-    sort: "trending",
-    year: 2020,
-    cast: "5",
-    company: "8",
-    releaseDate: { cutoff: "2020-01-01", operation: "<=" },
-    includeTags: [{ name: "Wanted", tmdb: "44" }],
-    excludeTags: [{ name: "Hidden", tmdb: "55" }],
-  });
-  assert.deepEqual(
-    result.items.map((item) => item.reference.id),
-    ["1"],
   );
 });

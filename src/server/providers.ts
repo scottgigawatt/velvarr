@@ -615,29 +615,31 @@ export function resolveSort(
       "Sorts apply to movie and scene search only.",
     );
   }
+  if (provider === "tmdb" && sort === "trending") sort = "recent-popular";
   const spec = sortSpec(provider, kind, sort);
   if (provider === "tmdb") {
     if (
       !spec ||
       kind !== "movie" ||
-      ((sort === "relevance" || sort === "trending") && direction !== undefined)
+      (sort === "relevance" && direction !== undefined)
     )
       throw new AppError(
         400,
         "invalid_search",
         "Unsupported TMDB movie order.",
       );
-    return sort === "relevance" || sort === "trending"
+    return sort === "relevance"
       ? {
           key: sort,
-          upstream: sort === "trending" ? "trending.week" : "relevance",
+          upstream: "relevance",
         }
       : {
           key: sort,
           direction: direction ?? "desc",
           upstream:
-            (sort === "popularity" ? "popularity." : "primary_release_date.") +
-            (direction ?? "desc"),
+            (sort === "popularity" || sort === "recent-popular"
+              ? "popularity."
+              : "primary_release_date.") + (direction ?? "desc"),
         };
   }
   if (provider === "tpdb") {

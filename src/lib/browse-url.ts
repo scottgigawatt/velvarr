@@ -45,6 +45,7 @@ export function scopeBrowseTags(
 export const BROWSE_KEYS = [
   "type",
   "movieSource",
+  "recentDays",
   "adultOnly",
   "q",
   "include",

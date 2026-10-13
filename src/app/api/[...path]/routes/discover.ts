@@ -670,14 +670,16 @@ export async function discover(ctx: AuthContext): Promise<Response> {
     },
     {
       id: "tmdb-trending",
-      title: "Trending movies · TMDB",
+      title: "Recent popular movies · TMDB",
       source: "tmdb" as const,
       description:
-        "TMDB's weekly movie trends, filtered by your tag preferences.",
+        "Adult-keyword US releases from the last 30 days, ranked by TMDB popularity and narrowed by your TMDB tags.",
       params: {
         type: "movie",
         movieSource: "tmdb",
-        sort: "trending",
+        sort: "recent-popular",
+        direction: "desc",
+        recentDays: "30",
       },
     },
   ];

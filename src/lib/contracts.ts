@@ -322,7 +322,7 @@ export const DISCOVER_SHELVES = [
   { id: "new-scenes", title: "New scenes · StashDB" },
   { id: "tmdb-new", title: "New movies · TMDB" },
   { id: "trending", title: "Trending scenes · StashDB" },
-  { id: "tmdb-trending", title: "Trending movies · TMDB" },
+  { id: "tmdb-trending", title: "Recent popular movies · TMDB" },
   { id: "jellyfin-recent", title: "Recently added" },
   { id: "velvarr-requests", title: "Recent requests" },
   { id: "studios", title: "Studios" },

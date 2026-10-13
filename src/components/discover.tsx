@@ -544,14 +544,14 @@ export function ShelfSection({
             </p>
           ))}
           {shelf.source === "tmdb" &&
-            shelf.browse?.params.sort === "trending" &&
+            shelf.browse?.params.sort === "recent-popular" &&
             shelf.errors?.some((error) => error.code === "scan_ceiling") && (
               <Link
                 className="btn mt-2"
-                href={`/?${new URLSearchParams({ view: "titles", ...shelf.browse.params, sort: "popularity", direction: "desc" })}`}
+                href={`/?${new URLSearchParams({ view: "titles", ...shelf.browse.params, sort: "recent-popular", recentDays: "90", direction: "desc" })}`}
                 prefetch={false}
               >
-                Browse matching movies by popularity
+                Expand release window to 90 days
               </Link>
             )}
         </div>

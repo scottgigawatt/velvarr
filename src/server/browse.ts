@@ -80,6 +80,7 @@ export type BrowseQuery = {
   tmdbPerformer?: string;
   tmdbStudio?: string;
   q?: string;
+  recentDays?: number;
   include: CatalogTagSelection[];
   exclude: CatalogTagSelection[];
   studioTpdb?: string;
@@ -265,6 +266,9 @@ export function parseBrowseQuery(params: URLSearchParams): BrowseQuery {
         }
       : {}),
     ...(q !== undefined && q !== "" ? { q } : {}),
+    ...(params.has("recentDays")
+      ? { recentDays: Number(params.get("recentDays")) }
+      : {}),
     include: parseSelections(params, "include"),
     // Both lists accept labels with no provider id: an include label is a
     // free-text term that expands on each side's published tags — the
@@ -994,10 +998,16 @@ export async function browseTitles(
       );
     if (
       query.sort &&
-      !["relevance", "recency", "popularity", "trending"].includes(query.sort)
+      ![
+        "relevance",
+        "recency",
+        "popularity",
+        "recent-popular",
+        "trending",
+      ].includes(query.sort)
     )
       throw invalidQuery(
-        "TMDB supports relevance, release date, popularity, or weekly trending.",
+        "TMDB supports relevance, release date, popularity, or recent popularity.",
       );
     const result = await searchVisibleCatalog(
       {
@@ -1005,6 +1015,7 @@ export async function browseTitles(
         kind: "movie",
         query: query.q,
         year: query.year,
+        recentDays: query.recentDays,
         cast: query.tmdbPerformer,
         company: query.tmdbStudio,
         includeTags: query.include,

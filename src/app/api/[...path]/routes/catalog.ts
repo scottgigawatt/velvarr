@@ -561,7 +561,8 @@ export async function browseRoute(
         movieSource: "tpdb" as const,
         perPage: limit,
         sort:
-          parsedQuery.sort === "trending"
+          parsedQuery.sort === "trending" ||
+          parsedQuery.sort === "recent-popular"
             ? ("trending" as const)
             : parsedQuery.sort === "relevance"
               ? undefined

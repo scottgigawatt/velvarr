@@ -1,6 +1,11 @@
 import {
+  recentPopularWindow,
+  RECENT_POPULAR_DAYS,
+  RECENT_POPULAR_REGION,
+} from "../lib/tmdb-discovery.ts";
+import {
   previewLimitError,
-  trendingLimitError,
+  recentPopularLimitError,
   type CatalogScanBudget,
 } from "./catalog-budget.ts";
 // TMDB movie reads only. Search pages stay lightweight; details are fetched on demand.
@@ -20,7 +25,8 @@ export type TmdbQuery = {
   kind: "movie";
   query?: string;
   year?: number;
-  sort?: "relevance" | "recency" | "popularity" | "trending";
+  sort?: "relevance" | "recency" | "popularity" | "recent-popular" | "trending";
+  recentDays?: number;
   cast?: string;
   company?: string;
   includeTags?: CatalogTagSelection[];
@@ -94,6 +100,43 @@ function movie(
   };
 }
 
+// Resolve published keyword identities instead of guessing IDs or trusting the adult flag.
+export const DEFAULT_ADULT_KEYWORDS = [
+  "pornography",
+  "pornographic film",
+  "gay pornography",
+  "lesbian pornography",
+  "hardcore pornography",
+  "softcore pornography",
+  "hentai",
+  "adult",
+] as const;
+const adultKeywordMemo = new WeakMap<Read, { at: number; ids: string[] }>();
+
+async function adultKeywordIds(read: Read): Promise<string[]> {
+  const cached = adultKeywordMemo.get(read);
+  if (cached && Date.now() - cached.at < 3600000) return cached.ids;
+  const matches = await Promise.all(
+    DEFAULT_ADULT_KEYWORDS.map(async (name) =>
+      (await searchTmdbKeywords(read, name))
+        .filter(
+          (keyword) =>
+            normalizeFacetName(keyword.name) === normalizeFacetName(name),
+        )
+        .map((keyword) => keyword.id),
+    ),
+  );
+  const ids = [...new Set(matches.flat())];
+  if (!ids.length)
+    throw new AppError(
+      503,
+      "tmdb_adult_keywords_unavailable",
+      "TMDB did not return the adult-media keyword catalog. No unfiltered movie list was substituted.",
+    );
+  adultKeywordMemo.set(read, { at: Date.now(), ids });
+  return ids;
+}
+
 /** Bounded native pages, never a catalog download. Filtered totals stay unknown. */
 export async function searchTmdb(
   read: Read,
@@ -109,6 +152,19 @@ export async function searchTmdb(
         "Invalid TMDB cast or company ID.",
       );
   }
+  // Legacy TMDB Trending links now use the disclosed recent-popular query.
+  if (query.sort === "trending") query = { ...query, sort: "recent-popular" };
+  if (
+    query.recentDays !== undefined &&
+    !(RECENT_POPULAR_DAYS as readonly number[]).includes(query.recentDays)
+  )
+    throw new AppError(
+      400,
+      "invalid_search",
+      "Recent popularity window must be 30, 90, or 365 days.",
+    );
+  const recent = query.sort === "recent-popular";
+  const window = recent ? recentPopularWindow(query.recentDays) : undefined;
   const page = query.page ?? 1,
     perPage = query.perPage ?? 24;
   if (
@@ -139,7 +195,9 @@ export async function searchTmdb(
     );
   if (
     query.sort &&
-    !["relevance", "recency", "popularity", "trending"].includes(query.sort)
+    !["relevance", "recency", "popularity", "recent-popular"].includes(
+      query.sort,
+    )
   )
     throw new AppError(400, "invalid_search", "Unsupported TMDB sort.");
   if (!q && query.sort === "relevance")
@@ -160,13 +218,13 @@ export async function searchTmdb(
         key:
           query.sort === "popularity"
             ? ("popularity" as const)
-            : query.sort === "trending"
-              ? ("trending" as const)
+            : query.sort === "recent-popular"
+              ? ("recent-popular" as const)
               : ("recency" as const),
         direction: query.direction ?? "desc",
         upstream:
-          query.sort === "trending"
-            ? "trending.week"
+          query.sort === "recent-popular"
+            ? "popularity." + (query.direction ?? "desc")
             : (query.sort === "popularity"
                 ? "popularity."
                 : "primary_release_date.") + (query.direction ?? "desc"),
@@ -176,13 +234,11 @@ export async function searchTmdb(
     language: "en-US",
   });
   if (q) params.set("query", q.slice(0, 500));
-  else if (query.sort !== "trending")
-    params.set("sort_by", appliedSort.upstream);
+  else params.set("sort_by", appliedSort.upstream);
   if (query.year !== undefined) {
     if (!Number.isInteger(query.year) || query.year < 1900 || query.year > 2100)
       throw new AppError(400, "invalid_search", "Invalid TMDB release year.");
-    if (query.sort !== "trending")
-      params.set("primary_release_year", String(query.year));
+    params.set("primary_release_year", String(query.year));
   }
   const genreData = await read<Row>("/3/genre/movie/list?language=en-US");
   if (!Array.isArray(genreData.genres))
@@ -198,7 +254,7 @@ export async function searchTmdb(
         : [],
     ),
   );
-  if (!q && query.sort !== "trending") {
+  if (!q) {
     if (query.cast) params.set("with_cast", query.cast);
     if (query.company) params.set("with_companies", query.company);
   }
@@ -214,17 +270,27 @@ export async function searchTmdb(
     query.releaseDate ||
     query.cast ||
     query.company ||
-    (query.sort === "trending" && query.year !== undefined),
+    recent,
   );
-  const nativeKeywords = !q && query.sort !== "trending";
-  if (nativeKeywords && includes.length && includes.every((tag) => tag.tmdb))
-    params.set("with_keywords", includes.map((tag) => tag.tmdb).join(","));
+  const nativeKeywords = !q;
+  const nativeIncludes = includes.flatMap((tag) =>
+    tag.tmdb ? [tag.tmdb] : [],
+  );
+  const adultIds = recent ? await adultKeywordIds(read) : [];
+  if (nativeKeywords && nativeIncludes.length)
+    params.set("with_keywords", nativeIncludes.join(","));
+  else if (recent) params.set("with_keywords", adultIds.join("|"));
+  if (window) {
+    params.set("region", RECENT_POPULAR_REGION);
+    params.set("release_date.gte", window.start);
+    params.set("release_date.lte", window.end);
+  }
   if (nativeKeywords && excludes.some((tag) => tag.tmdb))
     params.set(
       "without_keywords",
       excludes.flatMap((tag) => (tag.tmdb ? [tag.tmdb] : [])).join(","),
     );
-  if (!q && query.sort !== "trending" && query.releaseDate) {
+  if (!q && query.releaseDate) {
     const { cutoff, operation } = query.releaseDate;
     if (["=", ">=", ">"].includes(operation))
       params.set("primary_release_date.gte", cutoff);
@@ -250,11 +316,7 @@ export async function searchTmdb(
       );
     params.set("page", String(nativePage));
     const data = await read<Row>(
-      (query.sort === "trending"
-        ? "/3/trending/movie/week"
-        : `/3/${q ? "search" : "discover"}/movie`) +
-        "?" +
-        params,
+      `/3/${q ? "search" : "discover"}/movie` + "?" + params,
     );
     if (
       !Array.isArray(data.results) ||
@@ -281,13 +343,8 @@ export async function searchTmdb(
         );
       return [d];
     });
-    // Trending ignores discover parameters, so year filtering stays local.
-    if (query.sort === "trending" && query.year !== undefined) {
-      candidates = candidates.filter(
-        (detail) => detail.releaseDate?.slice(0, 4) === String(query.year),
-      );
-    }
-    if ((q || query.sort === "trending") && (query.cast || query.company)) {
+    // Discover applies regional release dates; rows expose the primary date, which may differ.
+    if (q && (query.cast || query.company)) {
       const qualified = await Promise.all(
         candidates.map(async (detail) => {
           let metadata: Row;
@@ -332,7 +389,7 @@ export async function searchTmdb(
         (detail): detail is CatalogDetail => detail !== null,
       );
     }
-    if (includes.length || excludes.length) {
+    if (includes.length || excludes.length || recent) {
       const tagged = await Promise.all(
         candidates.map(async (detail) => {
           let keywords: Row;
@@ -360,9 +417,11 @@ export async function searchTmdb(
         .filter((detail): detail is CatalogDetail => detail !== null)
         .filter(
           (detail) =>
+            (!recent || detail.tags.some((tag) => adultIds.includes(tag.id))) &&
             includes.every((tag) =>
               tagMatches(detail, tag, tag.tmdb ? "exact" : "substring"),
-            ) && !excludes.some((tag) => tagMatches(detail, tag, "family")),
+            ) &&
+            !excludes.some((tag) => tagMatches(detail, tag, "family")),
         );
     }
     if (query.releaseDate) {
@@ -406,7 +465,7 @@ export async function searchTmdb(
         ...(!filtered && Number(data.total_pages) <= 500 ? { total } : {}),
       };
   }
-  if (query.scanBudget || query.sort === "trending")
+  if (query.scanBudget || query.sort === "recent-popular")
     return {
       provider: "tmdb",
       kind: "movie",
@@ -417,8 +476,8 @@ export async function searchTmdb(
       hasMore: false,
       totalCountKnown: false,
       errors: [
-        query.sort === "trending"
-          ? trendingLimitError()
+        query.sort === "recent-popular"
+          ? recentPopularLimitError()
           : previewLimitError("tmdb"),
       ],
     };

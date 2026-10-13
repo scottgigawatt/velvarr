@@ -14,12 +14,12 @@ export function previewLimitError(provider: CatalogProvider): SourceError {
   };
 }
 
-/** Trending can filter only TMDB's weekly list, not discover the full catalog. */
-export function trendingLimitError(): SourceError {
+/** A limited recent-release query preserves matches and suggests a wider window. */
+export function recentPopularLimitError(): SourceError {
   return {
     provider: "tmdb",
     code: "scan_ceiling",
     message:
-      "This search reached its limit while filtering TMDB's weekly trending list. Any matches found are shown. Use Popularity or Release recency to search the full movie catalog with these filters.",
+      "This filtered recent-release search reached its limit. Any matches found are shown. Expand the release window or adjust your content keywords.",
   };
 }

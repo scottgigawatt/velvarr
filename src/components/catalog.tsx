@@ -1,5 +1,7 @@
 "use client";
 
+import { RECENT_POPULAR_DAYS } from "../lib/tmdb-discovery.ts";
+
 import {
   useCallback,
   useEffect,
@@ -723,6 +725,7 @@ function parseTags(v: string | null): CatalogTagSelection[] {
  * state under endless scroll. An outage is an error, never an empty page. */
 function browsePath(f: {
   movieSource?: "tpdb" | "tmdb";
+  recentDays?: string;
   preferredTags?: string | null;
   tmdbPerformer?: string | null;
   tmdbStudio?: string | null;
@@ -745,6 +748,7 @@ function browsePath(f: {
 }): string {
   const qs = new URLSearchParams();
   if (f.type !== "all") qs.set("type", f.type);
+  if (f.recentDays) qs.set("recentDays", f.recentDays);
   if (f.preferredTags === "0" || f.preferredTags === "1")
     qs.set("preferredTags", f.preferredTags);
   if (f.tmdbPerformer) qs.set("tmdbPerformer", f.tmdbPerformer);
@@ -887,6 +891,8 @@ function SingleTitlesView() {
   // Anything that is not movie/scene reads as the `all` default.
   const type = typeRaw === "movie" || typeRaw === "scene" ? typeRaw : "all";
   const movieSource = params.get("movieSource") === "tmdb" ? "tmdb" : "tpdb";
+  const recentDays = params.get("recentDays") ?? "30";
+  const nextRecentDays = recentDays === "30" ? "90" : "365";
   const preferredTags = params.get("preferredTags");
   const tmdbPerformer = params.get("tmdbPerformer");
   const tmdbStudio = params.get("tmdbStudio");
@@ -922,9 +928,13 @@ function SingleTitlesView() {
     movieSource === "tmdb" && type === "movie"
       ? q
         ? (["relevance"] as const)
-        : (["recency", "popularity", "trending"] as const)
+        : (["recency", "popularity", "recent-popular"] as const)
       : browseSortsFor(type);
-  const sortRaw = params.get("sort") ?? "";
+  const rawSort = params.get("sort") ?? "";
+  const sortRaw =
+    movieSource === "tmdb" && rawSort === "trending"
+      ? "recent-popular"
+      : rawSort;
   const sort = (sorts as readonly string[]).includes(sortRaw) ? sortRaw : "";
   const dirRaw = params.get("direction") ?? "";
   const direction =
@@ -988,6 +998,7 @@ function SingleTitlesView() {
       browsePath({
         type,
         movieSource,
+        recentDays,
         preferredTags,
         tmdbPerformer,
         tmdbStudio,
@@ -1010,6 +1021,7 @@ function SingleTitlesView() {
     [
       type,
       movieSource,
+      recentDays,
       preferredTags,
       tmdbPerformer,
       tmdbStudio,
@@ -1543,6 +1555,15 @@ function SingleTitlesView() {
           />
         )}
 
+        {type === "movie" &&
+          movieSource === "tmdb" &&
+          sort === "recent-popular" && (
+            <RecentPopularControls
+              value={recentDays}
+              onChange={(value) => setP({ recentDays: value }, { push: true })}
+            />
+          )}
+
         {chips.length > 0 && (
           <div className="mt-3 flex flex-wrap items-center gap-2">
             <span className="text-xs text-muted">Filters:</span>
@@ -1571,24 +1592,30 @@ function SingleTitlesView() {
               {acc.errors.map((e) =>
                 e.code === "scan_ceiling" &&
                 e.provider === "tmdb" &&
-                sort === "trending" ? (
+                sort === "recent-popular" ? (
                   <div
                     key={e.provider}
                     className="panel p-4 text-sm text-muted"
                     role="note"
                   >
                     <p>{e.message}</p>
-                    <button
-                      className="btn mt-2"
-                      onClick={() =>
-                        setP(
-                          { sort: "popularity", direction: "desc" },
-                          { push: true },
-                        )
-                      }
-                    >
-                      Browse matching movies by popularity
-                    </button>
+                    {recentDays !== "365" && (
+                      <button
+                        className="btn mt-2"
+                        onClick={() =>
+                          setP(
+                            {
+                              sort: "recent-popular",
+                              recentDays: nextRecentDays,
+                              direction: "desc",
+                            },
+                            { push: true },
+                          )
+                        }
+                      >
+                        Expand release window to {nextRecentDays} days
+                      </button>
+                    )}
                   </div>
                 ) : e.code === "scan_ceiling" ? (
                   // The source answered every scanned page and hit the
@@ -1797,6 +1824,37 @@ function SingleTitlesView() {
   );
 }
 
+function RecentPopularControls({
+  value,
+  onChange,
+}: {
+  value: string;
+  onChange: (value: string) => void;
+}) {
+  return (
+    <div className="panel p-4 mt-3">
+      <p className="field-help">
+        US releases with adult-media keywords, ranked by TMDB popularity. Your
+        TMDB tags narrow the results.
+      </p>
+      <label className="label">
+        Recent release window
+        <select
+          className="input"
+          value={value}
+          onChange={(event) => onChange(event.target.value)}
+        >
+          {RECENT_POPULAR_DAYS.map((days) => (
+            <option key={days} value={days}>
+              Last {days} days
+            </option>
+          ))}
+        </select>
+      </label>
+    </div>
+  );
+}
+
 function MovieProviderSwitch({
   source,
   onChange,
@@ -1867,6 +1925,7 @@ function GroupedTitlesView() {
   const query = new URLSearchParams({ grouped: "1" });
   for (const key of [
     "movieSource",
+    "recentDays",
     "q",
     "year",
     "include",
@@ -1896,6 +1955,8 @@ function GroupedTitlesView() {
     if (tags.length) query.set(key, JSON.stringify(tags));
     else query.delete(key);
   }
+  if (source === "tmdb" && query.get("sort") === "trending")
+    query.set("sort", "recent-popular");
   const path = "/api/browse?" + query;
   const page = useApiGet<{
     groups: BrowseGroup[];
@@ -1932,7 +1993,7 @@ function GroupedTitlesView() {
     source === "tmdb"
       ? q
         ? []
-        : (["recency", "trending", "popularity"] as const)
+        : (["recency", "recent-popular", "popularity"] as const)
       : (["recency", "duration"] as const);
   const toType = (type: "all" | "movie" | "scene") =>
     patch({ type: type === "all" ? null : type, sort: null, direction: null });
@@ -1942,6 +2003,10 @@ function GroupedTitlesView() {
     values.delete("rowLimit");
     values.set("view", "titles");
     values.set("type", group.type);
+    if (group.type === "scene" && values.get("sort") === "recent-popular") {
+      values.set("sort", "trending");
+      values.delete("recentDays");
+    }
     for (const key of ["include", "exclude"]) {
       const tags = scopeBrowseTags(
         parseTags(values.get(key)),
@@ -1995,6 +2060,12 @@ function GroupedTitlesView() {
           })
         }
       />
+      {source === "tmdb" && query.get("sort") === "recent-popular" && (
+        <RecentPopularControls
+          value={params.get("recentDays") ?? "30"}
+          onChange={(value) => patch({ recentDays: value })}
+        />
+      )}
       <div className="browse-search-bar">
         <SearchBox
           id="all-titles-q"
@@ -2008,7 +2079,7 @@ function GroupedTitlesView() {
           Sort
           <select
             className="input"
-            value={params.get("sort") ?? ""}
+            value={query.get("sort") ?? ""}
             onChange={(event) =>
               patch({
                 sort: event.target.value || null,
@@ -2094,21 +2165,32 @@ function GroupedTitlesView() {
                 {group.errors?.map((error, index) =>
                   error.code === "scan_ceiling" &&
                   group.source === "tmdb" &&
-                  params.get("sort") === "trending" ? (
+                  query.get("sort") === "recent-popular" ? (
                     <div
                       key={index}
                       className="panel p-4 text-sm text-muted"
                       role="note"
                     >
                       <p>{error.message}</p>
-                      <button
-                        className="btn mt-2"
-                        onClick={() =>
-                          patch({ sort: "popularity", direction: "desc" })
-                        }
-                      >
-                        Browse matching movies by popularity
-                      </button>
+                      {params.get("recentDays") !== "365" && (
+                        <button
+                          className="btn mt-2"
+                          onClick={() =>
+                            patch({
+                              sort: "recent-popular",
+                              recentDays:
+                                params.get("recentDays") === "90"
+                                  ? "365"
+                                  : "90",
+                              direction: "desc",
+                            })
+                          }
+                        >
+                          Expand release window to{" "}
+                          {params.get("recentDays") === "90" ? "365" : "90"}{" "}
+                          days
+                        </button>
+                      )}
                     </div>
                   ) : (
                     <ErrorPanel key={index} message={error.message} />
@@ -2339,7 +2421,7 @@ function TmdbFacetPicker({
       )}
       <p className="field-help">
         TMDB {kind === "performer" ? "cast" : "production-company"} filter.
-        Search and trending matches are checked against movie details.
+        Title-search matches are checked against movie details.
       </p>
     </div>
   );

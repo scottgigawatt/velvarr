@@ -36,12 +36,13 @@ test("sortSpec: the implemented spec, undefined when nobody serves it", () => {
 test("SORT_KEYS: every implemented key once, in table order", () => {
   assert.deepEqual(SORT_KEYS, [
     "popularity",
-    "trending",
+    "recent-popular",
     "relevance",
     "recency",
     "duration",
     "title",
     "date",
+    "trending",
     "created",
     "updated",
   ]);
@@ -94,6 +95,7 @@ test("SORT_LABELS: the client-facing strings; recency is never called trending",
     title: "Title",
     date: "Release date",
     trending: "Trending",
+    "recent-popular": "Recent popular",
     popularity: "Popularity",
     created: "Recently added (StashDB)",
     updated: "Last updated (StashDB)",

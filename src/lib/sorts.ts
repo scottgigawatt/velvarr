@@ -8,7 +8,7 @@
 import type { CatalogKind, CatalogProvider } from "./contracts.ts";
 
 /** Normalized sort vocabulary. Only orders the providers genuinely
- * implement appear here; the page surfaces the exact upstream order that
+ * implement, plus explicitly labeled discovery modes, appear here; the page surfaces the exact upstream order that
  * was applied. */
 export type SortKey =
   | "relevance"
@@ -18,6 +18,7 @@ export type SortKey =
   | "date"
   | "trending"
   | "popularity"
+  | "recent-popular"
   | "created"
   | "updated";
 
@@ -34,7 +35,7 @@ export const SORT_CAPABILITIES: Readonly<
   tmdb: {
     movie: [
       { key: "popularity", directional: true },
-      { key: "trending", directional: false },
+      { key: "recent-popular", directional: true },
       { key: "relevance", directional: false },
       { key: "recency", directional: true },
     ],
@@ -140,6 +141,7 @@ export const SORT_LABELS: Record<SortKey, string> = {
   date: "Release date",
   trending: "Trending",
   popularity: "Popularity",
+  "recent-popular": "Recent popular",
   created: "Recently added (StashDB)",
   updated: "Last updated (StashDB)",
 };
