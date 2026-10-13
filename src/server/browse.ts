@@ -1,3 +1,5 @@
+import { previewLimitError, type CatalogScanBudget } from "./catalog-budget.ts";
+import type { TmdbQuery } from "./tmdb.ts";
 // User-visible catalog composition: one Browse destination over TPDB movies
 // and StashDB scenes, with personal hidden tags and tag include/exclude
 // filters layered on top of provider-native search. The metadata cache in
@@ -16,8 +18,10 @@
 // never a fake empty page or fake end — narrow the filters. One exception:
 // a multi-term free-text AND split between a native tag criterion and the
 // local re-check degrades to a named partial page instead
-// (Stream.softCeiling). Raise MAX_SCAN_PAGES only when real browsing
-// measurably needs it.
+// (Stream.softCeiling). A second: a side whose free-text expansion is
+// provably empty (complete freshness-bounded listing, no match, no
+// uuid-less rows) answers exact zero before any scan. Raise
+// MAX_SCAN_PAGES only when real browsing measurably needs it.
 
 // Stryker disable all — the mutation window re-opens below the parse/adapters
 // block and covers the pure merge/plan logic only (mergeStreams, nativeQuery,
@@ -31,13 +35,13 @@ import {
   listCatalogTags,
   searchCatalog,
   searchCatalogTags,
-  tagCounterpart,
   expandCatalogTagTerm,
 } from "./providers.ts";
 import {
   resolveIncludeCriteria,
   scanCeilingOutcome,
   softCeilingFor,
+  TAG_FILTER_ID_CAP,
   type TagExpansion,
 } from "../lib/browse-includes.ts";
 import type {
@@ -53,6 +57,9 @@ import {
   CATALOG_YEAR_MAX,
   CATALOG_YEAR_MIN,
   normalizeFacetName,
+  tagAppliesToProvider,
+  tagSelectionKey,
+  isCatalogId,
 } from "../lib/contracts.ts";
 import { BROWSE_MIXED_SORTS, SORT_KEYS, sortSpec } from "../lib/sorts.ts";
 import type {
@@ -72,8 +79,10 @@ export type BrowseType = "all" | "movie" | "scene";
 export type BrowseQuery = {
   type: BrowseType;
   movieSource?: "tpdb" | "tmdb";
-  adultOnly?: boolean;
+  tmdbPerformer?: string;
+  tmdbStudio?: string;
   q?: string;
+  recentDays?: number;
   include: CatalogTagSelection[];
   exclude: CatalogTagSelection[];
   studioTpdb?: string;
@@ -190,6 +199,11 @@ export function parseBrowseQuery(params: URLSearchParams): BrowseQuery {
   if (direction !== undefined && sort === undefined) {
     throw invalidQuery("direction requires an explicit sort.");
   }
+  for (const key of ["tmdbPerformer", "tmdbStudio"]) {
+    const value = params.get(key);
+    if (value !== null && !isCatalogId("tmdb", value))
+      throw invalidQuery("Invalid TMDB cast or company ID.");
+  }
   const date = params.get("date")?.trim() ?? "";
   const dateOperation = parseEnum(
     params.get("date_operation"),
@@ -238,6 +252,12 @@ export function parseBrowseQuery(params: URLSearchParams): BrowseQuery {
   );
   return {
     type: type ?? "all",
+    ...(params.get("tmdbPerformer")
+      ? { tmdbPerformer: params.get("tmdbPerformer")! }
+      : {}),
+    ...(params.get("tmdbStudio")
+      ? { tmdbStudio: params.get("tmdbStudio")! }
+      : {}),
     ...(params.has("movieSource")
       ? {
           movieSource: parseEnum(
@@ -247,13 +267,10 @@ export function parseBrowseQuery(params: URLSearchParams): BrowseQuery {
           ),
         }
       : {}),
-    ...(params.has("adultOnly")
-      ? {
-          adultOnly:
-            parseEnum(params.get("adultOnly"), ["0", "1"], "adultOnly") === "1",
-        }
-      : {}),
     ...(q !== undefined && q !== "" ? { q } : {}),
+    ...(params.has("recentDays")
+      ? { recentDays: Number(params.get("recentDays")) }
+      : {}),
     include: parseSelections(params, "include"),
     // Both lists accept labels with no provider id: an include label is a
     // free-text term that expands on each side's published tags — the
@@ -292,7 +309,11 @@ export function parseBrowseQuery(params: URLSearchParams): BrowseQuery {
  * resolution and the visible predicate must agree on it, or a free-text
  * include 400s or disqualifies a side again. */
 function isFreeTextSelection(sel: CatalogTagSelection): boolean {
-  return sel.tpdb === undefined && sel.stashdb === undefined;
+  return (
+    sel.tpdb === undefined &&
+    sel.stashdb === undefined &&
+    sel.tmdb === undefined
+  );
 }
 
 function visiblePredicate(
@@ -308,9 +329,11 @@ function visiblePredicate(
     if (exclude.some((sel) => tagMatches(d, sel, "family"))) return false;
     if (
       include.length > 0 &&
-      !include.every((sel) =>
-        tagMatches(d, sel, isFreeTextSelection(sel) ? "substring" : "exact"),
-      )
+      !include
+        .filter((sel) => tagAppliesToProvider(sel, d.reference.provider))
+        .every((sel) =>
+          tagMatches(d, sel, isFreeTextSelection(sel) ? "substring" : "exact"),
+        )
     ) {
       return false;
     }
@@ -326,13 +349,15 @@ function visiblePredicate(
  * criterion — a title satisfying the term AND must carry each of these
  * tags), `anyOf` the smallest free-text expansion (any-of criterion — a
  * valid pre-filter only, sent when no singleton or anchored id exists and
- * the expansion is complete and fits the native id cap). `localFree`
- * holds the free-text terms the visible predicate must still re-check
- * locally: several terms AND together, which one upstream tag criterion
- * cannot express. */
+ * the expansion is complete and fits the native id cap). `localInclude`
+ * holds the selections the visible predicate must still re-check locally:
+ * free-text terms (several AND together, which one upstream tag
+ * criterion cannot express). Picked tags never resolve on another provider.
+ * `localFree` contains only free-text terms for the soft scan ceiling. */
 type ResolvedIncludes = {
   allOf: string[];
   anyOf: string[];
+  localInclude: CatalogTagSelection[];
   localFree: CatalogTagSelection[];
   /** True when at least one free-text term rides the native tag criterion
    * (a singleton expansion in `allOf`, or the `anyOf` group): at the scan
@@ -341,26 +366,10 @@ type ResolvedIncludes = {
   freeTextNative: boolean;
 };
 
-/** Resolves the native include criteria for one provider side. Anchored
- * selections resolve as before: a selection already carrying the side's
- * UUID uses it; otherwise the counterpart id is resolved through the
- * providers' own published label pairing, and an unresolvable anchored tag
- * — including a uuid-less match (TPDB numeric-string id) — disqualifies the
- * whole side (undefined) — it is NEVER allowed to run unfiltered.
- * Free-text includes expand on THIS side's complete published tag listing
- * (expandCatalogTagTerm), anchored ids or not. Every term's expansion must
- * be complete and native — no capped walk, no uuid-less rows — before
- * anything free travels: a partial criterion would silently drop titles,
- * and an empty expansion is never proof the side is empty, so the side is
- * never skipped for one; anything incomplete keeps the WHOLE free group on
- * the local substring re-check with the side's approximate totals. Of a
- * complete group set, the most selective valid pre-filter travels: every
- * singleton group joins the anchored ids in the all-of criterion (an AND
- * match must carry each of those tags), and with no singleton and no
- * anchored id the smallest group rides alone as any-of while the other
- * terms keep filtering locally. A lookup that fails
- * throws; browseTitles records the side as a failed source instead of
- * reading the outage as absence. */
+/** Resolve native IDs only on the provider they were selected from.
+ * Label-only terms expand against this provider's own published tags.
+ * A complete fresh listing with no matching tag proves this side empty;
+ * an incomplete listing or uuid-less match keeps the local check. */
 async function includeIdsForSide(
   selections: CatalogTagSelection[],
   side: "tpdb" | "stashdb",
@@ -374,25 +383,21 @@ async function includeIdsForSide(
       if (!allOf.includes(direct)) allOf.push(direct);
       continue;
     }
-    if (!isFreeTextSelection(sel)) {
-      // tagCounterpart searches the OTHER provider by exact normalized
-      // label.
-      const counterpart = await tagCounterpart(
-        side === "tpdb" ? "stashdb" : "tpdb",
-        sel.name,
-      );
-      if (counterpart === undefined) return undefined;
-      if (!allOf.includes(counterpart.id)) allOf.push(counterpart.id);
-      continue;
-    }
+    if (!isFreeTextSelection(sel)) continue;
     free.push(sel);
   }
   if (free.length === 0 || !expandFree) {
-    return { allOf, anyOf: [], localFree: free, freeTextNative: false };
+    return {
+      allOf,
+      anyOf: [],
+      localInclude: free,
+      localFree: free,
+      freeTextNative: false,
+    };
   }
   // Every term expands before the decision: the tag listing behind
   // expandCatalogTagTerm is memoized, so reading every term costs no extra
-  // upstream traffic, and complete term indexes keep localFree aligned
+  // upstream traffic, and complete term indexes keep localInclude aligned
   // with the caller's selections. The ride-local-or-native decision
   // itself lives in resolveIncludeCriteria.
   const expansions: TagExpansion[] = [];
@@ -400,9 +405,15 @@ async function includeIdsForSide(
     expansions.push(await expandCatalogTagTerm(side, sel.name));
   }
   const criteria = resolveIncludeCriteria(allOf, expansions);
+  // Grounded absence (complete fresh listing, no uuid-less match, empty
+  // ids): the side is skipped — exact zero via the plans.length === 0
+  // path when no side survives — instead of a 40-page unfiltered scan
+  // ending in query_too_broad. An All browse keeps the surviving side.
+  if (criteria.provablyEmpty) return undefined;
   return {
     allOf: criteria.allOf,
     anyOf: criteria.anyOf,
+    localInclude: criteria.localTermIndexes.map((i) => free[i]!),
     localFree: criteria.localTermIndexes.map((i) => free[i]!),
     freeTextNative: criteria.freeTextNative,
   };
@@ -471,6 +482,7 @@ class Stream {
    * because the native pre-filter kept the scanned pages productive and
    * the matches found are a real partial answer. */
   readonly softCeiling: boolean;
+  private readonly scanBudget?: CatalogScanBudget;
   private page = 0;
   private fetches = 0;
   private readonly base: CatalogSearchQuery;
@@ -483,12 +495,14 @@ class Stream {
     perPage: number,
     localFiltered: boolean,
     softCeiling = false,
+    scanBudget?: CatalogScanBudget,
   ) {
     this.base = base;
     this.visible = visible;
     this.perPage = perPage;
     this.localFiltered = localFiltered;
     this.softCeiling = softCeiling;
+    this.scanBudget = scanBudget;
   }
 
   get live(): boolean {
@@ -507,7 +521,12 @@ class Stream {
   async fetch(): Promise<void> {
     if (!this.live) return;
     this.fetches += 1;
-    if (this.fetches > MAX_SCAN_PAGES) {
+    if (this.fetches > (this.scanBudget?.maxPages ?? MAX_SCAN_PAGES)) {
+      if (this.scanBudget) {
+        this.exhausted = true;
+        this.error = previewLimitError(this.base.provider);
+        return;
+      }
       const ceiling = scanCeilingOutcome(this.softCeiling, this.base.provider);
       if (ceiling.hard) {
         throw new AppError(
@@ -975,6 +994,7 @@ export async function browseTitles(
   query: BrowseQuery,
   hiddenTags: CatalogTagSelection[],
   starredPerformerIds: string[] = [],
+  scanBudget?: CatalogScanBudget,
 ): Promise<BrowsePage> {
   if (query.movieSource === "tmdb" && query.type !== "scene") {
     if (
@@ -984,30 +1004,52 @@ export async function browseTitles(
       query.studioTpdb ||
       query.studioStashdb ||
       query.performerStarred ||
-      query.date ||
-      query.include.length ||
-      query.exclude.length
+      false
     )
       throw invalidQuery(
-        "TMDB movie search supports title, year, and adult-only filters. Clear the other filters first.",
+        "TMDB supports title, year, date, and keywords. Performer and studio filters are unavailable.",
       );
-    if (query.sort && query.sort !== "relevance" && query.sort !== "recency")
-      throw invalidQuery("TMDB supports relevance or release recency.");
+    if (
+      query.sort &&
+      ![
+        "relevance",
+        "recency",
+        "popularity",
+        "recent-popular",
+        "trending",
+      ].includes(query.sort)
+    )
+      throw invalidQuery(
+        "TMDB supports relevance, release date, popularity, or recent popularity.",
+      );
     const result = await searchVisibleCatalog(
       {
         provider: "tmdb",
         kind: "movie",
         query: query.q,
         year: query.year,
-        adultOnly: query.adultOnly,
-        sort: query.sort,
-        direction: query.direction,
+        recentDays: query.recentDays,
+        cast: query.tmdbPerformer,
+        company: query.tmdbStudio,
+        includeTags: query.include,
+        excludeTags: [...query.exclude, ...hiddenTags],
+        ...(query.date
+          ? {
+              releaseDate: {
+                cutoff: query.date,
+                operation: query.dateOperation!,
+              },
+            }
+          : {}),
+        sort: query.sort as TmdbQuery["sort"],
+        direction: query.sort === "trending" ? undefined : query.direction,
         page: query.page,
         perPage: query.perPage,
       },
-      hiddenTags,
+      [], // TMDB receives hidden tags as exclusions in the same bounded scan.
+      scanBudget,
     );
-    return { ...result, errors: [] };
+    return { ...result, errors: result.errors ?? [] };
   }
   const plan = planBrowseSides(query);
   if (query.performerStarred === true && starredPerformerIds.length === 0) {
@@ -1061,6 +1103,7 @@ export async function browseTitles(
     excludeIds: string[];
     localFiltered: boolean;
     localInclude: CatalogTagSelection[];
+    localFree: CatalogTagSelection[];
     localYear?: number;
     performerIds?: string[];
   }[] = [];
@@ -1078,11 +1121,13 @@ export async function browseTitles(
       freeTextNative: tpdbIncludes.freeTextNative,
       excludeIds: [], // TPDB has no native exclude criterion
       localFiltered:
-        hiddenTags.length > 0 ||
-        query.exclude.length > 0 ||
-        tpdbIncludes.localFree.length > 0 ||
-        (filmography && query.include.length > 0),
-      localInclude: filmography ? query.include : tpdbIncludes.localFree,
+        hiddenTags.some((tag) => tagAppliesToProvider(tag, "tpdb")) ||
+        query.exclude.some((tag) => tagAppliesToProvider(tag, "tpdb")) ||
+        tpdbIncludes.localInclude.length > 0 ||
+        (filmography &&
+          query.include.some((tag) => tagAppliesToProvider(tag, "tpdb"))),
+      localInclude: filmography ? query.include : tpdbIncludes.localInclude,
+      localFree: filmography ? query.include : tpdbIncludes.localFree,
       localYear: undefined,
     });
   }
@@ -1102,15 +1147,18 @@ export async function browseTitles(
       // native. Selections without a StashDB id stay local-only below.
       excludeIds: includesNative
         ? []
-        : query.exclude
+        : [...query.exclude, ...(scanBudget ? hiddenTags : [])]
             .map((sel) => sel.stashdb)
-            .filter((id): id is string => id !== undefined),
+            .filter((id): id is string => id !== undefined)
+            // Keep excess and label-family exclusions in the local predicate.
+            .slice(0, TAG_FILTER_ID_CAP),
       localFiltered:
-        hiddenTags.length > 0 ||
-        query.exclude.length > 0 ||
-        stashIncludes.localFree.length > 0 ||
+        hiddenTags.some((tag) => tagAppliesToProvider(tag, "stashdb")) ||
+        query.exclude.some((tag) => tagAppliesToProvider(tag, "stashdb")) ||
+        stashIncludes.localInclude.length > 0 ||
         query.year !== undefined,
-      localInclude: stashIncludes.localFree,
+      localInclude: stashIncludes.localInclude,
+      localFree: stashIncludes.localFree,
       localYear: query.year,
       performerIds:
         query.performerStarred === true ? starredPerformerIds : undefined,
@@ -1185,7 +1233,11 @@ export async function browseTitles(
         ),
         query.perPage,
         plan.localFiltered,
-        softCeilingFor(plan),
+        softCeilingFor({
+          localInclude: plan.localFree,
+          freeTextNative: plan.freeTextNative,
+        }),
+        scanBudget,
       ),
   );
   streams.push(...unresolved);
@@ -1207,7 +1259,19 @@ export async function browseTitles(
 export async function searchVisibleCatalog(
   query: CatalogSearchQuery,
   hiddenTags: CatalogTagSelection[],
+  scanBudget?: CatalogScanBudget,
 ): Promise<CatalogSearchPage> {
+  hiddenTags = hiddenTags.filter((tag) =>
+    tagAppliesToProvider(tag, query.provider),
+  );
+  // TMDB already filters keywords/adult/date while scanning native pages.
+  // A second visible-page fill loop could multiply the scan budget.
+  if (query.provider === "tmdb")
+    return searchCatalog({
+      ...query,
+      excludeTags: [...(query.excludeTags ?? []), ...hiddenTags],
+      ...(scanBudget ? { scanBudget } : {}),
+    });
   if (
     hiddenTags.length === 0 ||
     (query.kind !== "movie" && query.kind !== "scene")
@@ -1221,13 +1285,15 @@ export async function searchVisibleCatalog(
     (d) => !isHiddenTitle(d, hiddenTags),
     perPage,
     true, // hidden filtering is always local
+    false,
+    scanBudget,
   );
   const start = (requestedPage - 1) * perPage;
   // `live` (not `open`): a stream holding buffered rows but no continuation
   // must end the fill, otherwise this spins on a no-op fetch.
   while (stream.buffer.length < start + perPage && stream.live) {
     await stream.fetch();
-    if (stream.error !== undefined) {
+    if (stream.error !== undefined && stream.error.code !== "scan_ceiling") {
       throw new AppError(502, stream.error.code, stream.error.message);
     }
   }
@@ -1241,22 +1307,24 @@ export async function searchVisibleCatalog(
     // Exhausted but holding rows past this page: the surplus is still
     // pageable (mergeStreams requires the same empty-buffer proof).
     hasMore: !exhausted || stream.buffer.length > start + perPage,
-    ...(exhausted
+    ...(exhausted && !stream.error
       ? { total: stream.buffer.length, totalCountKnown: true }
       : { totalCountKnown: false }),
     items: stream.buffer.slice(start, start + perPage),
+    ...(stream.error ? { errors: [stream.error] } : {}),
   };
 }
 
 // --- unified tag picker search ---
 
-/** Both providers searched in parallel; selections group by the existing
- * exact normalized label rule, carrying each provider's native id. Missing
+/** Both providers searched in parallel; selections retain
+ * their provider identity even when labels are identical. Missing
  * sources and partial failures come back as errors — never silently dropped.
  * When no provider matches and a TypeSafe key exists, the existing judged
  * suggestion path proposes real provider tags (never invented ones). */
 export async function searchBrowseTags(
   term: string,
+  selectedProvider?: CatalogProvider,
 ): Promise<BrowseTagsResponse> {
   const q = term.trim();
   if (q.length < 2) {
@@ -1266,13 +1334,15 @@ export async function searchBrowseTags(
       "Enter at least 2 characters to search.",
     );
   }
-  const providers: CatalogProvider[] = ["tpdb", "stashdb"];
+  const providers: CatalogProvider[] = selectedProvider
+    ? [selectedProvider]
+    : ["tpdb", "stashdb"];
   const settled = await Promise.allSettled(
     providers.map((p) => searchCatalogTags(p, q)),
   );
   const errors: SourceError[] = [];
   const tags: CatalogTagSelection[] = [];
-  const byLabel = new Map<string, CatalogTagSelection>();
+  const seen = new Set<string>();
   for (let i = 0; i < settled.length; i++) {
     const result = settled[i]!;
     const provider = providers[i]!;
@@ -1287,21 +1357,22 @@ export async function searchBrowseTags(
       if (provider === "tpdb" && !isUuid(row.id)) continue;
       const label = normalizeFacetName(row.name);
       if (label === "") continue;
-      const existing = byLabel.get(label);
-      if (existing === undefined) {
-        const selection: CatalogTagSelection = { name: row.name };
-        if (provider === "tpdb") selection.tpdb = row.id;
-        else selection.stashdb = row.id;
-        byLabel.set(label, selection);
+      const selection: CatalogTagSelection = {
+        name: row.name,
+        [provider]: row.id,
+      };
+      const key = tagSelectionKey(selection);
+      if (!seen.has(key)) {
+        seen.add(key);
         tags.push(selection);
-      } else if (provider === "tpdb" && existing.tpdb === undefined) {
-        existing.tpdb = row.id;
-      } else if (provider === "stashdb" && existing.stashdb === undefined) {
-        existing.stashdb = row.id;
       }
     }
   }
-  if (tags.length === 0 && errors.length < providers.length) {
+  if (
+    selectedProvider !== "tmdb" &&
+    tags.length === 0 &&
+    errors.length < providers.length
+  ) {
     try {
       const settings = getConfig()?.providers;
       if (judgmentConfigured(settings)) {
@@ -1331,11 +1402,7 @@ export async function searchBrowseTags(
           if (candidate.provider === "tpdb") selection.tpdb = candidate.id;
           else selection.stashdb = candidate.id;
           if (
-            !tags.some(
-              (t) =>
-                normalizeFacetName(t.name) ===
-                normalizeFacetName(candidate.name),
-            )
+            !tags.some((t) => tagSelectionKey(t) === tagSelectionKey(selection))
           ) {
             tags.push(selection);
           }

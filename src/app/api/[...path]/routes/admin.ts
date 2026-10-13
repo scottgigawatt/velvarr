@@ -1,3 +1,4 @@
+import { httpAllowed, isLoopbackHost } from "../../../../server/http.ts";
 import { whisparrConnections } from "../../../../server/whisparr-targets.ts";
 import {
   readJson,
@@ -42,6 +43,7 @@ import { getWhisparrStatus } from "../../../../server/whisparr.ts";
 
 export function integrationsShape(config: IntegrationConfig) {
   return {
+    allowHttp: config.allowHttp ?? httpAllowed(),
     jellyfin: {
       url: config.jellyfin.url,
       externalUrl: config.jellyfin.externalUrl,
@@ -189,13 +191,14 @@ export function nextProviderCredentials(
   if (
     judgmentProvider !== undefined &&
     judgmentProvider !== "" &&
+    judgmentProvider !== "none" &&
     judgmentProvider !== "typesafe" &&
     judgmentProvider !== "ollama"
   ) {
     throw new AppError(
       400,
       "invalid_field",
-      "Judgment provider must be typesafe or ollama.",
+      "Judgment provider must be none, typesafe, or ollama.",
     );
   }
   if (ollamaModel && !/^[A-Za-z0-9][A-Za-z0-9._:/-]*$/.test(ollamaModel)) {
@@ -450,6 +453,32 @@ export async function adminUpdateIntegrations(
   // sends just its fields, and re-validating the Jellyfin connection would
   // make provider keys uneditable whenever Jellyfin is briefly down.
   const bodyKeys = Object.keys(body);
+  if (bodyKeys.length === 1 && bodyKeys[0] === "allowHttp") {
+    if (typeof body.allowHttp !== "boolean")
+      throw new AppError(400, "invalid_field", "allowHttp must be a boolean");
+    if (!body.allowHttp) {
+      const urls = [
+        ctx.config.jellyfin.url,
+        ctx.config.jellyfin.externalUrl,
+        ...whisparrConnections(ctx.config).map((connection) => connection.url),
+        ctx.config.providers?.ollamaUrl,
+      ].filter((url): url is string => Boolean(url));
+      if (
+        urls.some((value) => {
+          const url = new URL(value);
+          return url.protocol === "http:" && !isLoopbackHost(url.hostname);
+        })
+      )
+        throw new AppError(
+          409,
+          "http_in_use",
+          "A saved connection still uses private HTTP. Change its URL to HTTPS before disabling this option.",
+        );
+    }
+    const patched = { ...ctx.config, allowHttp: body.allowHttp };
+    saveConfig(patched);
+    return json(integrationsShape(patched));
+  }
   if (
     bodyKeys.length > 0 &&
     bodyKeys.every((k) =>
@@ -547,6 +576,37 @@ export async function adminProviders(_ctx: AuthContext): Promise<Response> {
   return json({ providers: [tpdb, stashdb, tmdb] });
 }
 
+export async function whisparrConnectionStatuses(
+  ctx: AuthContext,
+): Promise<Response> {
+  const instances = await Promise.all(
+    whisparrConnections(ctx.config).map(async (connection) => {
+      try {
+        const status = await getWhisparrStatus({
+          ...ctx.config,
+          whisparr: connection,
+        });
+        return {
+          instanceId: connection.instanceId,
+          name: connection.name,
+          url: connection.url,
+          ...status,
+        };
+      } catch (error) {
+        if (!(error instanceof AppError)) throw error;
+        return {
+          instanceId: connection.instanceId,
+          name: connection.name,
+          url: connection.url,
+          configured: true,
+          error: { code: error.code, message: error.message },
+        };
+      }
+    }),
+  );
+  return json({ instances });
+}
+
 function connectionShapes(config: IntegrationConfig) {
   return whisparrConnections(config).map(({ apiKey, ...c }) => ({
     ...c,
@@ -640,6 +700,36 @@ import type { RouteDef } from "../admission.ts";
 export const routes: RouteDef[] = [
   {
     method: "GET",
+    segments: ["admin", "providers", ":provider"],
+    auth: "admin",
+    run: async (_ctx, _request, params) => {
+      if (!["tpdb", "tmdb", "stashdb"].includes(params.provider ?? ""))
+        throw new AppError(400, "invalid_query", "Unknown provider");
+      try {
+        return json(
+          await getProviderStatus(
+            params.provider as "tpdb" | "tmdb" | "stashdb",
+          ),
+        );
+      } catch (error) {
+        if (!(error instanceof AppError)) throw error;
+        return json({
+          provider: params.provider,
+          configured: true,
+          verified: false,
+          error: { code: error.code, message: error.message },
+        });
+      }
+    },
+  },
+  {
+    method: "GET",
+    segments: ["admin", "whisparr", "statuses"],
+    auth: "admin",
+    run: async (ctx) => whisparrConnectionStatuses(ctx),
+  },
+  {
+    method: "GET",
     segments: ["admin", "users"],
     auth: "admin",
     run: async (ctx) => adminUsers(ctx),
@@ -682,9 +772,18 @@ export const routes: RouteDef[] = [
           "target_not_found",
           "Whisparr connection not found.",
         );
-      return json(
-        await getWhisparrStatus({ ...ctx.config, whisparr: connection }),
-      );
+      try {
+        return json({
+          ...(await getWhisparrStatus({ ...ctx.config, whisparr: connection })),
+          url: connection.url,
+        });
+      } catch (error) {
+        if (!(error instanceof AppError)) throw error;
+        return json({
+          configured: true,
+          error: { code: error.code, message: error.message },
+        });
+      }
     },
   },
   {

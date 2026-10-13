@@ -1,3 +1,4 @@
+import { DISCOVER_SCAN_BUDGET } from "../src/server/catalog-budget.ts";
 // Browse-service regression tests: isolated 127.0.0.1 HTTP fixtures only.
 // No real network, no source-text asserts — every case drives browseTitles /
 // searchVisibleCatalog / searchBrowseTags / parseBrowseQuery against a
@@ -173,6 +174,18 @@ function scriptedUpstream(options: {
   /** Rows for the StashDB queryTags listing (the complete tag vocabulary
    * the free-text expansion walks). */
   stashQueryTagRows?: { id: string; name: string }[];
+  /** Paged TPDB /tags listing for the expansion walk: entry i answers
+   * `page=i+1`; past the last entry the last repeats (an upstream that
+   * genuinely continues). Term'd counterpart reads keep the single-page
+   * shape. The array is read per request, so a test may mutate it between
+   * walks the way a published vocabulary changes while the app stays up. */
+  tpdbTagPages?: TpdbPage[];
+  /** Paged StashDB queryTags listing for the expansion walk: entry i
+   * answers `page=i+1`; past the last entry the last repeats. */
+  stashQueryTagPages?: {
+    count: number;
+    rows: { id: string; name: string }[];
+  }[];
   /** TPDB site-key (uuid or slug) -> numeric site id, for /sites/<key>. */
   siteIds?: Record<string, number>;
   /** Query string of each TPDB /tags read (expansion walks carry no term;
@@ -198,6 +211,15 @@ function scriptedUpstream(options: {
       const qs = queryOf(req.url ?? "");
       options.onTagsRequest?.(qs);
       const q = qs.get("q");
+      // The term-less listing walk serves its scripted pages; the term'd
+      // counterpart read keeps the single-page shape below.
+      if (!q && options.tpdbTagPages) {
+        const page = Number(qs.get("page") ?? "1");
+        const entry =
+          options.tpdbTagPages[page - 1] ?? options.tpdbTagPages.at(-1)!;
+        sendJson(res, 200, { data: entry.rows, links: { next: entry.next } });
+        return;
+      }
       const rows = q
         ? options.tagRows.filter((t) =>
             t.name.toLowerCase().includes(q.toLowerCase()),
@@ -255,7 +277,7 @@ function scriptedUpstream(options: {
       }
       const gql = JSON.parse(body) as {
         query: string;
-        variables: { f?: Record<string, unknown>; t?: string };
+        variables: { f?: Record<string, unknown>; t?: string; p?: number };
       };
       if (gql.query.includes("queryScenes")) {
         options.onScenesRequest?.(gql.variables.f ?? {});
@@ -273,6 +295,18 @@ function scriptedUpstream(options: {
       // walks: every row, with its count (the fixture vocabulary fits one
       // page).
       if (gql.query.includes("queryTags")) {
+        // The listing walk serves its scripted pages; past the last entry
+        // the last repeats.
+        if (options.stashQueryTagPages) {
+          const page = Number(gql.variables.p ?? 1);
+          const entry =
+            options.stashQueryTagPages[page - 1] ??
+            options.stashQueryTagPages.at(-1)!;
+          sendJson(res, 200, {
+            data: { queryTags: { count: entry.count, tags: entry.rows } },
+          });
+          return;
+        }
         const rows = options.stashQueryTagRows ?? [];
         sendJson(res, 200, {
           data: { queryTags: { count: rows.length, tags: rows } },
@@ -597,130 +631,96 @@ test("browse All merges movies and scenes by release recency with native AND inc
   );
 });
 
-// --- missing counterpart disqualifies the source; never unfiltered ---
+// --- picked includes constrain only their own provider ---
 
-test("an include without a resolvable StashDB id drops the scene source instead of running it unfiltered", async () => {
-  const TPDB_TAG = { id: 11, uuid: uuid(101), name: "Unpaired" };
-  const sceneCalls: number[] = [];
-  await runBrowse(
-    scriptedUpstream({
-      tagRows: [TPDB_TAG],
-      moviePages: [
-        {
-          rows: [tpdbRow(uuid(1), "Only Movie", "2024-01-01", [TPDB_TAG])],
-          next: null,
-          total: 1,
+for (const searchTagStatus of [200, 500]) {
+  test(`a TPDB include leaves scenes unconstrained without a counterpart lookup (${searchTagStatus})`, async () => {
+    const tag = { id: 11, uuid: uuid(101), name: "Selected" };
+    const sceneInputs: Record<string, unknown>[] = [];
+    await runBrowse(
+      scriptedUpstream({
+        tagRows: [tag],
+        stashTagRows: [{ id: uuid(201), name: "Selected" }],
+        searchTagStatus,
+        moviePages: [
+          {
+            rows: [tpdbRow(uuid(1), "Matched movie", "2024-01-01", [tag])],
+            next: null,
+            total: 1,
+          },
+        ],
+        scenes: {
+          count: 1,
+          rows: [stashRow(uuid(3), "Unrelated scene", "2024-06-01")],
         },
-      ],
-      scenes: {
-        count: 5,
-        rows: [stashRow(uuid(3), "Unfiltered?", "2024-06-01")],
-      },
-      onScenesRequest: () => sceneCalls.push(1),
-    }),
-    async () => {
-      const page = await browseTitles(
-        {
-          type: "all",
-          include: [{ name: "Unpaired", tpdb: TPDB_TAG.uuid }],
-          exclude: [],
-          studioMode: "exact",
-          page: 1,
-          perPage: 10,
-        },
-        [],
-      );
-      // searchTag ran (counterpart lookup) but queryScenes never did.
-      assert.equal(sceneCalls.length, 0);
-      assert.deepEqual(
-        page.items.map((d) => d.reference.provider),
-        ["tpdb"],
-      );
-      assert.equal(page.totalCountKnown, true);
-    },
-  );
-});
-
-// --- a broken counterpart lookup is an outage, never absence ---
-
-test("a failed StashDB tag search keeps the movie page but names the outage instead of an exact TPDB-only total", async () => {
-  const TPDB_TAG = { id: 11, uuid: uuid(101), name: "Unpaired" };
-  const sceneCalls: number[] = [];
-  await runBrowse(
-    scriptedUpstream({
-      tagRows: [TPDB_TAG],
-      moviePages: [
-        {
-          rows: [tpdbRow(uuid(1), "Only Movie", "2024-01-01", [TPDB_TAG])],
-          next: null,
-          total: 1,
-        },
-      ],
-      scenes: {
-        count: 5,
-        rows: [stashRow(uuid(3), "Unqueried", "2024-06-01")],
-      },
-      searchTagStatus: 500,
-      onScenesRequest: () => sceneCalls.push(1),
-    }),
-    async () => {
-      const page = await browseTitles(
-        {
-          type: "all",
-          include: [{ name: "Unpaired", tpdb: TPDB_TAG.uuid }],
-          exclude: [],
-          studioMode: "exact",
-          page: 1,
-          perPage: 10,
-        },
-        [],
-      );
-      // The scene side is dropped (never run unfiltered) and its outage is
-      // named beside the movie results that did survive.
-      assert.equal(sceneCalls.length, 0);
-      assert.deepEqual(
-        page.items.map((d) => d.reference.provider),
-        ["tpdb"],
-      );
-      assert.equal(page.errors.length, 1);
-      assert.equal(page.errors[0]!.provider, "stashdb");
-      assert.equal(page.errors[0]!.code, "upstream_unavailable");
-      // A wanted side is dark: the surviving side's count is not the
-      // catalog total, so it must not read as exact.
-      assert.equal(page.totalCountKnown, false);
-    },
-  );
-});
-
-test("when every wanted side's include lookup fails, browse is a 502 instead of an exact empty catalog", async () => {
-  await runBrowse(
-    scriptedUpstream({
-      tagRows: [],
-      tpdbTagsStatus: 500,
-      searchTagStatus: 500,
-      moviePages: [{ rows: [], next: null, total: 0 }],
-      scenes: { count: 0, rows: [] },
-    }),
-    async () => {
-      // Each selection anchors only the other side, so both sides need a
-      // counterpart lookup and both lookups are down.
-      await assert.rejects(
-        browseTitles(
+        onScenesRequest: (input) => sceneInputs.push(input),
+      }),
+      async () => {
+        const page = await browseTitles(
           {
             type: "all",
-            include: [
-              { name: "Only Stash", stashdb: uuid(201) },
-              { name: "Only Tpdb", tpdb: uuid(101) },
-            ],
+            include: [{ name: "Selected", tpdb: tag.uuid }],
             exclude: [],
             studioMode: "exact",
             page: 1,
             perPage: 10,
           },
           [],
-        ),
-        appError(502, "provider_unavailable"),
+        );
+        assert.deepEqual(
+          page.items.map((item) => item.reference.provider),
+          ["stashdb", "tpdb"],
+        );
+        assert.equal(sceneInputs.length, 1);
+        assert.equal(sceneInputs[0]!.tags, undefined);
+        assert.equal(page.total, 2);
+        assert.equal(page.totalCountKnown, true);
+        assert.deepEqual(page.errors, []);
+      },
+    );
+  });
+}
+
+test("a TMDB include leaves both TPDB and StashDB streams unconstrained", async () => {
+  const movieQueries: string[] = [];
+  const sceneInputs: Record<string, unknown>[] = [];
+  await runBrowse(
+    scriptedUpstream({
+      tagRows: [],
+      tpdbTagsStatus: 500,
+      searchTagStatus: 500,
+      moviePages: [
+        {
+          rows: [tpdbRow(uuid(1), "Unrelated movie", "2024-01-01")],
+          next: null,
+          total: 1,
+        },
+      ],
+      scenes: {
+        count: 1,
+        rows: [stashRow(uuid(3), "Unrelated scene", "2024-06-01")],
+      },
+      onMovieRequest: (_page, qs) => movieQueries.push(qs.toString()),
+      onScenesRequest: (input) => sceneInputs.push(input),
+    }),
+    async () => {
+      const page = await browseTitles(
+        {
+          type: "all",
+          include: [{ name: "Selected", tmdb: "44" }],
+          exclude: [],
+          studioMode: "exact",
+          page: 1,
+          perPage: 10,
+        },
+        [],
       );
+      assert.equal(page.items.length, 2);
+      assert.equal(movieQueries.length, 1);
+      assert.ok(!movieQueries[0]!.includes("tags"));
+      assert.equal(sceneInputs[0]!.tags, undefined);
+      assert.deepEqual(page.errors, []);
+      assert.equal(page.totalCountKnown, true);
     },
   );
 });
@@ -800,6 +800,7 @@ test("resolveIncludeCriteria joins singleton expansions with anchored ids in the
       anyOf: [],
       localTermIndexes: [1],
       freeTextNative: true,
+      provablyEmpty: false,
     },
   );
   // Anchored ids alone: the all-of path with nothing free riding native.
@@ -810,6 +811,7 @@ test("resolveIncludeCriteria joins singleton expansions with anchored ids in the
       anyOf: [],
       localTermIndexes: [0],
       freeTextNative: false,
+      provablyEmpty: false,
     },
   );
   // A singleton duplicating an anchored id travels once.
@@ -835,6 +837,7 @@ test("resolveIncludeCriteria rides the smallest group as any-of and keeps the re
       anyOf: [uuid(4), uuid(5)],
       localTermIndexes: [0],
       freeTextNative: true,
+      provablyEmpty: false,
     },
   );
   // Equal-size groups keep the first: the smallest pick is stable.
@@ -869,6 +872,7 @@ test("resolveIncludeCriteria routes a union past the native id cap to local filt
       anyOf: [],
       localTermIndexes: [0],
       freeTextNative: false,
+      provablyEmpty: false,
     },
   );
   // The same overload with an anchored id: the anchored id still travels
@@ -887,6 +891,7 @@ test("resolveIncludeCriteria routes a union past the native id cap to local filt
       anyOf: [],
       localTermIndexes: [0],
       freeTextNative: false,
+      provablyEmpty: false,
     },
   );
   // No terms at all: nothing rides, nothing re-checks — the function is
@@ -896,6 +901,7 @@ test("resolveIncludeCriteria routes a union past the native id cap to local filt
     anyOf: [],
     localTermIndexes: [],
     freeTextNative: false,
+    provablyEmpty: false,
   });
 });
 
@@ -903,7 +909,6 @@ test("resolveIncludeCriteria keeps the whole group local when any term expands i
   for (const bad of [
     { complete: false, dropped: false, ids: [uuid(2)] }, // capped listing walk
     { complete: true, dropped: true, ids: [uuid(2)] }, // uuid-less match
-    { complete: true, dropped: false, ids: [] }, // empty: never proof of absence
   ]) {
     assert.deepEqual(
       resolveIncludeCriteria([uuid(9)], [ready([uuid(1)]), bad]),
@@ -912,6 +917,7 @@ test("resolveIncludeCriteria keeps the whole group local when any term expands i
         anyOf: [],
         localTermIndexes: [0, 1],
         freeTextNative: false,
+        provablyEmpty: false,
       },
     );
   }
@@ -921,7 +927,63 @@ test("resolveIncludeCriteria keeps the whole group local when any term expands i
     anyOf: [],
     localTermIndexes: [],
     freeTextNative: false,
+    provablyEmpty: false,
   });
+});
+
+test("resolveIncludeCriteria reads a complete empty expansion as a provably empty side", () => {
+  // A complete, fresh listing walk (card 926308ec bounds the listing's
+  // age) that holds no tag for the term and no uuid-less match grounds
+  // the absence: no published tag contains the term, so no title can
+  // carry it and the AND can never match on this side.
+  assert.deepEqual(
+    resolveIncludeCriteria([], [{ complete: true, dropped: false, ids: [] }]),
+    {
+      allOf: [],
+      anyOf: [],
+      localTermIndexes: [0],
+      freeTextNative: false,
+      provablyEmpty: true,
+    },
+  );
+  // Anchored ids change nothing: the AND still cannot match; the anchored
+  // ids still travel the inert allOf field.
+  assert.deepEqual(
+    resolveIncludeCriteria(
+      [uuid(9)],
+      [{ complete: true, dropped: false, ids: [] }],
+    ),
+    {
+      allOf: [uuid(9)],
+      anyOf: [],
+      localTermIndexes: [0],
+      freeTextNative: false,
+      provablyEmpty: true,
+    },
+  );
+  // One absent term among several kills the whole AND, whichever slot it
+  // sits in: the other terms' expansions cannot rescue it.
+  assert.equal(
+    resolveIncludeCriteria(
+      [],
+      [{ complete: true, dropped: false, ids: [] }, ready([uuid(3)])],
+    ).provablyEmpty,
+    true,
+  );
+  assert.equal(
+    resolveIncludeCriteria(
+      [],
+      [ready([uuid(3)]), { complete: true, dropped: false, ids: [] }],
+    ).provablyEmpty,
+    true,
+  );
+  // uuid-less matches exist, so titles could still carry the term on this
+  // side: not absence — the local scan stays.
+  assert.equal(
+    resolveIncludeCriteria([], [{ complete: true, dropped: true, ids: [] }])
+      .provablyEmpty,
+    false,
+  );
 });
 
 test("softCeilingFor degrades only a native free-text term that still re-checks locally", () => {
@@ -1034,7 +1096,7 @@ test("a free-text include expands on each provider's tags and travels as a nativ
   );
 });
 
-test("a free-text term that expands on no TPDB tag still scans the movie side locally instead of skipping it", async () => {
+test("a free-text term that expands on no TPDB tag drops the movie side and keeps the scene side", async () => {
   const STASH_XYZ = uuid(201);
   let moviesCalled = 0;
   const movieUrls: string[] = [];
@@ -1075,18 +1137,19 @@ test("a free-text term that expands on no TPDB tag still scans the movie side lo
         },
         [],
       );
-      // An empty expansion is never proof the side is empty: the movie side
-      // runs with no native tag criterion and really scans, its local
-      // substring predicate dropping the untagged row. (The old behavior
-      // skipped the side and answered an exact zero with no upstream read.)
-      // The scene side carries its expansion natively.
-      assert.equal(moviesCalled, 1);
-      assert.doesNotMatch(movieUrls[0]!, /tags%5B|tags\[/);
+      // Moved pin: this test held that "an empty expansion is never proof
+      // the side is empty" — the movie side scanned unfiltered while its
+      // local predicate dropped every row, costing up to 40 /movies reads
+      // per page view. The complete freshness-bounded TPDB listing (card
+      // 926308ec) grounds the absence: no published tag contains the
+      // term, so the movie side is provably empty and skipped before any
+      // /movies read. The scene side carries its expansion natively.
+      assert.equal(moviesCalled, 0);
+      assert.deepEqual(movieUrls, []);
       assert.deepEqual(
         page.items.map((d) => d.reference.provider),
         ["stashdb"],
       );
-      // Exact only because the movie scan truly exhausted its listing.
       assert.equal(page.total, 1);
       assert.equal(page.totalCountKnown, true);
       assert.deepEqual(page.errors, []);
@@ -1273,34 +1336,501 @@ test("a 30-tag StashDB expansion filters the scene side locally instead of sendi
   );
 });
 
-test("an empty expansion on an endless scene source stays a named 422, never a provably-empty page", async () => {
+// --- the expansion walk: paging, the row cap, and the memo's age ---
+
+test("the TPDB expansion walk reads past page one and a later page's tag travels native", async () => {
+  const TAG_XYZ = { id: 11, uuid: uuid(101), name: "XYZ Special" };
+  let tagPageReads = 0;
+  const movieUrls: string[] = [];
   await runBrowse(
     scriptedUpstream({
-      // No tag anywhere contains the term: the expansion is complete and
-      // empty, which proves nothing — the scene side scans.
+      // Page 2 holds the only tag matching the term: a walk that stops
+      // after page one never finds it.
+      tagRows: [],
+      tpdbTagPages: [
+        {
+          rows: [{ id: 20, uuid: uuid(200), name: "Unrelated" }],
+          next: "https://tpdb.example/tags?page=2",
+          total: 0,
+        },
+        { rows: [TAG_XYZ], next: null, total: 0 },
+      ],
+      moviePages: [
+        {
+          rows: [tpdbRow(uuid(1), "Movie Foo", "2024-02-01", [TAG_XYZ])],
+          next: null,
+          total: 1,
+        },
+      ],
+      scenes: { count: 0, rows: [] },
+      onTagsRequest: (qs) => {
+        if (!qs.get("q")) tagPageReads += 1;
+      },
+      onMovieRequest: (_page, qs) => movieUrls.push(qs.toString()),
+    }),
+    async () => {
+      const page = await browseTitles(
+        {
+          type: "movie",
+          include: [{ name: "xyz" }],
+          exclude: [],
+          studioMode: "exact",
+          page: 1,
+          perPage: 10,
+        },
+        [],
+      );
+      // The walk ran to the end signal (two pages) and the page-2 tag
+      // rides the native all-of criterion with exact provider totals.
+      assert.equal(tagPageReads, 2);
+      assert.match(movieUrls[0]!, /tags%5B11%5D=1|tags\[11\]=1/);
+      assert.match(movieUrls[0]!, /tag_and=1/);
+      assert.equal(page.totalCountKnown, true);
+    },
+  );
+});
+
+test("the StashDB expansion walk reads past page one and a later page's tag travels native", async () => {
+  const STASH_XYZ = uuid(201);
+  const fillers = Array.from({ length: 100 }, (_, i) => ({
+    id: uuid(2000 + i),
+    name: `Unrelated ${i + 1}`,
+  }));
+  const tailFillers = Array.from({ length: 49 }, (_, i) => ({
+    id: uuid(3000 + i),
+    name: `Tail ${i + 1}`,
+  }));
+  const scenesSeen: Record<string, unknown>[] = [];
+  await runBrowse(
+    scriptedUpstream({
+      tagRows: [],
+      // The provider claims 150 tags over two pages; page 2 holds the only
+      // tag matching the term.
+      stashQueryTagPages: [
+        { count: 150, rows: fillers },
+        {
+          count: 150,
+          rows: [{ id: STASH_XYZ, name: "XYZ Thing" }, ...tailFillers],
+        },
+      ],
+      moviePages: [{ rows: [], next: null, total: 0 }],
+      scenes: {
+        count: 1,
+        rows: [
+          stashRow(uuid(1), "Scene Foo", "2024-06-01", [
+            { id: STASH_XYZ, name: "XYZ Thing" },
+          ]),
+        ],
+      },
+      onScenesRequest: (input) => scenesSeen.push(input),
+    }),
+    async () => {
+      const page = await browseTitles(
+        {
+          type: "scene",
+          include: [{ name: "xyz" }],
+          exclude: [],
+          studioMode: "exact",
+          page: 1,
+          perPage: 10,
+        },
+        [],
+      );
+      // The page-2 tag rides the native INCLUDES_ALL criterion; a walk
+      // that stopped after page one would have scanned locally instead.
+      assert.deepEqual(scenesSeen[0]!.tags, {
+        value: [STASH_XYZ],
+        modifier: "INCLUDES_ALL",
+      });
+      assert.equal(page.total, 1);
+      assert.equal(page.totalCountKnown, true);
+    },
+  );
+});
+
+test("a rows-less StashDB page before count keeps the expansion local", async () => {
+  const STASH_XYZ = uuid(201);
+  const fillers = Array.from({ length: 99 }, (_, i) => ({
+    id: uuid(2000 + i),
+    name: `Unrelated ${i + 1}`,
+  }));
+  const scenesSeen: Record<string, unknown>[] = [];
+  await runBrowse(
+    scriptedUpstream({
+      tagRows: [],
+      // The provider claims 150 tags but sends a rows-less page after the
+      // first hundred: 50 published rows are missing, so the walk is
+      // incomplete — the same rule as TPDB's rows-less page beside a next
+      // link.
+      stashQueryTagPages: [
+        {
+          count: 150,
+          rows: [{ id: STASH_XYZ, name: "XYZ Thing" }, ...fillers],
+        },
+        { count: 150, rows: [] },
+      ],
+      moviePages: [{ rows: [], next: null, total: 0 }],
+      scenes: {
+        count: 1,
+        rows: [
+          stashRow(uuid(1), "Scene Foo", "2024-06-01", [
+            { id: STASH_XYZ, name: "XYZ Thing" },
+          ]),
+        ],
+      },
+      onScenesRequest: (input) => scenesSeen.push(input),
+    }),
+    async () => {
+      const page = await browseTitles(
+        {
+          type: "scene",
+          include: [{ name: "xyz" }],
+          exclude: [],
+          studioMode: "exact",
+          page: 1,
+          perPage: 10,
+        },
+        [],
+      );
+      // Incomplete: the tag must not ride a native union under
+      // claimed-exact totals — the side scans locally and keeps the scene.
+      assert.equal(scenesSeen[0]!.tags, undefined);
+      assert.deepEqual(
+        page.items.map((d) => d.title),
+        ["Scene Foo"],
+      );
+    },
+  );
+});
+
+test("an endless TPDB listing caps the walk and never sends the capped tag native", async () => {
+  const TAG_XYZ = { id: 11, uuid: uuid(101), name: "XYZ Special" };
+  let tagPageReads = 0;
+  const movieUrls: string[] = [];
+  await runBrowse(
+    scriptedUpstream({
+      // Every page repeats: the listing never ends. 100 rows a page, so
+      // the walk must stop at the 5000-row cap after 50 reads and report
+      // the expansion incomplete.
+      tagRows: [],
+      tpdbTagPages: [
+        {
+          rows: [
+            TAG_XYZ,
+            ...Array.from({ length: 99 }, (_, i) => ({
+              id: 200 + i,
+              uuid: uuid(2000 + i),
+              name: `Unrelated ${i + 1}`,
+            })),
+          ],
+          next: "https://tpdb.example/tags?page=2",
+          total: 0,
+        },
+      ],
+      moviePages: [
+        {
+          rows: [tpdbRow(uuid(1), "Movie Foo", "2024-02-01", [TAG_XYZ])],
+          next: null,
+          total: 1,
+        },
+      ],
+      scenes: { count: 0, rows: [] },
+      onTagsRequest: (qs) => {
+        if (!qs.get("q")) tagPageReads += 1;
+      },
+      onMovieRequest: (_page, qs) => movieUrls.push(qs.toString()),
+    }),
+    async () => {
+      const page = await browseTitles(
+        {
+          type: "movie",
+          include: [{ name: "xyz" }],
+          exclude: [],
+          studioMode: "exact",
+          page: 1,
+          perPage: 10,
+        },
+        [],
+      );
+      // 50 reads = the 5000-row cap at 100 rows a page (hardcoded, like
+      // the cache windows in tests/api.test.ts: swapping the cap in
+      // src/server/providers.ts fails this test).
+      assert.equal(tagPageReads, 50);
+      // Capped: complete is false, so XYZ never rides a native criterion —
+      // the side scans locally and keeps the tagged movie (the fixture's
+      // movie listing truly exhausts, so its totals stay exact).
+      assert.doesNotMatch(movieUrls[0]!, /tags%5B|tags\[/);
+      assert.deepEqual(
+        page.items.map((d) => d.title),
+        ["Movie Foo"],
+      );
+    },
+  );
+});
+
+test("a capped TPDB walk keeps the hard ceiling on an endless movie source", async () => {
+  const TAG_XYZ = { id: 11, uuid: uuid(101), name: "XYZ Special" };
+  await runBrowse(
+    scriptedUpstream({
+      // Endless tag listing: the walk caps at 5000 rows, incomplete.
+      tagRows: [],
+      tpdbTagPages: [
+        {
+          rows: [
+            TAG_XYZ,
+            ...Array.from({ length: 99 }, (_, i) => ({
+              id: 200 + i,
+              uuid: uuid(2000 + i),
+              name: `Unrelated ${i + 1}`,
+            })),
+          ],
+          next: "https://tpdb.example/tags?page=2",
+          total: 0,
+        },
+      ],
+      // Endless movie pages: the local scan hits the documented ceiling. A
+      // single-term local AND keeps the hard ceiling, so the named 422 is
+      // the answer — never an exact-sounding partial page.
+      moviePages: [
+        {
+          rows: [tpdbRow(uuid(1), "Movie Foo", "2024-02-01", [TAG_XYZ])],
+          next: "x",
+          total: 10000,
+        },
+      ],
+      scenes: { count: 0, rows: [] },
+    }),
+    async () => {
+      // Early pages still fill (the endless source yields a match on every
+      // page), so the test asks a page the scan cannot reach: the merge
+      // must pull past the documented 40-page ceiling, where a single-term
+      // local AND keeps the hard ceiling — the named 422 is the answer,
+      // never an exact-sounding partial page.
+      await assert.rejects(
+        browseTitles(
+          {
+            type: "movie",
+            include: [{ name: "xyz" }],
+            exclude: [],
+            studioMode: "exact",
+            page: 5,
+            perPage: 10,
+          },
+          [],
+        ),
+        appError(422, "query_too_broad"),
+      );
+    },
+  );
+});
+
+test("a capped StashDB walk keeps the hard ceiling on an endless scene source", async () => {
+  const STASH_XYZ = uuid(201);
+  await runBrowse(
+    scriptedUpstream({
+      tagRows: [],
+      // Endless listing per the provider's own count: the walk caps at
+      // 5000 rows, incomplete.
+      stashQueryTagPages: [
+        {
+          count: 1_000_000,
+          rows: [
+            { id: STASH_XYZ, name: "XYZ Thing" },
+            ...Array.from({ length: 99 }, (_, i) => ({
+              id: uuid(2000 + i),
+              name: `Unrelated ${i + 1}`,
+            })),
+          ],
+        },
+      ],
+      moviePages: [{ rows: [], next: null, total: 0 }],
+      scenes: {
+        count: 100000,
+        rows: [
+          stashRow(uuid(9), "Scene Foo", "2024-06-01", [
+            { id: STASH_XYZ, name: "XYZ Thing" },
+          ]),
+        ],
+      },
+    }),
+    async () => {
+      // Early pages still fill (the endless source yields a match on every
+      // page), so the test asks a page the scan cannot reach: the hard
+      // ceiling is the answer, never an exact-sounding partial page.
+      await assert.rejects(
+        browseTitles(
+          {
+            type: "scene",
+            include: [{ name: "xyz" }],
+            exclude: [],
+            studioMode: "exact",
+            page: 5,
+            perPage: 10,
+          },
+          [],
+        ),
+        appError(422, "query_too_broad"),
+      );
+    },
+  );
+});
+
+test("the memoized tag listing expires and the re-walk picks up newly published tags", async () => {
+  const TAG_A = { id: 11, uuid: uuid(101), name: "Foo A" };
+  const TAG_B = { id: 12, uuid: uuid(102), name: "Foo B" };
+  // The listing the fixture serves mutates between walks, the way a
+  // published vocabulary changes while the app container stays up.
+  const tagPages: TpdbPage[] = [{ rows: [TAG_A], next: null, total: 0 }];
+  let tagPageReads = 0;
+  const movieUrls: string[] = [];
+  const realNow = Date.now;
+  let now = 1_700_000_000_000;
+  try {
+    Date.now = () => now;
+    await runBrowse(
+      scriptedUpstream({
+        tagRows: [],
+        tpdbTagPages: tagPages,
+        moviePages: [
+          {
+            rows: [
+              tpdbRow(uuid(1), "Movie A", "2024-01-01", [TAG_A]),
+              tpdbRow(uuid(2), "Movie B", "2024-02-01", [TAG_B]),
+            ],
+            next: null,
+            total: 2,
+          },
+        ],
+        scenes: { count: 0, rows: [] },
+        onTagsRequest: (qs) => {
+          if (!qs.get("q")) tagPageReads += 1;
+        },
+        onMovieRequest: (_page, qs) => movieUrls.push(qs.toString()),
+      }),
+      async () => {
+        const query = {
+          type: "movie" as const,
+          include: [{ name: "foo" }],
+          exclude: [],
+          studioMode: "exact" as const,
+          page: 1,
+          perPage: 10,
+        };
+        // First walk: Foo A only, riding the native criterion.
+        await browseTitles(query, []);
+        assert.equal(tagPageReads, 1);
+        assert.match(movieUrls[0]!, /tags%5B11%5D=1|tags\[11\]=1/);
+        assert.doesNotMatch(movieUrls[0]!, /tags%5B12%5D|tags\[12\]/);
+        // Eleven minutes in: the 10-minute page cache has expired, so any
+        // upstream read would show — but the listing memo (one hour) still
+        // answers, and no tag page is read. The identical query may also
+        // skip the movie read only while the page cache lives, so the
+        // assertion counts tag pages, not movie reads.
+        now += 11 * 60_000;
+        await browseTitles(query, []);
+        assert.equal(tagPageReads, 1);
+        // Past the window the walk re-reads the listing: Foo B (now on
+        // page 2) joins the native criterion instead of staying invisible
+        // until the process restarts.
+        tagPages.length = 0;
+        tagPages.push(
+          {
+            rows: [TAG_A],
+            next: "https://tpdb.example/tags?page=2",
+            total: 0,
+          },
+          { rows: [TAG_B], next: null, total: 0 },
+        );
+        // A full day: past any sane listing window (hardcoded, like the
+        // cache windows in tests/api.test.ts).
+        now += 24 * 60 * 60 * 1000;
+        await browseTitles(query, []);
+        assert.equal(tagPageReads, 3);
+        // The last movie read (the third browse; the second may have been
+        // served from the 10-minute page cache without an upstream read)
+        // carries BOTH tags: Foo B joined the native criterion.
+        assert.match(movieUrls.at(-1)!, /tags%5B11%5D=1|tags\[11\]=1/);
+        assert.match(movieUrls.at(-1)!, /tags%5B12%5D=1|tags\[12\]=1/);
+      },
+    );
+  } finally {
+    Date.now = realNow;
+  }
+});
+
+test("a complete fresh listing with no match answers the side provably empty without a scan", async () => {
+  // The pin this test replaces (0081f6b: "an empty expansion is never
+  // proof the side is empty — the side scans into the 422 ceiling")
+  // predates the freshness-bounded listing walk (card 926308ec): the
+  // expansion now reads a COMPLETE listing re-walked within its TTL
+  // window, so an empty id list with no uuid-less match is grounded
+  // absence — no published tag contains the term, so no title can carry
+  // it. The side answers exact zero before any upstream scan instead of
+  // paying 40 pages per side per page view for a typo and ending in a
+  // 422 that blames breadth.
+  let sceneCalls = 0;
+  await runBrowse(
+    scriptedUpstream({
       tagRows: [],
       moviePages: [{ rows: [], next: null, total: 0 }],
-      // The scene source keeps claiming more pages, so the local scan hits
-      // the documented ceiling instead of exhausting into an exact total.
+      // The scene listing is complete: one non-matching tag, and the walk
+      // stops because the rows cover the claimed count.
+      stashQueryTagPages: [
+        { count: 1, rows: [{ id: uuid(201), name: "Drama" }] },
+      ],
+      // The source keeps claiming more pages, so only a scan could ever
+      // notice — and no scan happens.
+      scenes: {
+        count: 100000,
+        rows: [stashRow(uuid(9), "Untagged", "2024-06-01")],
+      },
+      onScenesRequest: () => {
+        sceneCalls += 1;
+      },
+    }),
+    async () => {
+      const page = await browseTitles(
+        {
+          type: "scene",
+          include: [{ name: "zzqx" }],
+          exclude: [],
+          studioMode: "exact",
+          page: 1,
+          perPage: 10,
+        },
+        [],
+      );
+      assert.equal(sceneCalls, 0);
+      assert.deepEqual(page.items, []);
+      assert.equal(page.total, 0);
+      assert.equal(page.totalCountKnown, true);
+      assert.equal(page.hasMore, false);
+    },
+  );
+});
+
+test("an incomplete listing keeps the local scan and the hard 422 ceiling", async () => {
+  // The provably-empty answer needs a COMPLETE walk: a rows-less page
+  // while the count still claims more leaves the expansion incomplete,
+  // the absence is not grounded, and the side scans unfiltered into the
+  // documented ceiling — the honesty point 0081f6b pinned, kept.
+  await runBrowse(
+    scriptedUpstream({
+      tagRows: [],
+      moviePages: [{ rows: [], next: null, total: 0 }],
+      // Page 1 is rows-less while count claims 5 tags: incomplete walk.
+      stashQueryTagPages: [{ count: 5, rows: [] }],
       scenes: {
         count: 100000,
         rows: [stashRow(uuid(9), "Untagged", "2024-06-01")],
       },
     }),
     async () => {
-      // No exact zero: the side really scans, and when the endless source
-      // meets the documented ceiling the named 422 is the answer — never a
-      // fake empty page. (The old behavior skipped a side whose search
-      // found nothing and answered total 0, totalCountKnown true without
-      // any upstream read.) Under the reconciled soft-ceiling contract a
-      // single-term local scan keeps the hard ceiling; only a multi-term
-      // AND riding its native any-of union degrades to the named partial
-      // page.
       await assert.rejects(
         browseTitles(
           {
             type: "scene",
-            include: [{ name: "zzzz" }],
+            include: [{ name: "zzqx" }],
             exclude: [],
             studioMode: "exact",
             page: 1,
@@ -1310,6 +1840,52 @@ test("an empty expansion on an endless scene source stays a named 422, never a p
         ),
         appError(422, "query_too_broad"),
       );
+    },
+  );
+});
+
+test("one provably empty side drops while the other side still streams", async () => {
+  // All tab, term "drama": the TPDB listing is complete and holds no
+  // matching tag, so the movie side is provably empty and skipped before
+  // any /movies read; the StashDB side expands natively and streams.
+  const movieUrls: string[] = [];
+  await runBrowse(
+    scriptedUpstream({
+      tagRows: [], // complete empty TPDB tag vocabulary
+      moviePages: [
+        {
+          rows: [tpdbRow(uuid(1), "Movie", "2024-01-01")],
+          next: null,
+          total: 1,
+        },
+      ],
+      stashQueryTagRows: [{ id: uuid(201), name: "Drama" }],
+      scenes: {
+        count: 1,
+        rows: [
+          stashRow(uuid(5), "Drama scene", "2024-06-01", [
+            { id: uuid(201), name: "Drama" },
+          ]),
+        ],
+      },
+      onMovieRequest: (_page, qs) => movieUrls.push(qs.toString()),
+    }),
+    async () => {
+      const page = await browseTitles(
+        {
+          type: "all",
+          include: [{ name: "drama" }],
+          exclude: [],
+          studioMode: "exact",
+          page: 1,
+          perPage: 10,
+        },
+        [],
+      );
+      assert.deepEqual(movieUrls, []);
+      assert.equal(page.items.length, 1);
+      assert.equal(page.total, 1);
+      assert.equal(page.totalCountKnown, true);
     },
   );
 });
@@ -1556,19 +2132,23 @@ test("a free-text term matching only uuid-less TPDB tags runs the movie side loc
   );
 });
 
-test("an anchored include whose TPDB counterpart is uuid-less drops the movie side instead of 400ing", async () => {
+test("a StashDB include leaves TPDB movies unconstrained even when a same-named tag exists", async () => {
   const LEGACY_NUM = { id: 305, name: "Legacy" }; // uuid-less TPDB row
   const STASH_TAG = uuid(201);
   let moviesCalled = 0;
+  const movieUrls: string[] = [];
   await runBrowse(
     scriptedUpstream({
       tagRows: [LEGACY_NUM],
       stashTagRows: [{ id: STASH_TAG, name: "Legacy" }],
       moviePages: [
         {
-          rows: [tpdbRow(uuid(1), "Legacy movie", "2024-01-01", [LEGACY_NUM])],
+          rows: [
+            tpdbRow(uuid(1), "Legacy movie", "2024-01-01", [LEGACY_NUM]),
+            tpdbRow(uuid(2), "Untagged movie", "2023-01-01"),
+          ],
           next: null,
-          total: 1,
+          total: 2,
         },
       ],
       scenes: {
@@ -1579,8 +2159,9 @@ test("an anchored include whose TPDB counterpart is uuid-less drops the movie si
           ]),
         ],
       },
-      onMovieRequest: () => {
+      onMovieRequest: (_page, _qs, url) => {
         moviesCalled += 1;
+        movieUrls.push(url);
       },
     }),
     async () => {
@@ -1595,16 +2176,160 @@ test("an anchored include whose TPDB counterpart is uuid-less drops the movie si
         },
         [],
       );
-      // The anchored StashDB id cannot pair with a TPDB tag: the label
-      // match is uuid-less, which counts as unresolvable, so the movie side
-      // is dropped — never run unfiltered, never 400ed. The scene side
-      // carries its own anchored id natively.
-      assert.equal(moviesCalled, 0);
+      // The StashDB tag does not constrain TPDB, even when its label exists there.
+      assert.equal(moviesCalled, 1);
+      assert.doesNotMatch(movieUrls[0]!, /tag_and|tags%5B|tags\[/);
       assert.deepEqual(
-        page.items.map((d) => d.reference.provider),
-        ["stashdb"],
+        page.items.map((d) => [d.reference.provider, d.title]),
+        [
+          ["stashdb", "Legacy scene"],
+          ["tpdb", "Legacy movie"],
+          ["tpdb", "Untagged movie"],
+        ],
+      );
+      // Both streams exhausted; unrelated provider rows remain visible.
+      assert.equal(page.total, 3);
+      assert.equal(page.totalCountKnown, true);
+      assert.deepEqual(page.errors, []);
+    },
+  );
+});
+
+test("a foreign include retains native TPDB totals without counterpart resolution", async () => {
+  const LEGACY_NUM = { id: 305, name: "Legacy" };
+  const STASH_TAG = uuid(201);
+  await runBrowse(
+    scriptedUpstream({
+      tagRows: [LEGACY_NUM],
+      stashTagRows: [{ id: STASH_TAG, name: "Legacy" }],
+      moviePages: [
+        {
+          rows: [
+            ...Array.from({ length: 9 }, (_, i) =>
+              tpdbRow(uuid(100 + i), `Legacy movie ${i + 1}`, "2024-01-01", [
+                LEGACY_NUM,
+              ]),
+            ),
+            tpdbRow(uuid(2), "Untagged movie", "2023-01-01"),
+          ],
+          next: "x",
+          total: 100,
+        },
+      ],
+      scenes: { count: 0, rows: [] },
+    }),
+    async () => {
+      const page = await browseTitles(
+        {
+          type: "movie",
+          include: [{ name: "Legacy", stashdb: STASH_TAG }],
+          exclude: [],
+          studioMode: "exact",
+          page: 1,
+          perPage: 10,
+        },
+        [],
+      );
+      // The foreign tag is inactive here, so native paging and totals remain valid.
+      assert.equal(page.items.length, 10);
+      assert.equal(page.hasMore, true);
+      assert.equal(page.total, 100);
+      assert.equal(page.totalCountKnown, true);
+      assert.deepEqual(page.errors, []);
+    },
+  );
+});
+
+test("TPDB performer filmography ignores a tag selected on StashDB", async () => {
+  const LEGACY_NUM = { id: 305, name: "Legacy" }; // uuid-less TPDB row
+  const STASH_TAG = uuid(201);
+  const performer = uuid(55);
+  const urls: string[] = [];
+  await runBrowse(
+    scriptedUpstream({
+      tagRows: [LEGACY_NUM],
+      stashTagRows: [{ id: STASH_TAG, name: "Legacy" }],
+      moviePages: [
+        {
+          rows: [tpdbRow(uuid(1), "Legacy movie", "2024-01-01", [LEGACY_NUM])],
+          next: null,
+          total: 1,
+        },
+      ],
+      scenes: { count: 0, rows: [] },
+      onMovieRequest: (_page, _qs, url) => urls.push(url),
+    }),
+    async () => {
+      const page = await browseTitles(
+        {
+          type: "movie",
+          performerTpdb: performer,
+          include: [{ name: "Legacy", stashdb: STASH_TAG }],
+          exclude: [],
+          studioMode: "exact",
+          page: 1,
+          perPage: 10,
+        },
+        [],
+      );
+      // A StashDB tag does not add native or local filters to TPDB filmography.
+      assert.match(urls[0]!, new RegExp(`/performers/${performer}/movies`));
+      assert.doesNotMatch(urls[0]!, /tag_and|tags%5B|tags\[/);
+      assert.deepEqual(
+        page.items.map((d) => d.title),
+        ["Legacy movie"],
       );
       assert.equal(page.total, 1);
+      assert.equal(page.totalCountKnown, true);
+      assert.deepEqual(page.errors, []);
+    },
+  );
+});
+
+test("a StashDB include leaves TPDB visible when the label does not exist there", async () => {
+  const STASH_TAG = uuid(201);
+  let moviesCalled = 0;
+  await runBrowse(
+    scriptedUpstream({
+      tagRows: [{ id: 305, name: "Unrelated" }],
+      moviePages: [
+        {
+          rows: [tpdbRow(uuid(1), "Unfiltered?", "2024-01-01")],
+          next: null,
+          total: 1,
+        },
+      ],
+      scenes: {
+        count: 1,
+        rows: [
+          stashRow(uuid(3), "Ghost scene", "2024-06-01", [
+            { id: STASH_TAG, name: "Ghost" },
+          ]),
+        ],
+      },
+      onMovieRequest: () => {
+        moviesCalled += 1;
+      },
+    }),
+    async () => {
+      const page = await browseTitles(
+        {
+          type: "all",
+          include: [{ name: "Ghost", stashdb: STASH_TAG }],
+          exclude: [],
+          studioMode: "exact",
+          page: 1,
+          perPage: 10,
+        },
+        [],
+      );
+      // Provider isolation does not depend on same-name tag availability.
+      assert.equal(moviesCalled, 1);
+      assert.deepEqual(
+        page.items.map((d) => d.reference.provider),
+        ["stashdb", "tpdb"],
+      );
+      assert.equal(page.total, 2);
       assert.equal(page.totalCountKnown, true);
     },
   );
@@ -1777,8 +2502,9 @@ test("a scan-ceiling side beside a real outage returns the partial page, not a 5
           total: 10000,
         },
       ],
-      // StashDB is dark: its include expansion (searchTag) 500s, so the
-      // scene side enters the merge as an already-failed stream.
+      // StashDB is dark: its include expansion (the queryTags listing
+      // walk) 500s, so the scene side enters the merge as an
+      // already-failed stream.
       stashStatus: 500,
       scenes: { count: 0, rows: [] },
     }),
@@ -2483,7 +3209,7 @@ test("a filmography free-text include keeps the hard ceiling error", async () =>
   );
 });
 
-test("a free-text term beside an anchored tag keeps the hard ceiling error", async () => {
+test("an anchored tag beside a matchless free-text term answers provably empty", async () => {
   const TAG_ANCHOR = { id: 15, uuid: uuid(105), name: "Anchor Tag" };
   let moviesCalled = 0;
   await runBrowse(
@@ -2491,10 +3217,61 @@ test("a free-text term beside an anchored tag keeps the hard ceiling error", asy
       tagRows: [TAG_ANCHOR],
       moviePages: [
         {
-          // Every row carries the anchored tag but none carries a tag
-          // containing the free term: the native all-of keeps the pages
-          // flowing while the local free term filters everything, so the
-          // stream runs to its ceiling.
+          // Every row carries the anchored tag, but the complete listing
+          // holds no tag containing the free term.
+          rows: [tpdbRow(uuid(9), "Anchor only", "2024-01-01", [TAG_ANCHOR])],
+          next: "x",
+          total: 10000,
+        },
+      ],
+      scenes: { count: 0, rows: [] },
+      onMovieRequest: () => {
+        moviesCalled += 1;
+      },
+    }),
+    async () => {
+      // Moved pin: this test held the hard 422 here — the free term
+      // filtered locally beside the native anchor and the stream ran to
+      // its 40-page ceiling. The complete freshness-bounded listing now
+      // proves the AND can never match: no published TPDB tag contains
+      // "nevermatches", so the side answers exact zero before any scan.
+      const page = await browseTitles(
+        {
+          type: "movie",
+          include: [
+            { name: TAG_ANCHOR.name, tpdb: TAG_ANCHOR.uuid },
+            { name: "nevermatches" },
+          ],
+          exclude: [],
+          studioMode: "exact",
+          page: 1,
+          perPage: 10,
+        },
+        [],
+      );
+      assert.equal(moviesCalled, 0);
+      assert.deepEqual(page.items, []);
+      assert.equal(page.total, 0);
+      assert.equal(page.totalCountKnown, true);
+      assert.equal(page.hasMore, false);
+    },
+  );
+});
+
+test("an anchored tag beside a multi-match free-text term keeps the hard ceiling error", async () => {
+  // The ceiling contract the test above moved: when the free term DOES
+  // match published tags — several, so it re-checks locally beside the
+  // native anchor — absence is not provable, and the endless source
+  // meets the documented 40-page ceiling.
+  const TAG_ANCHOR = { id: 15, uuid: uuid(105), name: "Anchor Tag" };
+  const TAG_XYZ_A = { id: 16, uuid: uuid(106), name: "XYZ Alpha" };
+  const TAG_XYZ_B = { id: 17, uuid: uuid(107), name: "XYZ Beta" };
+  let moviesCalled = 0;
+  await runBrowse(
+    scriptedUpstream({
+      tagRows: [TAG_ANCHOR, TAG_XYZ_A, TAG_XYZ_B],
+      moviePages: [
+        {
           rows: [tpdbRow(uuid(9), "Anchor only", "2024-01-01", [TAG_ANCHOR])],
           next: "x",
           total: 10000,
@@ -2512,7 +3289,7 @@ test("a free-text term beside an anchored tag keeps the hard ceiling error", asy
             type: "movie",
             include: [
               { name: TAG_ANCHOR.name, tpdb: TAG_ANCHOR.uuid },
-              { name: "nevermatches" },
+              { name: "xyz" },
             ],
             exclude: [],
             studioMode: "exact",
@@ -2524,6 +3301,47 @@ test("a free-text term beside an anchored tag keeps the hard ceiling error", asy
         appError(422, "query_too_broad"),
       );
       assert.equal(moviesCalled, 40);
+    },
+  );
+});
+
+test("a foreign tag with a uuid-less same-name row cannot constrain a native free-text search", async () => {
+  const PREMIUM = { id: 11, uuid: uuid(101), name: "Premium" };
+  let moviesCalled = 0;
+  await runBrowse(
+    scriptedUpstream({
+      tagRows: [{ id: 305, name: "Legacy" }, PREMIUM],
+      stashTagRows: [{ id: uuid(201), name: "Legacy" }],
+      moviePages: [
+        {
+          rows: [tpdbRow(uuid(9), "Premium only", "2024-01-01", [PREMIUM])],
+          next: "x",
+          total: 10000,
+        },
+      ],
+      scenes: { count: 0, rows: [] },
+      onMovieRequest: () => {
+        moviesCalled += 1;
+      },
+    }),
+    async () => {
+      const page = await browseTitles(
+        {
+          type: "movie",
+          include: [
+            { name: "Legacy", stashdb: uuid(201) },
+            { name: "Premium" },
+          ],
+          exclude: [],
+          studioMode: "exact",
+          page: 1,
+          perPage: 1,
+        },
+        [],
+      );
+      assert.equal(page.items[0]?.title, "Premium only");
+      assert.equal(moviesCalled, 1);
+      assert.deepEqual(page.errors, []);
     },
   );
 });
@@ -2773,7 +3591,7 @@ test("searchVisibleCatalog keeps paging when the exhausted stream leaves a visib
 
 // --- searchBrowseTags ---
 
-test("searchBrowseTags merges same labels across providers and reports outages", async () => {
+test("searchBrowseTags keeps same-named provider selections separate and reports outages", async () => {
   const SHARED_T = uuid(302);
   const SHARED_S = uuid(303);
   const handler: FixtureHandler = (req, res, body) => {
@@ -2822,12 +3640,12 @@ test("searchBrowseTags merges same labels across providers and reports outages",
       ["anal", "stash only"],
     );
 
-    // Both sources healthy: the same label under different casing merges
-    // into ONE selection carrying both native ids.
+    // Same labels stay independently selectable with their own provider IDs.
     const merged = await searchBrowseTags("shared");
     assert.deepEqual(merged.errors, []);
     assert.deepEqual(merged.tags, [
-      { name: "shared", tpdb: SHARED_T, stashdb: SHARED_S },
+      { name: "shared", tpdb: SHARED_T },
+      { name: "Shared", stashdb: SHARED_S },
     ]);
   });
 });
@@ -3600,11 +4418,186 @@ test("every sort-table row is observable: membership, direction rule, offers", (
         assert.equal(applied.key, spec.key);
         assert.equal(applied.direction, spec.directional ? "asc" : undefined);
         const tab = provider !== "stashdb" ? "movie" : "scene";
-        assert.equal(browseSortIsDirectional(tab, spec.key), spec.directional);
+        assert.equal(
+          browseSortIsDirectional(
+            tab,
+            spec.key,
+            provider === "tmdb" ? "tmdb" : "tpdb",
+          ),
+          spec.directional,
+        );
       }
     }
   }
   // A key the tab's side does not carry reads as non-directional: a stale
   // relevance on the Scenes tab clamps its direction off, never crashes.
   assert.equal(browseSortIsDirectional("scene", "relevance"), false);
+});
+
+test("bounded previews keep sparse matches, stop after three native pages, and never leak hidden titles", async () => {
+  const hidden = { id: 25, uuid: uuid(125), name: "Hidden" };
+  let moviesCalled = 0;
+  await runBrowse(
+    scriptedUpstream({
+      tagRows: [hidden],
+      moviePages: [
+        {
+          rows: [tpdbRow(uuid(1), "Blocked", "2024-01-01", [hidden])],
+          next: "x",
+          total: 10000,
+        },
+        {
+          rows: [tpdbRow(uuid(2), "Visible", "2024-01-01")],
+          next: "x",
+          total: 10000,
+        },
+        {
+          rows: [tpdbRow(uuid(3), "Blocked again", "2024-01-01", [hidden])],
+          next: "x",
+          total: 10000,
+        },
+      ],
+      scenes: { count: 0, rows: [] },
+      onMovieRequest: (_page, qs) => {
+        moviesCalled++;
+        assert.equal(qs.get("per_page"), "12");
+      },
+    }),
+    async () => {
+      const page = await browseTitles(
+        {
+          type: "movie",
+          include: [],
+          exclude: [],
+          studioMode: "exact",
+          page: 1,
+          perPage: 12,
+        },
+        [{ name: hidden.name, tpdb: hidden.uuid }],
+        [],
+        DISCOVER_SCAN_BUDGET,
+      );
+      assert.equal(moviesCalled, 3);
+      assert.deepEqual(
+        page.items.map((item) => item.title),
+        ["Visible"],
+      );
+      assert.equal(page.totalCountKnown, false);
+      assert.equal(page.hasMore, false);
+      assert.deepEqual(
+        page.errors.map((e) => [e.provider, e.code]),
+        [["tpdb", "scan_ceiling"]],
+      );
+    },
+  );
+});
+
+test("scene previews stop at their budget with no matches instead of reporting an outage", async () => {
+  const hidden = { id: uuid(125), name: "Hidden" };
+  let scenesCalled = 0;
+  await runBrowse(
+    scriptedUpstream({
+      tagRows: [],
+      moviePages: [],
+      scenes: {
+        count: 10000,
+        rows: [stashRow(uuid(1), "Blocked", "2024-01-01", [hidden])],
+      },
+      onScenesRequest: () => {
+        scenesCalled++;
+      },
+    }),
+    async () => {
+      const page = await searchVisibleCatalog(
+        { provider: "stashdb", kind: "scene", sort: "trending", perPage: 12 },
+        [{ name: hidden.name, stashdb: hidden.id }],
+        DISCOVER_SCAN_BUDGET,
+      );
+      assert.equal(scenesCalled, 3);
+      assert.deepEqual(page.items, []);
+      assert.equal(page.totalCountKnown, false);
+      assert.equal(page.hasMore, false);
+      assert.equal(page.errors?.[0]?.code, "scan_ceiling");
+    },
+  );
+});
+
+test("a complete preview does not scan extra pages or claim partial coverage", async () => {
+  let moviesCalled = 0;
+  await runBrowse(
+    scriptedUpstream({
+      tagRows: [],
+      moviePages: [
+        {
+          rows: [tpdbRow(uuid(1), "Visible", "2024-01-01")],
+          next: "x",
+          total: 10000,
+        },
+      ],
+      scenes: { count: 0, rows: [] },
+      onMovieRequest: () => {
+        moviesCalled++;
+      },
+    }),
+    async () => {
+      const page = await browseTitles(
+        {
+          type: "movie",
+          include: [],
+          exclude: [],
+          studioMode: "exact",
+          page: 1,
+          perPage: 1,
+        },
+        [{ name: "Hidden" }],
+        [],
+        DISCOVER_SCAN_BUDGET,
+      );
+      assert.equal(moviesCalled, 1);
+      assert.equal(page.items.length, 1);
+      assert.deepEqual(page.errors, []);
+    },
+  );
+});
+
+test("Discover scene queries push hidden IDs upstream while keeping local exclusion checks", async () => {
+  const hidden = { id: uuid(125), name: "Hidden" };
+  let scenesCalled = 0;
+  await runBrowse(
+    scriptedUpstream({
+      tagRows: [],
+      moviePages: [],
+      scenes: {
+        count: 10000,
+        rows: [stashRow(uuid(1), "Blocked", "2024-01-01", [hidden])],
+      },
+      onScenesRequest: (input) => {
+        scenesCalled++;
+        assert.deepEqual(input.tags, {
+          value: [hidden.id],
+          modifier: "EXCLUDES",
+        });
+      },
+    }),
+    async () => {
+      const page = await browseTitles(
+        {
+          type: "scene",
+          include: [],
+          exclude: [],
+          studioMode: "exact",
+          sort: "trending",
+          direction: "desc",
+          page: 1,
+          perPage: 12,
+        },
+        [{ name: hidden.name, stashdb: hidden.id }],
+        [],
+        DISCOVER_SCAN_BUDGET,
+      );
+      assert.equal(scenesCalled, 3);
+      assert.deepEqual(page.items, []);
+      assert.equal(page.errors[0]?.code, "scan_ceiling");
+    },
+  );
 });

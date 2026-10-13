@@ -1,5 +1,7 @@
 "use client";
 
+import { RECENT_POPULAR_DAYS } from "../lib/tmdb-discovery.ts";
+
 import {
   useCallback,
   useEffect,
@@ -10,6 +12,12 @@ import {
 } from "react";
 import { useSearchParams } from "next/navigation";
 import "./catalog.css";
+import { RailSkeleton } from "./discover.tsx";
+import type {
+  ContentPreferences,
+  ShelfError,
+  SourceError,
+} from "../lib/contracts.ts";
 import { TagPicker } from "./tag-picker.tsx";
 import {
   api,
@@ -53,6 +61,7 @@ import { mergePageItems } from "../lib/browse-items.ts";
 // table the server's acceptance comes from.
 import {
   clearBrowseKeys,
+  scopeBrowseTags,
   countActiveFilters,
   performerStashdbPatch,
   performerTpdbPatch,
@@ -193,8 +202,12 @@ function SortSelect({
   onSort,
   onDirection,
   options,
+  defaultLabel = "Newest releases (default)",
+  movieProvider = "tpdb",
 }: {
   options?: readonly SortKey[];
+  defaultLabel?: string;
+  movieProvider?: "tmdb" | "tpdb";
   id: string;
   type: "all" | "movie" | "scene";
   sort: string;
@@ -220,27 +233,28 @@ function SortSelect({
           disabled={disabled}
           onChange={(e) => onSort(e.target.value)}
         >
-          <option value="">Provider default</option>
+          <option value="">{defaultLabel}</option>
           {sorts.map((s) => (
             <option key={s} value={s}>
               {SORT_LABELS[s]}
             </option>
           ))}
         </select>
-        {sort !== "" && browseSortIsDirectional(type, sort as SortKey) && (
-          <button
-            type="button"
-            className="btn shrink-0"
-            aria-label={
-              direction === "asc" ? "Sort ascending" : "Sort descending"
-            }
-            title={direction === "asc" ? "Sort ascending" : "Sort descending"}
-            disabled={disabled}
-            onClick={() => onDirection(direction === "asc" ? "desc" : "asc")}
-          >
-            <Icon name={direction === "asc" ? "sort-asc" : "sort-desc"} />
-          </button>
-        )}
+        {sort !== "" &&
+          browseSortIsDirectional(type, sort as SortKey, movieProvider) && (
+            <button
+              type="button"
+              className="btn shrink-0"
+              aria-label={
+                direction === "asc" ? "Sort ascending" : "Sort descending"
+              }
+              title={direction === "asc" ? "Sort ascending" : "Sort descending"}
+              disabled={disabled}
+              onClick={() => onDirection(direction === "asc" ? "desc" : "asc")}
+            >
+              <Icon name={direction === "asc" ? "sort-asc" : "sort-desc"} />
+            </button>
+          )}
       </div>
     </div>
   );
@@ -711,7 +725,10 @@ function parseTags(v: string | null): CatalogTagSelection[] {
  * state under endless scroll. An outage is an error, never an empty page. */
 function browsePath(f: {
   movieSource?: "tpdb" | "tmdb";
-  adultOnly?: boolean;
+  recentDays?: string;
+  preferredTags?: string | null;
+  tmdbPerformer?: string | null;
+  tmdbStudio?: string | null;
   type: "all" | "movie" | "scene";
   q: string;
   include: CatalogTagSelection[];
@@ -731,6 +748,11 @@ function browsePath(f: {
 }): string {
   const qs = new URLSearchParams();
   if (f.type !== "all") qs.set("type", f.type);
+  if (f.recentDays) qs.set("recentDays", f.recentDays);
+  if (f.preferredTags === "0" || f.preferredTags === "1")
+    qs.set("preferredTags", f.preferredTags);
+  if (f.tmdbPerformer) qs.set("tmdbPerformer", f.tmdbPerformer);
+  if (f.tmdbStudio) qs.set("tmdbStudio", f.tmdbStudio);
   if (f.q) qs.set("q", f.q);
   if (f.include.length > 0) qs.set("include", JSON.stringify(f.include));
   if (f.exclude.length > 0) qs.set("exclude", JSON.stringify(f.exclude));
@@ -751,7 +773,19 @@ function browsePath(f: {
   }
   if (f.movieSource === "tmdb" && f.type === "movie")
     qs.set("movieSource", "tmdb");
-  if (f.adultOnly && f.type === "movie") qs.set("adultOnly", "1");
+  if (!f.sort && !f.performerTpdb) {
+    const defaultSort =
+      f.type === "scene"
+        ? f.q
+          ? "title"
+          : "date"
+        : f.q
+          ? "relevance"
+          : "recency";
+    qs.set("sort", defaultSort);
+    if (defaultSort !== "relevance")
+      qs.set("direction", f.type === "scene" && f.q ? "asc" : "desc");
+  }
   qs.set("perPage", String(f.perPage));
   return `/api/browse?${qs.toString()}`;
 }
@@ -846,7 +880,7 @@ const TYPE_LABELS = { all: "All", movie: "Movies", scene: "Scenes" } as const;
  * a media detail opens over the grid, which stays mounted but hidden.
  * URL keys are the plan's canonical browse keys — include/exclude ride as
  * JSON arrays of CatalogTagSelection. */
-export function TitlesView() {
+function SingleTitlesView() {
   const params = useSearchParams();
   const setP = useParamsSetter();
   const { providers } = useSession();
@@ -857,10 +891,22 @@ export function TitlesView() {
   // Anything that is not movie/scene reads as the `all` default.
   const type = typeRaw === "movie" || typeRaw === "scene" ? typeRaw : "all";
   const movieSource = params.get("movieSource") === "tmdb" ? "tmdb" : "tpdb";
-  const adultOnly = params.get("adultOnly") === "1";
+  const recentDays = params.get("recentDays") ?? "30";
+  const nextRecentDays = recentDays === "30" ? "90" : "365";
+  const preferredTags = params.get("preferredTags");
+  const tmdbPerformer = params.get("tmdbPerformer");
+  const tmdbStudio = params.get("tmdbStudio");
   const q = params.get("q") ?? "";
-  const include = parseTags(params.get("include"));
-  const exclude = parseTags(params.get("exclude"));
+  const include = scopeBrowseTags(
+    parseTags(params.get("include")),
+    type,
+    movieSource,
+  );
+  const exclude = scopeBrowseTags(
+    parseTags(params.get("exclude")),
+    type,
+    movieSource,
+  );
   const studioTpdb = params.get("studioTpdb") ?? "";
   const studioStashdb = params.get("studioStashdb") ?? "";
   const performerTpdb = params.get("performerTpdb") ?? "";
@@ -882,14 +928,18 @@ export function TitlesView() {
     movieSource === "tmdb" && type === "movie"
       ? q
         ? (["relevance"] as const)
-        : (["recency"] as const)
+        : (["recency", "popularity", "recent-popular"] as const)
       : browseSortsFor(type);
-  const sortRaw = params.get("sort") ?? "";
+  const rawSort = params.get("sort") ?? "";
+  const sortRaw =
+    movieSource === "tmdb" && rawSort === "trending"
+      ? "recent-popular"
+      : rawSort;
   const sort = (sorts as readonly string[]).includes(sortRaw) ? sortRaw : "";
   const dirRaw = params.get("direction") ?? "";
   const direction =
     sort !== "" &&
-    browseSortIsDirectional(type, sort as SortKey) &&
+    browseSortIsDirectional(type, sort as SortKey, movieSource) &&
     (dirRaw === "asc" || dirRaw === "desc")
       ? dirRaw
       : "";
@@ -948,7 +998,10 @@ export function TitlesView() {
       browsePath({
         type,
         movieSource,
-        adultOnly,
+        recentDays,
+        preferredTags,
+        tmdbPerformer,
+        tmdbStudio,
         q,
         include,
         exclude,
@@ -968,7 +1021,10 @@ export function TitlesView() {
     [
       type,
       movieSource,
-      adultOnly,
+      recentDays,
+      preferredTags,
+      tmdbPerformer,
+      tmdbStudio,
       q,
       include,
       exclude,
@@ -1181,7 +1237,7 @@ export function TitlesView() {
           // Only sorts that take one carry a direction; picking a
           // non-directional order removes a stale one instead of 400ing.
           direction:
-            v && browseSortIsDirectional(type, v as SortKey)
+            v && browseSortIsDirectional(type, v as SortKey, movieSource)
               ? direction || "desc"
               : null,
         },
@@ -1211,7 +1267,12 @@ export function TitlesView() {
     // The tab and paging survive a clear — every constraint goes, and the
     // facet display label goes with them.
     setP(
-      { ...clearBrowseKeys(["type", "perPage"]), name: null },
+      {
+        ...clearBrowseKeys(["type", "perPage", "movieSource", "adultOnly"]),
+        tmdbPerformer: null,
+        tmdbStudio: null,
+        name: null,
+      },
       { push: true },
     );
   }, [setP]);
@@ -1219,6 +1280,8 @@ export function TitlesView() {
   // An active studio/tag id without a captured name stays an id — never a
   // fake label (see filterName).
   const filterCount =
+    Number(Boolean(tmdbPerformer)) +
+    Number(Boolean(tmdbStudio)) +
     countActiveFilters({
       q,
       year,
@@ -1233,8 +1296,7 @@ export function TitlesView() {
       include,
       exclude,
     }) +
-    (type === "movie" && movieSource === "tmdb" ? 1 : 0) +
-    (type === "movie" && adultOnly ? 1 : 0);
+    (type === "movie" && movieSource === "tmdb" ? 1 : 0);
 
   // `name` is display-only (never queried) — a forged label can misname the
   // heading but never change results.
@@ -1270,14 +1332,6 @@ export function TitlesView() {
             { push: true },
           )
         }
-      />,
-    );
-  if (type === "movie" && adultOnly)
-    chips.push(
-      <FilterChip
-        key="adult"
-        label="Adult-flagged only"
-        onRemove={() => setP({ adultOnly: null }, { push: true })}
       />,
     );
   if (q) {
@@ -1364,7 +1418,12 @@ export function TitlesView() {
     chips.push(
       <FilterChip
         key={`include:${tag.name}:${tag.tpdb ?? ""}:${tag.stashdb ?? ""}:${i}`}
-        label={`Tag: ${tag.name} (include)`}
+        label={`Tag: ${tag.name} (${
+          (["tmdb", "tpdb", "stashdb"] as const)
+            .filter((provider) => tag[provider] !== undefined)
+            .map(providerLabel)
+            .join(", ") || "Free text"
+        }; include)`}
         onRemove={() => onInclude(include.filter((t) => t !== tag))}
       />,
     );
@@ -1373,7 +1432,12 @@ export function TitlesView() {
     chips.push(
       <FilterChip
         key={`exclude:${tag.name}:${tag.tpdb ?? ""}:${tag.stashdb ?? ""}:${i}`}
-        label={`Tag: ${tag.name} (exclude)`}
+        label={`Tag: ${tag.name} (${
+          (["tmdb", "tpdb", "stashdb"] as const)
+            .filter((provider) => tag[provider] !== undefined)
+            .map(providerLabel)
+            .join(", ") || "Free text"
+        }; exclude)`}
         onRemove={() => onExclude(exclude.filter((t) => t !== tag))}
       />,
     );
@@ -1418,6 +1482,7 @@ export function TitlesView() {
                 type="button"
                 className="btn"
                 aria-label={`${hiddenCount} personal hidden tags active — manage in Preferences`}
+                data-prefs-opener="hidden-tags"
                 onClick={() =>
                   window.dispatchEvent(new Event(OPEN_PREFERENCES))
                 }
@@ -1441,7 +1506,17 @@ export function TitlesView() {
             {/* TPDB filmography refuses search and order only where the
                 TPDB side runs; the Scenes tab runs her StashDB side. */}
             <SortSelect
+              movieProvider={movieSource}
               options={sorts}
+              defaultLabel={
+                q
+                  ? type === "scene"
+                    ? "Title A–Z (StashDB default)"
+                    : "Relevance (" + movieSource.toUpperCase() + " default)"
+                  : "Newest releases (" +
+                    (type === "scene" ? "StashDB" : movieSource.toUpperCase()) +
+                    " default)"
+              }
               id="titles-sort"
               type={type}
               sort={sort}
@@ -1456,6 +1531,38 @@ export function TitlesView() {
             />
           </div>
         </div>
+
+        {type !== "scene" && (
+          <MovieProviderSwitch
+            source={movieSource}
+            onChange={(source) =>
+              setP(
+                {
+                  movieSource: source,
+                  tmdbPerformer: null,
+                  tmdbStudio: null,
+                  adultOnly: null,
+                  sort: null,
+                  direction: null,
+                  performerTpdb: null,
+                  performerStashdb: null,
+                  studioTpdb: null,
+                  studioStashdb: null,
+                },
+                { push: true },
+              )
+            }
+          />
+        )}
+
+        {type === "movie" &&
+          movieSource === "tmdb" &&
+          sort === "recent-popular" && (
+            <RecentPopularControls
+              value={recentDays}
+              onChange={(value) => setP({ recentDays: value }, { push: true })}
+            />
+          )}
 
         {chips.length > 0 && (
           <div className="mt-3 flex flex-wrap items-center gap-2">
@@ -1483,7 +1590,34 @@ export function TitlesView() {
           ) : (
             <>
               {acc.errors.map((e) =>
-                e.code === "scan_ceiling" ? (
+                e.code === "scan_ceiling" &&
+                e.provider === "tmdb" &&
+                sort === "recent-popular" ? (
+                  <div
+                    key={e.provider}
+                    className="panel p-4 text-sm text-muted"
+                    role="note"
+                  >
+                    <p>{e.message}</p>
+                    {recentDays !== "365" && (
+                      <button
+                        className="btn mt-2"
+                        onClick={() =>
+                          setP(
+                            {
+                              sort: "recent-popular",
+                              recentDays: nextRecentDays,
+                              direction: "desc",
+                            },
+                            { push: true },
+                          )
+                        }
+                      >
+                        Expand release window to {nextRecentDays} days
+                      </button>
+                    )}
+                  </div>
+                ) : e.code === "scan_ceiling" ? (
                   // The source answered every scanned page and hit the
                   // documented limit: a partial answer, not an outage. No
                   // retry — only narrower filters change the outcome.
@@ -1580,53 +1714,6 @@ export function TitlesView() {
         count={filterCount}
         onClear={clearFilters}
       >
-        {type === "movie" && (
-          <div className="mb-4 space-y-3">
-            <label className="label" htmlFor="movie-source">
-              Movie metadata
-            </label>
-            <select
-              id="movie-source"
-              className="input"
-              value={movieSource}
-              onChange={(e) =>
-                setP(
-                  {
-                    ...clearBrowseKeys(["type", "perPage"]),
-                    movieSource: e.target.value,
-                  },
-                  { push: true },
-                )
-              }
-            >
-              <option value="tpdb">TPDB</option>
-              <option value="tmdb">TMDB</option>
-            </select>
-            {movieSource === "tmdb" && (
-              <label className="flex items-center gap-2 text-sm">
-                <input
-                  type="checkbox"
-                  className="check"
-                  checked={adultOnly}
-                  onChange={(e) =>
-                    setP(
-                      { adultOnly: e.target.checked ? "1" : null },
-                      { push: true },
-                    )
-                  }
-                />
-                Adult-flagged only
-              </label>
-            )}
-            {movieSource === "tmdb" && (
-              <p className="text-sm text-muted">
-                Full movie catalog by default, including adult titles.
-                Adult-only uses TMDB’s classification and can omit misclassified
-                movies.
-              </p>
-            )}
-          </div>
-        )}
         <SearchBox
           id="titles-q"
           label="Title search"
@@ -1634,24 +1721,26 @@ export function TitlesView() {
           onCommit={onQ}
           disabled={performerTpdb !== "" && type !== "scene"}
         />
-        {movieSource !== "tmdb" && (
-          <>
-            <TagPicker
-              id="titles-include"
-              label="Include tags"
-              selected={include}
-              onChange={onInclude}
-              allowFreeText
-              description="Titles must carry every selected tag (AND): a provider tag matches exactly, and a typed term keeps titles carrying any tag whose name contains it (case and separators ignored)."
-            />
-            <TagPicker
-              id="titles-exclude"
-              label="Exclude tags"
-              selected={exclude}
-              onChange={onExclude}
-              allowFreeText
-              description="Titles carrying any of these tags are left out — exclusions win over includes, and a tag also covers the ones that contain it as a word (Anal drops Anal Creampie, never Analingus)."
-            />
+        <>
+          <TagPicker
+            id="titles-include"
+            provider={type === "scene" ? "stashdb" : movieSource}
+            label="Include tags"
+            selected={include}
+            onChange={onInclude}
+            allowFreeText
+            description="Match every included tag from the result’s provider. Free-text terms apply across providers."
+          />
+          <TagPicker
+            id="titles-exclude"
+            provider={type === "scene" ? "stashdb" : movieSource}
+            label="Exclude tags"
+            selected={exclude}
+            onChange={onExclude}
+            allowFreeText
+            description="Exclude matches from each picked tag’s provider. Free-text terms apply across providers. Exclusions take priority."
+          />
+          {!(type === "movie" && movieSource === "tmdb") && (
             <PerformerPicker
               id="titles-performer"
               starred={performerStarred}
@@ -1662,6 +1751,20 @@ export function TitlesView() {
                   : onPerformerStashdb(performerId)
               }
             />
+          )}
+        </>
+        {type === "movie" && movieSource === "tmdb" && (
+          <>
+            <TmdbFacetPicker
+              kind="performer"
+              selected={tmdbPerformer}
+              onPick={(id) => setP({ tmdbPerformer: id }, { push: true })}
+            />
+            <TmdbFacetPicker
+              kind="studio"
+              selected={tmdbStudio}
+              onPick={(id) => setP({ tmdbStudio: id }, { push: true })}
+            />
           </>
         )}
         <YearBox
@@ -1670,15 +1773,13 @@ export function TitlesView() {
           onCommit={onYear}
           disabled={performerTpdb !== "" && type !== "scene"}
         />
-        {movieSource !== "tmdb" && (
-          <DateCutoff
-            id="titles-date"
-            date={date}
-            operation={dateOperation}
-            disabled={performerTpdb !== "" && type !== "scene"}
-            onCommit={onDate}
-          />
-        )}
+        <DateCutoff
+          id="titles-date"
+          date={date}
+          operation={dateOperation}
+          disabled={performerTpdb !== "" && type !== "scene"}
+          onCommit={onDate}
+        />
         {/* Year and date apply to both sides: TPDB natively, StashDB with
             the year checked locally, so scene totals are approximate. The
             note says exactly that — never silently ignored. */}
@@ -1704,20 +1805,624 @@ export function TitlesView() {
             </select>
           </div>
         )}
-        <p className="cat-note">
-          {hiddenCount > 0
-            ? `${hiddenCount} personal hidden tag${hiddenCount === 1 ? "" : "s"} appl${hiddenCount === 1 ? "ies" : "y"} on every browse — `
-            : "Personal hidden tags apply on every browse — "}
+        <div className="filter-personalization">
+          <p className="field-help">
+            Your saved hidden and preferred tags apply here. Clearing search
+            filters keeps your preferences.
+          </p>
           <button
             type="button"
             className="btn"
+            data-prefs-opener="drawer-note"
             onClick={() => window.dispatchEvent(new Event(OPEN_PREFERENCES))}
           >
-            manage them in Preferences
+            Manage preferences
           </button>
-          . Clear filters never removes them.
-        </p>
+        </div>
       </FilterDrawer>
     </section>
+  );
+}
+
+function RecentPopularControls({
+  value,
+  onChange,
+}: {
+  value: string;
+  onChange: (value: string) => void;
+}) {
+  return (
+    <div className="panel p-4 mt-3">
+      <p className="field-help">
+        US releases with adult-media keywords, ranked by TMDB popularity. Your
+        TMDB tags narrow the results.
+      </p>
+      <label className="label">
+        Recent release window
+        <select
+          className="input"
+          value={value}
+          onChange={(event) => onChange(event.target.value)}
+        >
+          {RECENT_POPULAR_DAYS.map((days) => (
+            <option key={days} value={days}>
+              Last {days} days
+            </option>
+          ))}
+        </select>
+      </label>
+    </div>
+  );
+}
+
+function MovieProviderSwitch({
+  source,
+  onChange,
+}: {
+  source: "tpdb" | "tmdb";
+  onChange: (source: "tpdb" | "tmdb") => void;
+}) {
+  return (
+    <div className="movie-provider-switch">
+      <span className="field-help">Movie catalog</span>
+      <div role="group" aria-label="Movie catalog">
+        {(["tpdb", "tmdb"] as const).map((provider) => (
+          <button
+            key={provider}
+            className={"btn " + (source === provider ? "btn-accent" : "")}
+            aria-pressed={source === provider}
+            onClick={() => onChange(provider)}
+          >
+            {provider.toUpperCase()}
+          </button>
+        ))}
+      </div>
+      <span className="field-help">Scenes come from StashDB.</span>
+    </div>
+  );
+}
+
+export function TitlesView() {
+  const params = useSearchParams();
+  return params.get("type") === "movie" || params.get("type") === "scene" ? (
+    <SingleTitlesView />
+  ) : (
+    <GroupedTitlesView />
+  );
+}
+
+type BrowseGroup = {
+  title: string;
+  source: CatalogProvider;
+  type: "movie" | "scene";
+  items?: CatalogDetail[];
+  hasMore?: boolean;
+  total?: number;
+  totalCountKnown?: boolean;
+  errors?: SourceError[];
+  error?: ShelfError;
+};
+
+function GroupedTitlesView() {
+  const params = useSearchParams();
+  const setP = useParamsSetter();
+  const browseTo = useBrowseTo();
+  const source = params.get("movieSource") === "tmdb" ? "tmdb" : "tpdb";
+  const q = params.get("q") ?? "";
+  const year = params.get("year") ?? "";
+  const include = scopeBrowseTags(
+    parseTags(params.get("include")),
+    "all",
+    source,
+  );
+  const exclude = scopeBrowseTags(
+    parseTags(params.get("exclude")),
+    "all",
+    source,
+  );
+  const [filtersOpen, setFiltersOpen] = useState(false);
+  const preferences = useApiGet<ContentPreferences>("/api/me/preferences", []);
+  const query = new URLSearchParams({ grouped: "1" });
+  for (const key of [
+    "movieSource",
+    "recentDays",
+    "q",
+    "year",
+    "include",
+    "exclude",
+    "sort",
+    "direction",
+    "date",
+    "date_operation",
+    "studioTpdb",
+    "studioStashdb",
+    "performerTpdb",
+    "performerStashdb",
+    "performerStarred",
+    "studioMode",
+    "preferredTags",
+    "rowLimit",
+    "tmdbPerformer",
+    "tmdbStudio",
+  ]) {
+    const value = params.get(key);
+    if (value !== null) query.set(key, value);
+  }
+  for (const [key, tags] of [
+    ["include", include],
+    ["exclude", exclude],
+  ] as const) {
+    if (tags.length) query.set(key, JSON.stringify(tags));
+    else query.delete(key);
+  }
+  if (source === "tmdb" && query.get("sort") === "trending")
+    query.set("sort", "recent-popular");
+  const path = "/api/browse?" + query;
+  const page = useApiGet<{
+    groups: BrowseGroup[];
+    rowLimit: number;
+    hiddenTagCount: number;
+    preferredTagCount: number;
+  }>(path, [path]);
+  useEffect(() => {
+    window.addEventListener("velvarr:preferences-changed", page.reload);
+    return () =>
+      window.removeEventListener("velvarr:preferences-changed", page.reload);
+  }, [page.reload]);
+  const patch = (values: Record<string, string | null>) =>
+    setP(values, { push: true });
+  const openDetail = (reference: CatalogReference) =>
+    setP(detailParams(reference), { push: true });
+  const count =
+    Number(Boolean(params.get("tmdbPerformer"))) +
+    Number(Boolean(params.get("tmdbStudio"))) +
+    Number(Boolean(q)) +
+    Number(Boolean(year)) +
+    include.length +
+    exclude.length;
+  const limit = Number(
+    params.get("rowLimit") ??
+      page.data?.rowLimit ??
+      preferences.data?.browseRowLimit ??
+      50,
+  );
+  const defaultSort = q
+    ? "Relevance / title (defaults)"
+    : "Newest releases (defaults)";
+  const choices =
+    source === "tmdb"
+      ? q
+        ? []
+        : (["recency", "recent-popular", "popularity"] as const)
+      : (["recency", "duration"] as const);
+  const toType = (type: "all" | "movie" | "scene") =>
+    patch({ type: type === "all" ? null : type, sort: null, direction: null });
+  const allHref = (group: BrowseGroup) => {
+    const values = new URLSearchParams(query);
+    values.delete("grouped");
+    values.delete("rowLimit");
+    values.set("view", "titles");
+    values.set("type", group.type);
+    if (group.type === "scene" && values.get("sort") === "recent-popular") {
+      values.set("sort", "trending");
+      values.delete("recentDays");
+    }
+    for (const key of ["include", "exclude"]) {
+      const tags = scopeBrowseTags(
+        parseTags(values.get(key)),
+        group.type,
+        source,
+      );
+      if (tags.length) values.set(key, JSON.stringify(tags));
+      else values.delete(key);
+    }
+    return "/?" + values;
+  };
+  return (
+    <section aria-label="Titles">
+      <header className="page-heading">
+        <div>
+          <h1 className="page-title">Browse</h1>
+          <p className="page-description">
+            Movies and scenes, each with room to explore.
+          </p>
+        </div>
+        <div className="page-toolbar">
+          <div role="group" aria-label="Title type" className="flex gap-2">
+            {(["all", "movie", "scene"] as const).map((type) => (
+              <button
+                key={type}
+                className={"btn " + (type === "all" ? "btn-accent" : "")}
+                aria-pressed={type === "all"}
+                onClick={() => toType(type)}
+              >
+                {TYPE_LABELS[type]}
+              </button>
+            ))}
+          </div>
+          <FiltersButton count={count} onClick={() => setFiltersOpen(true)} />
+        </div>
+      </header>
+      <MovieProviderSwitch
+        source={source}
+        onChange={(movieSource) =>
+          patch({
+            movieSource,
+            tmdbPerformer: null,
+            tmdbStudio: null,
+            adultOnly: null,
+            sort: null,
+            direction: null,
+            performerTpdb: null,
+            performerStashdb: null,
+            studioTpdb: null,
+            studioStashdb: null,
+          })
+        }
+      />
+      {source === "tmdb" && query.get("sort") === "recent-popular" && (
+        <RecentPopularControls
+          value={params.get("recentDays") ?? "30"}
+          onChange={(value) => patch({ recentDays: value })}
+        />
+      )}
+      <div className="browse-search-bar">
+        <SearchBox
+          id="all-titles-q"
+          label="Search titles"
+          value={q}
+          onCommit={(value) =>
+            patch({ q: value || null, sort: null, direction: null })
+          }
+        />
+        <label className="label">
+          Sort
+          <select
+            className="input"
+            value={query.get("sort") ?? ""}
+            onChange={(event) =>
+              patch({
+                sort: event.target.value || null,
+                direction:
+                  event.target.value && event.target.value !== "trending"
+                    ? "desc"
+                    : null,
+              })
+            }
+          >
+            <option value="">{defaultSort}</option>
+            {choices.map((sort) => (
+              <option value={sort} key={sort}>
+                {SORT_LABELS[sort]}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label className="label">
+          Results per row
+          <select
+            className="input"
+            value={limit}
+            onChange={(event) => patch({ rowLimit: event.target.value })}
+          >
+            {[...new Set([25, 50, 100, limit])]
+              .sort((a, b) => a - b)
+              .map((value) => (
+                <option value={value} key={value}>
+                  {value}
+                </option>
+              ))}
+          </select>
+        </label>
+      </div>
+      {(page.data?.preferredTagCount ?? 0) > 0 && (
+        <p className="field-help">
+          {page.data!.preferredTagCount} preferred tags active.
+        </p>
+      )}
+      {page.error && (
+        <ErrorPanel
+          title="Browse could not refresh"
+          message={page.error}
+          onRetry={page.reload}
+        />
+      )}
+      {!page.data ? (
+        <>
+          <RailSkeleton count={6} />
+          <RailSkeleton count={6} />
+        </>
+      ) : (
+        page.data.groups.map((group) => (
+          <section
+            className="browse-result-section"
+            key={group.type}
+            aria-label={group.title}
+          >
+            <header>
+              <div>
+                <h2>
+                  {group.title}{" "}
+                  <span className="chip">{providerLabel(group.source)}</span>
+                </h2>
+                <p className="field-help">
+                  {Math.min(group.items?.length ?? 0, limit)} results
+                  {group.hasMore ? " · More available" : ""}
+                </p>
+              </div>
+              <a className="btn" href={allHref(group)}>
+                Browse all {group.title.toLowerCase()}
+              </a>
+            </header>
+            {group.error ? (
+              <ErrorPanel
+                title={providerLabel(group.source) + " unavailable"}
+                message={group.error.message}
+                onRetry={page.reload}
+              />
+            ) : (
+              <>
+                {group.errors?.map((error, index) =>
+                  error.code === "scan_ceiling" &&
+                  group.source === "tmdb" &&
+                  query.get("sort") === "recent-popular" ? (
+                    <div
+                      key={index}
+                      className="panel p-4 text-sm text-muted"
+                      role="note"
+                    >
+                      <p>{error.message}</p>
+                      {params.get("recentDays") !== "365" && (
+                        <button
+                          className="btn mt-2"
+                          onClick={() =>
+                            patch({
+                              sort: "recent-popular",
+                              recentDays:
+                                params.get("recentDays") === "90"
+                                  ? "365"
+                                  : "90",
+                              direction: "desc",
+                            })
+                          }
+                        >
+                          Expand release window to{" "}
+                          {params.get("recentDays") === "90" ? "365" : "90"}{" "}
+                          days
+                        </button>
+                      )}
+                    </div>
+                  ) : (
+                    <ErrorPanel key={index} message={error.message} />
+                  ),
+                )}
+                {!group.items?.length ? (
+                  <p className="panel p-5 text-muted">
+                    No matching {group.title.toLowerCase()}. Try broadening your
+                    filters or preferences.
+                  </p>
+                ) : (
+                  <div
+                    className={
+                      "browse-result-rail " +
+                      (group.type === "scene" ? "is-scene" : "")
+                    }
+                    aria-label={group.title + " results"}
+                  >
+                    {group.items.map((item) =>
+                      group.type === "scene" ? (
+                        <SceneCard
+                          key={item.reference.id}
+                          item={item}
+                          onOpen={openDetail}
+                        />
+                      ) : (
+                        <MovieCard
+                          key={item.reference.id}
+                          item={item}
+                          onOpen={openDetail}
+                        />
+                      ),
+                    )}
+                  </div>
+                )}
+              </>
+            )}
+          </section>
+        ))
+      )}
+      <CatalogDetailView browseTo={browseTo} />
+      <FilterDrawer
+        open={filtersOpen}
+        onClose={() => setFiltersOpen(false)}
+        count={count}
+        onClear={() =>
+          patch({
+            q: null,
+            tmdbPerformer: null,
+            tmdbStudio: null,
+            year: null,
+            include: null,
+            exclude: null,
+            date: null,
+            date_operation: null,
+            sort: null,
+            direction: null,
+          })
+        }
+      >
+        <p className="field-help">
+          Movie filters use {source.toUpperCase()}; scenes use StashDB. Each row
+          applies compatible criteria independently.
+        </p>
+        <TagPicker
+          id="all-include"
+          label="Include tags"
+          selected={include}
+          allowFreeText
+          provider={source === "tmdb" ? "tmdb" : undefined}
+          onChange={(tags) =>
+            patch({ include: tags.length ? JSON.stringify(tags) : null })
+          }
+          description="Match every included tag from this provider. Free-text terms apply across providers."
+        />
+        <TagPicker
+          id="all-exclude"
+          label="Exclude tags"
+          selected={exclude}
+          allowFreeText
+          provider={source === "tmdb" ? "tmdb" : undefined}
+          onChange={(tags) =>
+            patch({ exclude: tags.length ? JSON.stringify(tags) : null })
+          }
+          description="Exclude matching titles from the tag’s provider. Free-text terms apply across providers. Exclusions win."
+        />
+        {source === "tmdb" && (
+          <>
+            <TmdbFacetPicker
+              kind="performer"
+              selected={params.get("tmdbPerformer")}
+              onPick={(id) => patch({ tmdbPerformer: id })}
+            />
+            <TmdbFacetPicker
+              kind="studio"
+              selected={params.get("tmdbStudio")}
+              onPick={(id) => patch({ tmdbStudio: id })}
+            />
+          </>
+        )}
+        <YearBox
+          id="all-year"
+          value={year}
+          onCommit={(value) =>
+            patch({ year: value || null, date: null, date_operation: null })
+          }
+        />
+        <DateCutoff
+          id="all-date"
+          date={params.get("date") ?? ""}
+          operation={params.get("date_operation") ?? ""}
+          onCommit={(date, operation) =>
+            patch({ date, date_operation: operation, year: null })
+          }
+        />
+        <div className="filter-personalization">
+          <label className="switch-label">
+            <input
+              type="checkbox"
+              className="check"
+              checked={
+                params.get("preferredTags") === "1" ||
+                (params.get("preferredTags") !== "0" &&
+                  (preferences.data?.applyIncludeTags ?? true))
+              }
+              onChange={(event) =>
+                patch({ preferredTags: event.target.checked ? "1" : "0" })
+              }
+            />
+            Use my preferred tags
+          </label>
+          <p className="field-help">
+            Hidden tags stay active. You can edit both lists in Preferences.
+          </p>
+          <button
+            className="btn"
+            onClick={() => window.dispatchEvent(new Event(OPEN_PREFERENCES))}
+          >
+            Manage preferences
+          </button>
+        </div>
+      </FilterDrawer>
+    </section>
+  );
+}
+
+function TmdbFacetPicker({
+  kind,
+  selected,
+  onPick,
+}: {
+  kind: "performer" | "studio";
+  selected: string | null;
+  onPick: (id: string | null) => void;
+}) {
+  const [term, setTerm] = useState("");
+  const [committed, setCommitted] = useState("");
+  const [picked, setPicked] = useState<{ id: string; name: string } | null>(
+    null,
+  );
+  useEffect(() => {
+    const timer = setTimeout(() => setCommitted(term.trim()), 350);
+    return () => clearTimeout(timer);
+  }, [term]);
+  const choices = useApiGet<{ items: { id: string; name: string }[] }>(
+    committed.length >= 2
+      ? "/api/browse/facets?kind=" +
+          kind +
+          "&q=" +
+          encodeURIComponent(committed)
+      : null,
+    [committed, kind],
+  );
+  const label =
+    kind === "performer" ? "Cast / performer" : "Studio / production company";
+  return (
+    <div className="tmdb-facet-picker">
+      <label className="label" htmlFor={"tmdb-facet-" + kind}>
+        {label}
+      </label>
+      {selected ? (
+        <div className="flex items-center gap-2">
+          <input
+            id={"tmdb-facet-" + kind}
+            className="input"
+            readOnly
+            value={
+              (picked?.id === selected ? picked.name : undefined) ||
+              (kind === "performer" ? "Cast selected" : "Studio selected")
+            }
+          />
+          <button className="btn" onClick={() => onPick(null)}>
+            Remove
+          </button>
+        </div>
+      ) : (
+        <input
+          id={"tmdb-facet-" + kind}
+          className="input"
+          placeholder={
+            "Search " + (kind === "performer" ? "cast…" : "studios…")
+          }
+          value={term}
+          onChange={(event) => setTerm(event.target.value)}
+        />
+      )}
+      {!selected && committed === term.trim() && (
+        <div className="facet-options">
+          {choices.data?.items.map((item) => (
+            <button
+              className="btn"
+              key={item.id}
+              onClick={() => {
+                setPicked(item);
+                onPick(item.id);
+                setTerm("");
+              }}
+            >
+              {item.name}
+            </button>
+          ))}
+        </div>
+      )}
+      {choices.error && (
+        <p className="field-help" role="alert">
+          {choices.error}
+        </p>
+      )}
+      <p className="field-help">
+        TMDB {kind === "performer" ? "cast" : "production-company"} filter.
+        Title-search matches are checked against movie details.
+      </p>
+    </div>
   );
 }

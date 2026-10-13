@@ -1,4 +1,6 @@
 "use client";
+import { AppearanceSync, AppearanceView } from "./appearance.tsx";
+import { PreferencesPage } from "./preferences.tsx";
 
 import {
   useCallback,
@@ -712,6 +714,9 @@ function LoginView({ onSignedIn }: { onSignedIn: () => void }) {
 const VIEWS = [
   "discover",
   "facets",
+  "studios",
+  "preferences",
+  "appearance",
   "titles",
   "following",
   "search",
@@ -882,9 +887,12 @@ function Shell() {
   const navigation = useRef<HTMLDialogElement>(null);
   const accountMenu = useRef<HTMLDetailsElement>(null);
   // The menu's Preferences button hides with the menu before showModal, so
-  // only that opener needs a manual focus restore; live openers (Browse's
-  // "N hidden" button) get the browser's native one.
+  // that path restores focus by hand. Browse's openers are live when they
+  // open, but a save remounts them (the reload clears acc, and "N hidden"
+  // renders only while tags are hidden), so open records the focused node
+  // and close restores it or its fresh replacement.
   const prefsFromMenu = useRef(false);
+  const prefsOpener = useRef<Element | null>(null);
   const [menuOpen, setMenuOpen] = useState(false);
   const [prefsOpen, setPrefsOpen] = useState(false);
   // Browse controls ("N hidden", drawer note) open the modal in place so the
@@ -892,6 +900,7 @@ function Shell() {
   useEffect(() => {
     const open = () => {
       prefsFromMenu.current = false;
+      prefsOpener.current = document.activeElement;
       setPrefsOpen(true);
     };
     window.addEventListener(OPEN_PREFERENCES, open);
@@ -928,6 +937,19 @@ function Shell() {
       label: "Performers",
       icon: "performer",
       group: "browse",
+    },
+    { id: "studios", label: "Studios", icon: "studio", group: "browse" },
+    {
+      id: "preferences",
+      label: "Preferences",
+      icon: "settings",
+      group: "manage",
+    },
+    {
+      id: "appearance",
+      label: "Appearance",
+      icon: "appearance",
+      group: "manage",
     },
     { id: "library", label: "Library", icon: "library", group: "manage" },
     { id: "requests", label: "Requests", icon: "requests", group: "manage" },
@@ -1001,6 +1023,7 @@ function Shell() {
 
   return (
     <div className="app-shell">
+      <AppearanceSync />
       <a className="skip-link" href="#main-content">
         Skip to content
       </a>
@@ -1059,6 +1082,9 @@ function Shell() {
       <main className="app-main" id="main-content" tabIndex={-1}>
         {view === "discover" && <DiscoverShelves />}
         {view === "facets" && <FacetsView />}
+        {view === "studios" && <FacetsView kindOverride="studios" />}
+        {view === "preferences" && <PreferencesPage />}
+        {view === "appearance" && <AppearanceView />}
         {view === "titles" && <TitlesView />}
         {view === "following" && <FollowingView />}
         {view === "library" && <LibraryView />}
@@ -1070,7 +1096,11 @@ function Shell() {
       </main>
       <nav className="mobile-bottom-nav" aria-label="Quick navigation">
         {visibleNav
-          .filter((item) => item.group === "browse" || item.id === "requests")
+          .filter(
+            (item) =>
+              (item.group === "browse" && item.id !== "studios") ||
+              item.id === "requests",
+          )
           .map((item) => (
             <a
               key={item.id}
@@ -1145,12 +1175,30 @@ function Shell() {
         open={prefsOpen}
         onClose={() => {
           setPrefsOpen(false);
-          // The Preferences button hid with the account menu before
-          // showModal, so the browser has no live element to return focus
-          // to; put it back on the menu's visible opener. Other openers
-          // stay live, and the native close steps already restored them.
-          if (prefsFromMenu.current)
-            accountMenu.current?.querySelector("summary")?.focus();
+          const summary = accountMenu.current?.querySelector("summary");
+          if (prefsFromMenu.current) {
+            // The menu's Preferences button hid with the account menu before
+            // showModal, so the browser has no live element to return focus
+            // to; put it back on the menu's visible opener.
+            summary?.focus();
+            return;
+          }
+          // A save unmounts Browse's openers (the reload clears acc, and the
+          // "N hidden" button only renders while tags are hidden), so the
+          // node the native close steps would restore to can be detached.
+          // Restore to the recorded opener when it survived, else the fresh
+          // button of the same kind, else the account menu's visible opener.
+          const opener = prefsOpener.current;
+          const kind = opener?.getAttribute("data-prefs-opener");
+          const target =
+            opener instanceof HTMLElement && opener.isConnected
+              ? opener
+              : kind
+                ? document.querySelector<HTMLElement>(
+                    `[data-prefs-opener="${kind}"]`,
+                  )
+                : null;
+          (target ?? summary)?.focus();
         }}
       />
     </div>

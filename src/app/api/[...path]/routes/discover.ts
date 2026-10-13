@@ -1,3 +1,5 @@
+import { TAG_FILTER_ID_CAP } from "../../../../lib/browse-includes.ts";
+import { DISCOVER_SCAN_BUDGET } from "../../../../server/catalog-budget.ts";
 import { type AuthContext, json } from "../admission.ts";
 import { PROVIDER_UUID } from "../parse.ts";
 import type {
@@ -11,7 +13,11 @@ import type {
   ShelfItems,
   SourceError,
 } from "../../../../lib/contracts.ts";
-import { normalizeFacetName } from "../../../../lib/contracts.ts";
+import {
+  normalizeFacetName,
+  tagAppliesToProvider,
+  scopeTagSelections,
+} from "../../../../lib/contracts.ts";
 import {
   getContentPreferences,
   listFollowsByProvider,
@@ -31,7 +37,10 @@ import {
   searchVisibleCatalog,
   type BrowsePage,
 } from "../../../../server/browse.ts";
-import { isHiddenTitle } from "../../../../server/catalog-visibility.ts";
+import {
+  tagMatches,
+  isHiddenTitle,
+} from "../../../../server/catalog-visibility.ts";
 
 export function shelfError(err: unknown): ShelfError {
   if (err instanceof AppError) return { code: err.code, message: err.message };
@@ -120,6 +129,7 @@ export async function followedTitles(
 export async function followedShelf(
   accountId: string,
   hiddenTags: CatalogTagSelection[],
+  includeTags: CatalogTagSelection[] = [],
 ): Promise<Shelf | null> {
   const sides = await Promise.allSettled([
     followedTitles(accountId, "tpdb"),
@@ -131,7 +141,21 @@ export async function followedShelf(
     const provider = i === 0 ? ("tpdb" as const) : ("stashdb" as const);
     if (side.status === "fulfilled") {
       merged.push(
-        ...side.value.items.filter((item) => !isHiddenTitle(item, hiddenTags)),
+        ...side.value.items.filter(
+          (item) =>
+            !isHiddenTitle(item, hiddenTags) &&
+            includeTags
+              .filter((tag) =>
+                tagAppliesToProvider(tag, item.reference.provider),
+              )
+              .every((tag) =>
+                tagMatches(
+                  item,
+                  tag,
+                  tag.tpdb || tag.stashdb || tag.tmdb ? "exact" : "substring",
+                ),
+              ),
+        ),
       );
       // A partial side keeps its survivors and still names the provider.
       if (side.value.failure !== undefined) {
@@ -148,12 +172,13 @@ export async function followedShelf(
     browse: { view: "following", params: {} },
   };
   if (merged.length === 0) {
-    // Every side the account actually follows failed: the error-only shape,
-    // never a quiet empty list.
-    const firstFailure = sides.find(
-      (side): side is PromiseRejectedResult => side.status === "rejected",
-    );
-    return { ...base, error: shelfError(firstFailure?.reason) };
+    // Every side the account actually follows failed, or a partial side's
+    // survivors are all hidden: the error-only shape carries the collected
+    // failure — never a rejected-sides-only lookup, which misses a
+    // fulfilled side's page failure and degrades to a generic error.
+    // errors is non-empty here, else we returned null above.
+    const first = errors[0]!;
+    return { ...base, error: { code: first.code, message: first.message } };
   }
   return {
     ...base,
@@ -202,7 +227,11 @@ export function browseShelf(
     return { ...base, error: shelfError(result.reason) };
   const page = result.value;
   if (page.items.length === 0 && page.errors.length > 0) {
-    const down = new Set(page.errors.map((error) => error.provider));
+    const down = new Set(
+      page.errors
+        .filter((error) => error.code !== "scan_ceiling")
+        .map((error) => error.provider),
+    );
     if (down.has("tpdb") && down.has("stashdb")) {
       return {
         ...base,
@@ -324,7 +353,11 @@ export function facetShelves(
     const page = newReleases.value;
     items = page.items;
     if (items.length === 0 && page.errors.length > 0) {
-      const down = new Set(page.errors.map((entry) => entry.provider));
+      const down = new Set(
+        page.errors
+          .filter((entry) => entry.code !== "scan_ceiling")
+          .map((entry) => entry.provider),
+      );
       if (down.has("tpdb") && down.has("stashdb")) {
         error = {
           code: page.errors[0]!.code,
@@ -474,12 +507,18 @@ export async function resolveLinked(tiles: FacetItem[]): Promise<void> {
   );
   settled.forEach((result, i) => {
     const tile = missing[i];
-    if (tile && result.status === "fulfilled" && result.value !== undefined) {
-      tile.linked = {
-        provider: result.value.provider,
-        id: result.value.id,
-      };
+    if (tile === undefined || result.status !== "fulfilled") return;
+    const ref = result.value;
+    if (ref === undefined) return;
+    if ("native" in ref) {
+      // Tag reference: a uuid-less exact-label match carries no id — the
+      // label exists on the other provider, but there is nothing to link.
+      if (ref.native) {
+        tile.linked = { provider: ref.provider, id: ref.id };
+      }
+      return;
     }
+    tile.linked = { provider: ref.provider, id: ref.id };
   });
 }
 
@@ -570,97 +609,152 @@ export async function discoveryFacets(
 }
 
 export async function discover(ctx: AuthContext): Promise<Response> {
-  // UTC server date: the shared "today" cutoff for the mixed New releases
-  // rail and its browse-all link.
   const today = new Date().toISOString().slice(0, 10);
-  // One preferences read feeds both the hidden-tag filter and the shelf
-  // order; the shelves themselves assemble in registry order first.
-  const { hiddenTags, discoverOrder } = getContentPreferences(ctx.account.id);
-  const [newReleases, trending, recentlyAdded, requests] =
-    await Promise.allSettled([
-      // Built through the browse parser so the rail and its own browse link
-      // are provably the same query. Native provider filters carry the date
-      // bound; hidden tags apply before anything downstream is derived.
-      browseTitles(
-        parseBrowseQuery(
-          new URLSearchParams({
-            type: "all",
-            sort: "recency",
-            direction: "desc",
-            date: today,
-            date_operation: "<=",
-            page: "1",
-            perPage: String(SHELF_ITEMS),
-          }),
+  const preferences = getContentPreferences(ctx.account.id);
+  const hiddenTags = preferences.personalizeDiscover
+    ? preferences.hiddenTags
+    : [];
+  const include =
+    preferences.personalizeDiscover && preferences.applyIncludeTags
+      ? preferences.includeTags
+      : [];
+  const definitions = [
+    {
+      id: "new-releases",
+      title: "New movies · TPDB",
+      source: "tpdb" as const,
+      description:
+        "Newest releases from TPDB. TPDB does not publish a trending signal.",
+      params: {
+        type: "movie",
+        movieSource: "tpdb",
+        sort: "recency",
+        direction: "desc",
+        date: today,
+        date_operation: "<=",
+      },
+    },
+    {
+      id: "new-scenes",
+      title: "New scenes · StashDB",
+      source: "stashdb" as const,
+      description: "Newest scene releases from StashDB.",
+      params: {
+        type: "scene",
+        sort: "date",
+        direction: "desc",
+        date: today,
+        date_operation: "<=",
+      },
+    },
+    {
+      id: "tmdb-new",
+      title: "New movies · TMDB",
+      source: "tmdb" as const,
+      description: "Newest TMDB releases, filtered by your tag preferences.",
+      params: {
+        type: "movie",
+        movieSource: "tmdb",
+        sort: "recency",
+        direction: "desc",
+        date: today,
+        date_operation: "<=",
+      },
+    },
+    {
+      id: "trending",
+      title: "Trending scenes · StashDB",
+      source: "stashdb" as const,
+      description: "StashDB's scene trending signal.",
+      params: { type: "scene", sort: "trending", direction: "desc" },
+    },
+    {
+      id: "tmdb-trending",
+      title: "Recent popular movies · TMDB",
+      source: "tmdb" as const,
+      description:
+        "Adult-keyword US releases from the last 30 days, ranked by TMDB popularity and narrowed by your TMDB tags.",
+      params: {
+        type: "movie",
+        movieSource: "tmdb",
+        sort: "recent-popular",
+        direction: "desc",
+        recentDays: "30",
+      },
+    },
+  ];
+  const settled = await Promise.allSettled(
+    definitions.map((definition) => {
+      const params = new URLSearchParams(
+        Object.entries(definition.params).filter(
+          (pair): pair is [string, string] => typeof pair[1] === "string",
         ),
-        hiddenTags,
-      ),
-      // Trending is honestly a StashDB-only signal: TPDB publishes no
-      // trend data, so nothing pretends otherwise. Single source, so a
-      // failure is the shelf's own rejection.
-      searchVisibleCatalog(
-        {
-          provider: "stashdb",
-          kind: "scene",
-          sort: "trending",
-          direction: "desc",
-          page: 1,
-          perPage: SHELF_ITEMS,
-        },
-        hiddenTags,
-      ).then((page) => page.items),
-      listRecentlyAddedItems(ctx.config, ctx.token, ctx.account, SHELF_ITEMS),
-      // storage is sync; defer so its failures settle like the rest. Capped
-      // like every other shelf: a bulk performer request can file a hundred
-      // intents at once, and a rail is not a list view. The rows carry the
-      // shared acquisition state so the rail's badge tells the truth.
-      Promise.resolve().then(() => listRequestItems(ctx).slice(0, SHELF_ITEMS)),
-    ]);
-  // Appended only when this account follows someone (or a side failed): an
-  // account with no follows gets exactly the standard shelves.
-  const followed = await followedShelf(ctx.account.id, hiddenTags);
-  const shelves: Shelf[] = [
-    browseShelf(
-      {
-        id: "new-releases",
-        title: "New releases",
-        description: "Newest TPDB movies and StashDB scenes",
-        source: "velvarr",
-        kind: "catalog",
-        browse: {
-          view: "titles",
-          params: {
-            type: "all",
-            sort: "recency",
+      );
+      params.set("page", "1");
+      params.set("perPage", String(SHELF_ITEMS));
+      const sourceIncludes = scopeTagSelections(include, [definition.source]);
+      const sourceHidden = scopeTagSelections(hiddenTags, [definition.source]);
+      if (sourceIncludes.length)
+        params.set("include", JSON.stringify(sourceIncludes));
+      if (definition.id === "trending" && sourceIncludes.length === 0) {
+        return searchVisibleCatalog(
+          {
+            provider: "stashdb",
+            kind: "scene",
+            sort: "trending",
             direction: "desc",
-            date: today,
-            date_operation: "<=",
+            page: 1,
+            perPage: SHELF_ITEMS,
+            tagsExclude: sourceHidden
+              .flatMap((tag) => (tag.stashdb ? [tag.stashdb] : []))
+              .slice(0, TAG_FILTER_ID_CAP),
           },
-        },
-      },
-      newReleases,
-    ),
-    shelfOf(
+          sourceHidden,
+          DISCOVER_SCAN_BUDGET,
+        ).then((page) => ({ ...page, errors: page.errors ?? [] }));
+      }
+      return browseTitles(
+        parseBrowseQuery(params),
+        sourceHidden,
+        [],
+        DISCOVER_SCAN_BUDGET,
+      );
+    }),
+  );
+  const [recentlyAdded, requests] = await Promise.allSettled([
+    listRecentlyAddedItems(ctx.config, ctx.token, ctx.account, SHELF_ITEMS),
+    Promise.resolve().then(() => listRequestItems(ctx).slice(0, SHELF_ITEMS)),
+  ]);
+  const shelves: Shelf[] = definitions.map((definition, index) => {
+    const params = Object.fromEntries(
+      Object.entries(definition.params).filter(
+        (pair): pair is [string, string] => typeof pair[1] === "string",
+      ),
+    );
+    const sourceIncludes = scopeTagSelections(include, [definition.source]);
+    if (sourceIncludes.length) params.include = JSON.stringify(sourceIncludes);
+    // The link carries this row’s effective preference snapshot explicitly.
+    params.preferredTags = "0";
+    return browseShelf(
       {
-        id: "trending",
-        title: "Trending",
-        description: "Scene trends from StashDB",
-        source: "stashdb",
+        id: definition.id,
+        title: definition.title,
+        source: definition.source,
+        description: definition.description,
         kind: "catalog",
-        browse: {
-          view: "titles",
-          params: { type: "scene", sort: "trending", direction: "desc" },
-        },
+        browse: { view: "titles", params },
       },
-      trending,
-    ),
+      settled[index]!,
+    );
+  });
+  shelves.push(
     shelfOf(
       {
         id: "jellyfin-recent",
         title: "Recently added",
         source: "jellyfin",
         kind: "library",
-        browse: { view: "library", params: {} },
+        browse: { view: "library", params: { sort: "dateAdded" } },
       },
       recentlyAdded,
     ),
@@ -674,21 +768,38 @@ export async function discover(ctx: AuthContext): Promise<Response> {
       },
       requests,
     ),
-    ...(await facetShelves(newReleases)),
-    ...(followed === null ? [] : [followed]),
-  ];
-  // Per-account order over the PRESENT shelves only: a shelf the account
-  // cannot fill (no follows) stays absent — never a fake rail, and the
-  // saved order itself is untouched. Array#sort is stable, so any id the
-  // saved order does not know (a shelf newer than this account's stored
-  // order) keeps its assembled position after the ranked ones.
+    ...(await facetShelves(
+      settled[0]!.status === "fulfilled" && settled[1]!.status === "fulfilled"
+        ? {
+            status: "fulfilled",
+            value: {
+              ...settled[0]!.value,
+              items: [...settled[0]!.value.items, ...settled[1]!.value.items],
+              errors: [
+                ...settled[0]!.value.errors,
+                ...settled[1]!.value.errors,
+              ],
+            },
+          }
+        : settled[0]!.status === "fulfilled"
+          ? settled[0]!
+          : settled[1]!,
+    )),
+  );
+  const followed = await followedShelf(ctx.account.id, hiddenTags, include);
+  if (followed) shelves.push(followed);
   const rank = new Map<string, number>(
-    discoverOrder.map((id, i) => [id, i] as const),
+    preferences.discoverOrder.map((id, index) => [id, index]),
   );
   shelves.sort(
     (a, b) => (rank.get(a.id) ?? rank.size) - (rank.get(b.id) ?? rank.size),
   );
-  return json({ shelves });
+  return json({
+    shelves,
+    personalized: preferences.personalizeDiscover,
+    hiddenTagCount: hiddenTags.length,
+    preferredTagCount: include.length,
+  });
 }
 
 import { listRequestItems } from "./requests.ts";

@@ -50,11 +50,11 @@ export function judgmentConfiguration(options?: JudgmentOptions): {
     (stored?.judgmentProvider ??
       process.env.VELVARR_JUDGMENT_PROVIDER?.trim()) ||
     "typesafe";
-  if (provider !== "typesafe" && provider !== "ollama") {
+  if (provider !== "none" && provider !== "typesafe" && provider !== "ollama") {
     throw new AppError(
       400,
       "invalid_config",
-      "Judgment provider must be typesafe or ollama.",
+      "Judgment provider must be none, typesafe, or ollama.",
     );
   }
   const url =
@@ -68,9 +68,11 @@ export function judgmentConfiguration(options?: JudgmentOptions): {
     model,
     configured:
       provider === "ollama" ||
-      Boolean(
-        stored?.typesafeApiKey?.trim() || process.env.TYPESAFE_API_KEY?.trim(),
-      ),
+      (provider === "typesafe" &&
+        Boolean(
+          stored?.typesafeApiKey?.trim() ||
+          process.env.TYPESAFE_API_KEY?.trim(),
+        )),
     stored:
       stored?.judgmentProvider !== undefined ||
       stored?.ollamaUrl !== undefined ||
@@ -143,7 +145,10 @@ export async function checkJudgmentConnection(options?: JudgmentOptions) {
     return {
       provider: settings.provider,
       connected: false,
-      error: "No TypeSafe API key is configured.",
+      error:
+        settings.provider === "none"
+          ? "AI-assisted matching is disabled."
+          : "No TypeSafe API key is configured.",
     };
   try {
     const backend = judgmentBackend(options)!;

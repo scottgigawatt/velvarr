@@ -134,6 +134,13 @@ export function isPrivateHost(hostname: string): boolean {
 
 // Preserves any reverse-proxy path prefix, strips trailing slashes, and
 // rejects query strings, fragments, userinfo, and non-private plain HTTP.
+let storedHttpPolicy: boolean | undefined;
+export function setHttpPolicy(value: boolean | undefined): void {
+  storedHttpPolicy = value;
+}
+export function httpAllowed(): boolean {
+  return storedHttpPolicy ?? process.env.VELVARR_ALLOW_HTTP === "1";
+}
 export function validateBaseUrl(value: string): string {
   const invalid = () =>
     new AppError(
@@ -155,7 +162,7 @@ export function validateBaseUrl(value: string): string {
   if (scheme === "http") {
     if (
       !isLoopbackHost(u.hostname) &&
-      (process.env.VELVARR_ALLOW_HTTP !== "1" || !isPrivateHost(u.hostname))
+      (!httpAllowed() || !isPrivateHost(u.hostname))
     ) {
       // ponytail: EnableRemoteAccess-style trusted client-network model does
       // not exist yet, so private HTTP needs the explicit operator escape
@@ -163,7 +170,7 @@ export function validateBaseUrl(value: string): string {
       throw new AppError(
         400,
         "invalid_url",
-        "Plain HTTP is only allowed for loopback, or for trusted private addresses when VELVARR_ALLOW_HTTP=1.",
+        "Enable Allow private HTTP in Settings to connect to trusted local addresses. Public HTTP addresses are never allowed.",
       );
     }
   } else if (scheme !== "https") {

@@ -73,10 +73,9 @@ export function mergeTagCounts(
 /** Where a performer-page tag chip's browse jump must land. With a linked
  * performer on the other provider, the jump is a union: both of her ids
  * ride (primary `id` plus `counterpart`) and browse lands on All — her TPDB
- * movies plus her StashDB scenes in one page. No side can lie: a side whose
- * include tag cannot resolve itself self-disqualifies server-side
- * (`includeIdsForSide` resolves labels via `tagCounterpart`, exact
- * normalized name). Without a linked counterpart the old single-side rules
+ * movies plus her StashDB scenes in one page. Tags filter only the providers
+ * whose IDs they carry; the other side stays unconstrained by that tag.
+ * Without a linked counterpart the old single-side rules
  * stand: an own-side tag keeps the page performer; an other-side tag would
  * land on a provably empty page (a TPDB performer query never runs the
  * scene side), so it travels as a bare tag filter. */
@@ -262,20 +261,68 @@ export type PerformerFollow = {
   linked: CatalogReference | null;
 };
 
-/** One provider tag a user picked by its real published label. Ids are the
- * provider's own UUIDs; at least one must be present. */
+/** A picked tag carries its provider-native IDs; a label-only selection is
+ * an explicit free-text filter across providers. */
 export type CatalogTagSelection = {
   name: string;
   tpdb?: string;
   stashdb?: string;
+  /** TMDB keyword IDs remain scoped to TMDB. */
+  tmdb?: string;
 };
+
+/** Picked tags apply only to providers whose native IDs they carry.
+ * Explicit label-only terms remain filters across all providers. */
+export function tagAppliesToProvider(
+  tag: CatalogTagSelection,
+  provider: CatalogProvider,
+): boolean {
+  return (
+    tag[provider] !== undefined ||
+    (tag.tmdb === undefined &&
+      tag.tpdb === undefined &&
+      tag.stashdb === undefined)
+  );
+}
+
+/** Keep only tags and native IDs applicable to the selected catalog sources.
+ * Saved preferences are untouched; explicit free-text terms remain global. */
+export function scopeTagSelections(
+  tags: CatalogTagSelection[],
+  providers: readonly CatalogProvider[],
+): CatalogTagSelection[] {
+  return tags
+    .filter((tag) =>
+      providers.some((provider) => tagAppliesToProvider(tag, provider)),
+    )
+    .map((tag) => {
+      const selection: CatalogTagSelection = { name: tag.name };
+      for (const provider of providers) {
+        const id = tag[provider];
+        if (id !== undefined) selection[provider] = id;
+      }
+      return selection;
+    });
+}
+
+/** Native provider identity keeps same-named tags independently selectable.
+ * Label-only terms deduplicate by their normalized text instead. */
+export function tagSelectionKey(tag: CatalogTagSelection): string {
+  const ids = (["tmdb", "tpdb", "stashdb"] as const).flatMap((provider) =>
+    tag[provider] === undefined ? [] : [`${provider}:${tag[provider]}`],
+  );
+  return ids.length ? ids.join("|") : `text:${normalizeFacetName(tag.name)}`;
+}
 
 /** The Discover carousels in their default display order. Shared vocabulary:
  * the server orders present shelves by the saved per-account order, the UI
  * renders titles from here, and storage validates saved ids against it. */
 export const DISCOVER_SHELVES = [
-  { id: "new-releases", title: "New releases" },
-  { id: "trending", title: "Trending" },
+  { id: "new-releases", title: "New movies · TPDB" },
+  { id: "new-scenes", title: "New scenes · StashDB" },
+  { id: "tmdb-new", title: "New movies · TMDB" },
+  { id: "trending", title: "Trending scenes · StashDB" },
+  { id: "tmdb-trending", title: "Recent popular movies · TMDB" },
   { id: "jellyfin-recent", title: "Recently added" },
   { id: "velvarr-requests", title: "Recent requests" },
   { id: "studios", title: "Studios" },
@@ -293,6 +340,17 @@ export type DiscoverShelfId = (typeof DISCOVER_SHELVES)[number]["id"];
 export type ContentPreferences = {
   hiddenTags: CatalogTagSelection[];
   discoverOrder: DiscoverShelfId[];
+  includeTags: CatalogTagSelection[];
+  applyIncludeTags: boolean;
+  personalizeDiscover: boolean;
+  browseRowLimit: number;
+  appearance: AppearancePreferences;
+};
+
+export type AppearancePreferences = {
+  mode: "dark" | "light" | "system";
+  preset: "velvet" | "ocean" | "forest" | "amber" | "violet" | "custom";
+  accent: string;
 };
 
 export type RequestDecision = "pending" | "approved" | "declined" | "cancelled";
@@ -545,9 +603,11 @@ export function isCatalogId(provider: CatalogProvider, id: string): boolean {
     : UUID_RE.test(id);
 }
 
-export type JudgmentProvider = "typesafe" | "ollama";
+export type JudgmentProvider = "none" | "typesafe" | "ollama";
 
 export type IntegrationConfig = {
+  /** Administrator policy; absent values retain the environment fallback. */
+  allowHttp?: boolean;
   jellyfin: {
     url: string;
     externalUrl: string;

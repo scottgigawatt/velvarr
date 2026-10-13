@@ -10,6 +10,10 @@ type Connection = Omit<WhisparrConnection, "apiKey"> & {
 };
 type Status = {
   version?: string;
+  configured?: boolean;
+  error?: { code: string; message: string };
+  checkedAt?: string;
+  url?: string;
   rootFolders?: { id: number; path: string }[];
   profiles?: { id: number; name: string }[];
 };
@@ -23,9 +27,10 @@ const defaultDelivery = (root: string): WhisparrDelivery => ({
 /** Each connection owns its roots, credentials, and Jellyfin path correspondence. */
 export function WhisparrConnections() {
   const [connections, setConnections] = useState<Connection[]>([]);
-  const [editing, setEditing] = useState(false);
+  const [editingIndex, setEditingIndex] = useState<number | null>(null);
   const [ready, setReady] = useState(false);
   const [pending, setPending] = useState(false);
+  const [checkingId, setCheckingId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
   const [status, setStatus] = useState<Record<string, Status>>({});
@@ -36,6 +41,20 @@ export function WhisparrConnections() {
       .then((d) => {
         setConnections(d.connections.map((c) => ({ ...c, apiKey: "" })));
         setReady(true);
+        void api<{ instances: (Status & { instanceId: string })[] }>(
+          "/api/admin/whisparr/statuses",
+        )
+          .then((result) =>
+            setStatus(
+              Object.fromEntries(
+                result.instances.map((item) => [
+                  item.instanceId,
+                  { ...item, checkedAt: new Date().toISOString() },
+                ]),
+              ),
+            ),
+          )
+          .catch((error) => setError(messageOf(error)));
       })
       .catch((e) => setError(messageOf(e)));
   }, []);
@@ -59,6 +78,7 @@ export function WhisparrConnections() {
         { method: "PATCH", body: JSON.stringify({ connections }) },
       );
       setConnections(result.connections.map((c) => ({ ...c, apiKey: "" })));
+      setEditingIndex(null);
       window.dispatchEvent(new Event("velvarr:connections-changed"));
       setMessage(
         "Connections saved. Existing approvals retain their original destination.",
@@ -72,21 +92,34 @@ export function WhisparrConnections() {
   const check = async (c: Connection) => {
     if (!c.instanceId) return;
     setPending(true);
+    setCheckingId(c.instanceId);
     setError(null);
     try {
       const data = await api<Status>(
         `/api/admin/whisparr/connections/${c.instanceId}`,
       );
-      setStatus((s) => ({ ...s, [c.instanceId!]: data }));
+      setStatus((s) => ({
+        ...s,
+        [c.instanceId!]: { ...data, checkedAt: new Date().toISOString() },
+      }));
     } catch (e) {
       setError(messageOf(e));
+      setStatus((values) => ({
+        ...values,
+        [c.instanceId!]: {
+          configured: true,
+          url: values[c.instanceId!]?.url,
+          error: { code: "check_failed", message: messageOf(e) },
+        },
+      }));
     } finally {
       setPending(false);
+      setCheckingId(null);
     }
   };
   return (
-    <div className="panel p-5">
-      <h3 className="font-semibold">Whisparr connections</h3>
+    <section className="settings-group" aria-labelledby="whisparr-heading">
+      <h2 id="whisparr-heading">Whisparr</h2>
       <p className="mt-2 text-sm text-muted">
         Assign one connection to each movie provider. Scenes use the default
         connection unless staff chooses another before approval. Each connection
@@ -94,27 +127,81 @@ export function WhisparrConnections() {
         managed by Whisparr.
       </p>
       {error && <ErrorPanel message={error} />}
-      {!editing ? (
-        <button
-          className="btn mt-3"
-          disabled={!ready}
-          onClick={() => setEditing(true)}
-        >
-          Configure connections
-        </button>
-      ) : (
-        <div className="mt-4 space-y-5">
-          {connections.map((c, i) => {
-            const checked = c.instanceId ? status[c.instanceId] : undefined;
-            return (
+      <div className="instance-list">
+        {connections.map((c, i) => {
+          const checked = c.instanceId ? status[c.instanceId] : undefined;
+          const changed =
+            Boolean(c.apiKey) || Boolean(checked?.url && checked.url !== c.url);
+          const checking = checkingId !== null && checkingId === c.instanceId;
+          return (
+            <section key={c.instanceId ?? i} className="connection-instance">
+              <div className="instance-heading">
+                <div>
+                  <h3>{c.name || "New instance"}</h3>
+                  <p className="connection-address">
+                    {c.url || "Enter a server URL"}
+                  </p>
+                </div>
+                <span
+                  className={
+                    "connection-state " +
+                    (changed || checking
+                      ? ""
+                      : checked?.error
+                        ? "is-error"
+                        : checked?.version
+                          ? "is-ok"
+                          : "")
+                  }
+                >
+                  {changed
+                    ? "Unsaved connection"
+                    : checking
+                      ? "Checking…"
+                      : checked?.error
+                        ? "Connection failed"
+                        : checked?.version
+                          ? "Connected"
+                          : c.instanceId
+                            ? "Not checked"
+                            : "Not saved"}
+                </span>
+                <button
+                  className="btn"
+                  disabled={pending || !c.instanceId || changed}
+                  onClick={() => void check(c)}
+                >
+                  Check connection
+                </button>
+                <button
+                  className="btn"
+                  disabled={pending}
+                  aria-expanded={editingIndex === i}
+                  onClick={() => setEditingIndex(editingIndex === i ? null : i)}
+                >
+                  {editingIndex === i ? "Close" : "Edit instance"}
+                </button>
+              </div>
+              <div className="instance-meta">
+                <span>
+                  {c.movieProvider === "none"
+                    ? "Scenes only"
+                    : c.movieProvider.toUpperCase() + " movies"}
+                </span>
+                {c.sceneDefault && <span>Default for scenes</span>}
+                {checked?.version && <span>Version {checked.version}</span>}
+                {checked?.checkedAt && (
+                  <span>
+                    Checked {new Date(checked.checkedAt).toLocaleTimeString()}
+                  </span>
+                )}
+              </div>
+              {checked?.error && <ErrorPanel message={checked.error.message} />}
               <fieldset
-                key={i}
-                className="rounded border border-edge p-4"
+                className="instance-configuration"
                 disabled={pending}
+                hidden={editingIndex !== i}
               >
-                <legend className="font-semibold">
-                  {c.name || `Connection ${i + 1}`}
-                </legend>
                 <div className="grid gap-3 sm:grid-cols-2">
                   <label className="label">
                     Name
@@ -216,18 +303,44 @@ export function WhisparrConnections() {
                           />
                         </label>
                         <label className="label">
-                          Quality profile ID
-                          <input
-                            className="input"
-                            type="number"
-                            min={1}
-                            value={delivery.qualityProfileId}
-                            onChange={(e) =>
-                              update({
-                                qualityProfileId: Number(e.target.value),
-                              })
-                            }
-                          />
+                          Quality profile
+                          {checked?.profiles?.length ? (
+                            <select
+                              className="input"
+                              value={delivery.qualityProfileId}
+                              onChange={(event) =>
+                                update({
+                                  qualityProfileId: Number(event.target.value),
+                                })
+                              }
+                            >
+                              {!checked.profiles.some(
+                                (profile) =>
+                                  profile.id === delivery.qualityProfileId,
+                              ) && (
+                                <option value={delivery.qualityProfileId}>
+                                  Saved profile #{delivery.qualityProfileId}
+                                </option>
+                              )}
+                              {checked.profiles.map((profile) => (
+                                <option key={profile.id} value={profile.id}>
+                                  {profile.name}
+                                </option>
+                              ))}
+                            </select>
+                          ) : (
+                            <input
+                              className="input"
+                              type="number"
+                              min={1}
+                              value={delivery.qualityProfileId}
+                              onChange={(event) =>
+                                update({
+                                  qualityProfileId: Number(event.target.value),
+                                })
+                              }
+                            />
+                          )}
                         </label>
                         <label className="flex items-center gap-2 text-sm">
                           <input
@@ -341,47 +454,53 @@ export function WhisparrConnections() {
                   </p>
                 )}
               </fieldset>
-            );
-          })}
-          <div className="flex flex-wrap gap-2">
-            <button
-              className="btn"
-              disabled={pending || connections.length >= 8}
-              onClick={() =>
-                setConnections((cs) => [
-                  ...cs,
-                  {
-                    name: cs.length ? "Alternate" : "Main",
-                    url: "",
-                    apiKey: "",
-                    movieProvider: cs.some((c) => c.movieProvider === "tpdb")
-                      ? "tmdb"
-                      : "tpdb",
-                    sceneDefault: cs.length === 0,
-                    delivery: defaultDelivery("/data/movies"),
-                    sceneDelivery: defaultDelivery("/data/scenes"),
-                    pathMappings: [],
-                  },
-                ])
-              }
-            >
-              Add connection
-            </button>
-            <button
-              className="btn btn-accent"
-              disabled={pending}
-              onClick={() => void save()}
-            >
-              {pending ? "Saving…" : "Save connections"}
-            </button>
-          </div>
+            </section>
+          );
+        })}
+        <div className="flex flex-wrap gap-2">
+          <button
+            className="btn"
+            disabled={!ready || pending || connections.length >= 8}
+            onClick={() => {
+              setEditingIndex(connections.length);
+              setConnections((cs) => [
+                ...cs,
+                {
+                  name:
+                    cs.length === 0
+                      ? "Main"
+                      : cs.length === 1
+                        ? "Alternate"
+                        : "Instance " + (cs.length + 1),
+                  url: "",
+                  apiKey: "",
+                  movieProvider: cs.some((c) => c.movieProvider === "tpdb")
+                    ? "tmdb"
+                    : "tpdb",
+                  sceneDefault: cs.length === 0,
+                  delivery: defaultDelivery("/data/movies"),
+                  sceneDelivery: defaultDelivery("/data/scenes"),
+                  pathMappings: [],
+                },
+              ]);
+            }}
+          >
+            Add instance
+          </button>
+          <button
+            className="btn btn-accent"
+            disabled={pending}
+            onClick={() => void save()}
+          >
+            {pending ? "Working…" : "Save connections"}
+          </button>
         </div>
-      )}
+      </div>
       {message && (
         <p className="mt-3 text-sm" role="status">
           {message}
         </p>
       )}
-    </div>
+    </section>
   );
 }

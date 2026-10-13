@@ -567,6 +567,9 @@ const ICON_PATHS = {
   search: "M17 10a7 7 0 1 1-14 0 7 7 0 0 1 14 0Z m-2 5 6 6",
   requests: "M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0Z M12 7v5l3 2",
   library: "M4 4v16M8 4v16M12 4v16M16 4l4 16",
+  studio: "M3 21V8l6 4V8l6 4V4h6v17H3Z",
+  appearance:
+    "M12 3a9 9 0 1 0 0 18h2a2 2 0 0 0 0-4h-1a1 1 0 0 1 0-2h3a5 5 0 0 0 5-5c0-4-4-7-9-7Z M7 9h.01M10 6h.01M15 6h.01M18 9h.01",
   settings: "M4 7h16M4 17h16M8 4v6M16 14v6",
   users:
     "M14 8a4 4 0 1 1-8 0 4 4 0 0 1 8 0Z M2 21v-2a8 8 0 0 1 16 0v2 M17 4a4 4 0 0 1 0 8m2 3a6 6 0 0 1 3 6",

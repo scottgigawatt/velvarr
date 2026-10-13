@@ -64,7 +64,6 @@ let owner: Account;
 let requester: Account;
 const tmdbCalls: { url: URL; authorization: string | undefined }[] = [];
 let wrongDetail = false;
-let emptyAdult = false;
 let tmdbUnavailable = false;
 const metadata = createServer((req, res) => {
   const url = new URL(req.url!, "http://localhost");
@@ -91,17 +90,21 @@ const metadata = createServer((req, res) => {
     const page = Number(url.searchParams.get("page"));
     json({
       page,
-      total_pages: emptyAdult ? 100 : 3,
-      total_results: emptyAdult ? 2000 : 60,
+      total_pages: 3,
+      total_results: 60,
       results: Array.from({ length: 20 }, (_, i) => ({
         id: (page - 1) * 20 + i + 1,
         title: `Fixture ${page}-${i}`,
-        adult: !emptyAdult && i % 10 === 0,
+        adult: i % 10 === 0,
         genre_ids: [18],
         release_date: "2026-01-01",
         poster_path: "/poster.jpg",
       })),
     });
+    return;
+  }
+  if (/^\/3\/movie\/\d+\/keywords$/.test(url.pathname)) {
+    json({ keywords: [] });
     return;
   }
   if (url.pathname === "/3/movie/404") {
@@ -384,33 +387,21 @@ test("TMDB uses bearer reads, cached native pages, and full catalog title/year s
   );
 });
 
-test("adult-only scans across sparse pages without claiming an unfiltered total", async () => {
+test("TMDB pagination includes unflagged movies without scanning for an adult classification", async () => {
   const results = await searchCatalog({
     provider: "tmdb",
     kind: "movie",
-    query: "Adult fixture",
-    adultOnly: true,
+    query: "Fixture",
     perPage: 3,
     page: 2,
   });
   assert.deepEqual(
-    results.items.map((i) => i.reference.id),
-    ["31", "41", "51"],
+    results.items.map((item) => item.reference.id),
+    ["4", "5", "6"],
   );
-  assert.equal(results.totalCountKnown, false);
-  assert.equal(results.total, undefined);
-  assert.equal(results.hasMore, false);
-  emptyAdult = true;
-  await assert.rejects(
-    searchCatalog({
-      provider: "tmdb",
-      kind: "movie",
-      query: "Empty adult fixture",
-      adultOnly: true,
-    }),
-    (err: unknown) => err instanceof AppError && err.code === "query_too_broad",
-  );
-  emptyAdult = false;
+  assert.ok(results.items.every((item) => item.adult === false));
+  assert.equal(results.totalCountKnown, true);
+  assert.equal(results.total, 60);
 });
 
 test("TMDB details validate identity and surface outages; scene calls never leave the app", async () => {
@@ -459,7 +450,7 @@ test("legacy approvals and claims survive a real schema-11 upgrade and keep Main
   const db = new DatabaseSync(dbPath);
   // Remove the new column/index to reconstruct the pre-feature requests shape.
   db.exec(
-    "DROP INDEX requests_target; ALTER TABLE requests DROP COLUMN target_instance_id; PRAGMA user_version = 11;",
+    "ALTER TABLE accounts DROP COLUMN personal_settings; DROP INDEX requests_target; ALTER TABLE requests DROP COLUMN target_instance_id; PRAGMA user_version = 11;",
   );
   db.close();
   storage.initializeStorage();

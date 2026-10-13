@@ -1,3 +1,4 @@
+import { defaultPersonalSettings } from "../src/lib/personalization.ts";
 import assert from "node:assert/strict";
 import test, { after } from "node:test";
 import { createCipheriv, createHash, randomBytes } from "node:crypto";
@@ -500,15 +501,18 @@ test("guardMutation enforces exact configured origin and safe transport", () => 
 });
 
 // One failed login, the way routes/auth.ts runs it: the attempt reserves
-// its account slot before the upstream call, and a credential rejection
-// keeps that slot and feeds the global spray cap. A full global cap
-// surfaces 429 to the route, but the account charge stands either way.
-function failedLogin(name: string): void {
-  security.reserveLoginAttempt(name); // refund dropped: this was a guess
-  try {
-    security.recordLoginFailure();
-  } catch {
-    // global spray cap full — the reservation's charge already landed
+// its slots before the upstream call. A non-admitted guess holds its global
+// spray slot from the reservation; an admitted name is exempt from the
+// reservation and charges the cap on the rejection instead. A credential
+// rejection never refunds.
+function failedLogin(name: string, admitted = false): void {
+  security.reserveLoginAttempt(name, admitted); // refund dropped: this was a guess
+  if (admitted) {
+    try {
+      security.recordLoginFailure();
+    } catch {
+      // global spray cap full — nothing left to record
+    }
   }
 }
 
@@ -582,7 +586,7 @@ test("login limiter: the spray cap binds strangers, admitted names ride past it"
   security.resetLoginBuckets();
   // The per-account bucket still binds an admitted name even with admitted
   // set: brute force on a real account stays throttled.
-  for (let i = 0; i < 5; i++) failedLogin("locked-owner");
+  for (let i = 0; i < 5; i++) failedLogin("locked-owner", true);
   assert.throws(
     () => security.assertLoginAllowed("locked-owner", true),
     (e: { code: string }) => e.code === "too_many_attempts",
@@ -623,11 +627,14 @@ test("login limiter: the spray cap binds strangers, admitted names ride past it"
   // The old global-first charge skipped the account charge once the spray
   // cap was full, leaving admitted names unbounded.
   security.assertLoginAllowed("brute-target", true);
-  for (let i = 0; i < 5; i++) failedLogin("brute-target");
+  // These guesses go through login with hasAccountNamed=true, so the helper
+  // must state admitted: the reservation skips the full global bucket and
+  // the rejection feeds it, exactly as the route runs it.
+  for (let i = 0; i < 5; i++) failedLogin("brute-target", true);
   // The sixth guess is refused by its own account bucket, not the spray
   // cap: global full no longer means unlimited guesses.
   assert.throws(
-    () => failedLogin("brute-target"),
+    () => failedLogin("brute-target", true),
     (e: { code: string }) => e.code === "too_many_attempts",
   );
   assert.throws(
@@ -637,6 +644,57 @@ test("login limiter: the spray cap binds strangers, admitted names ride past it"
   // An untouched admitted name is exempt from the spray cap only, not
   // unlocked: a full global bucket locks no admitted name by itself.
   security.assertLoginAllowed("brute-bystander", true);
+});
+
+test("login limiter: reserve→refund cycles on distinct names leave the bucket map bounded", () => {
+  // Regression guard for the f29b9d2 leak: a non-credential outcome refunded
+  // the count but left an account:<name> bucket in the map forever, and
+  // consumeBucket's insert path skipped the MAX_BUCKETS sweep. A cheap
+  // invalid-credentials path (a 201..512-character password rejected before
+  // any upstream call) drove the map ~309 bytes per attempt with no cap
+  // charge; the refund must delete a bucket that reaches zero.
+  security.resetLoginBuckets();
+  const before = security.loginBucketCount();
+  for (let i = 0; i < 2000; i++) {
+    security.reserveLoginAttempt(`spray-${i}`)();
+  }
+  assert.equal(
+    security.loginBucketCount(),
+    before,
+    "a reserve→refund cycle must not leave a bucket behind",
+  );
+});
+
+test("login limiter: a rotating-name concurrent burst stops at GLOBAL_LIMIT (300)", async () => {
+  // The spray cap must bind a burst of rotating names, not just a sequence:
+  // the global slot lands in the same synchronous step as the reservation,
+  // before any upstream round-trip, so one burst cannot slip past the
+  // read-only gate's check-then-await.
+  security.resetLoginBuckets();
+  const results = await Promise.allSettled(
+    Array.from({ length: 320 }, async (_, i) => {
+      security.reserveLoginAttempt(`rot-${i}`);
+      return true;
+    }),
+  );
+  const passed = results.filter((r) => r.status === "fulfilled");
+  const refused = results.filter(
+    (r) =>
+      r.status === "rejected" &&
+      r.reason instanceof AppError &&
+      r.reason.code === "too_many_attempts",
+  );
+  assert.equal(
+    passed.length,
+    300,
+    `the burst must stop at GLOBAL_LIMIT (300), got ${passed.length}`,
+  );
+  assert.equal(refused.length, 20, "the surplus guesses must be refused");
+  assert.throws(
+    () => security.assertLoginAllowed("rot-unserved"),
+    (e: { code: string }) => e.code === "too_many_attempts",
+    "the global bucket must be what stopped the burst",
+  );
 });
 
 test("session cookie flags follow request transport and clear correctly", () => {
@@ -937,7 +995,11 @@ test("v1 database migrates in place preserving config, accounts, sessions, and g
   );
   assert.deepEqual(
     storage.getContentPreferences(owner.id),
-    { hiddenTags: [], discoverOrder: DEFAULT_ORDER },
+    {
+      ...defaultPersonalSettings(),
+      hiddenTags: [],
+      discoverOrder: DEFAULT_ORDER,
+    },
     "migrated accounts default to empty hidden tags and the default order",
   );
   assert.deepEqual(
@@ -960,7 +1022,7 @@ test("v1 database migrates in place preserving config, accounts, sessions, and g
     raw.prepare("PRAGMA user_version").get() as { user_version: number }
   ).user_version;
   raw.close();
-  assert.equal(version, 12, "v1 database must migrate to schema 12");
+  assert.equal(version, 13, "v1 database must migrate to schema 13");
   // A v1 database never contained the removal tables (current migration 5
   // creates none), so nothing here can assert about them; the schema-10 test
   // below owns the claim that migration 11 drops them.
@@ -1096,7 +1158,9 @@ test("a schema-10 database migrates to 11: every removal object is dropped, rows
       "INSERT INTO removal_audit (id, execution_id, requester_id, approver_id, provider, kind, external_id, level, attempt_token, outcome, created_at) VALUES ('ra1', 're1', ?, ?, 'tpdb', 'movie', ?, 'drop', 'att1', 'done', ?)",
     )
     .run(ownerUser().id, ownerUser().id, MOVIE.id, now);
-  raw.exec("PRAGMA user_version = 10");
+  raw.exec(
+    "ALTER TABLE accounts DROP COLUMN personal_settings; PRAGMA user_version = 10",
+  );
   raw.close();
   storage.closeStorage();
 
@@ -1129,8 +1193,8 @@ test("a schema-10 database migrates to 11: every removal object is dropped, rows
   );
   assert.equal(
     versionRow.user_version,
-    12,
-    "schema 10 database must migrate to schema 12",
+    13,
+    "schema 10 database must migrate to schema 13",
   );
   assert.ok(
     grantRow !== null &&
@@ -1679,7 +1743,12 @@ test("a URL change carries imported approvals forward and still delivers never-d
   assert.ok(importedRow);
   storage.recordAcquisitionObservation(importedRow.id, {
     state: "imported",
-    item: { monitored: true },
+    item: {
+      whisparrId: 42,
+      path: "/data/whisparr/movie.mkv",
+      title: "Carried Movie",
+      monitored: true,
+    },
   });
 
   // Approved but never dispatched: delivery must still happen after the move.
@@ -1693,12 +1762,212 @@ test("a URL change carries imported approvals forward and still delivers never-d
   const carried = storage.getAcquisitionByReference(MOVIE);
   assert.ok(carried);
   assert.equal(carried.state, "imported", "imported survives the URL change");
+  assert.equal(carried.whisparrId, 42, "whisparrId survives the URL change");
+  assert.equal(
+    carried.whisparrPath,
+    "/data/whisparr/movie.mkv",
+    "the path survives the URL change",
+  );
+  assert.equal(
+    carried.whisparrTitle,
+    "Carried Movie",
+    "the title survives the URL change",
+  );
+  assert.equal(
+    carried.whisparrMonitored,
+    true,
+    "monitored survives the URL change",
+  );
+  assert.ok(carried.lastObservedAt, "lastObservedAt survives the URL change");
+  assert.equal(
+    carried.dueAt,
+    null,
+    "a carried imported row is never rescheduled",
+  );
 
   const due = storage.listDueAcquisitions(Date.now() + 60_000);
   assert.deepEqual(
     due.map((a) => [a.media.id, a.state]),
     [[SCENE.id, "unsent"]],
     "only the never-dispatched approval is due after the change",
+  );
+});
+
+test("boot repair restores facts a URL change dropped from a carried imported row", () => {
+  freshDir();
+  storage.bootstrap(deliveryConfig(true), ownerUser(), "jf-owner-token");
+  const owner = storage.getAccount(ownerUser().id) as Account;
+
+  const done = storage.createRequest(owner.id, MOVIE);
+  storage.decideRequest(owner, done.id, "approved");
+  const observed = storage.getAcquisitionByReference(MOVIE);
+  assert.ok(observed);
+  storage.recordAcquisitionObservation(observed.id, {
+    state: "imported",
+    item: {
+      whisparrId: 42,
+      path: "/data/whisparr/movie.mkv",
+      title: "Carried Movie",
+      monitored: true,
+    },
+  });
+
+  const moved = deliveryConfig(true);
+  moved.whisparr = { ...moved.whisparr!, url: "http://127.0.0.1:6970" };
+  storage.saveConfig(moved);
+  const carried = storage.getAcquisitionByReference(MOVIE);
+  assert.ok(carried);
+
+  // Simulate a build that carried the state without the observed facts.
+  storage.closeStorage();
+  const raw = new DatabaseSync(join(currentDir, "velvarr.sqlite"));
+  raw
+    .prepare(
+      "UPDATE acquisitions SET last_observed_at = NULL, whisparr_id = NULL, whisparr_path = NULL, whisparr_title = NULL, whisparr_monitored = NULL WHERE id = ?",
+    )
+    .run(carried.id);
+  raw.close();
+
+  storage.initializeStorage();
+  const repaired = storage.getAcquisitionByReference(MOVIE);
+  assert.ok(repaired);
+  assert.equal(repaired.state, "imported");
+  assert.equal(repaired.whisparrId, 42, "repair restores whisparrId");
+  assert.equal(
+    repaired.whisparrPath,
+    "/data/whisparr/movie.mkv",
+    "repair restores the path",
+  );
+  assert.equal(
+    repaired.whisparrTitle,
+    "Carried Movie",
+    "repair restores the title",
+  );
+  assert.equal(repaired.whisparrMonitored, true, "repair restores monitored");
+  assert.ok(repaired.lastObservedAt, "repair restores lastObservedAt");
+  assert.equal(
+    repaired.dueAt,
+    null,
+    "repair never reschedules an imported row",
+  );
+
+  // Idempotent: a second boot leaves the repaired row untouched.
+  const updatedAt = repaired.updatedAt;
+  storage.initializeStorage();
+  assert.equal(
+    storage.getAcquisitionByReference(MOVIE)?.updatedAt,
+    updatedAt,
+    "a second boot must not touch the repaired row",
+  );
+});
+
+test("boot repair only heals the current identity so a retired row never hijacks the next carry", () => {
+  freshDir();
+  storage.bootstrap(deliveryConfig(true), ownerUser(), "jf-owner-token");
+  const owner = storage.getAccount(ownerUser().id) as Account;
+
+  // In flight on the current identity: delivered, observed, monitoring.
+  const request = storage.createRequest(owner.id, MOVIE);
+  storage.decideRequest(owner, request.id, "approved");
+  const current = storage.getAcquisitionByReference(MOVIE);
+  assert.ok(current);
+  storage.recordAcquisitionObservation(current.id, {
+    state: "monitoring",
+    item: {
+      whisparrId: 7,
+      path: "/data/whisparr/new/M.mkv",
+      title: "M",
+      monitored: true,
+    },
+  });
+
+  // Retired rows only the untagged 193ea58..7a6939b builds can leave behind:
+  // identity A imported with observed facts, identity B the same import
+  // carried without its facts. Their updated_at predates the current row.
+  storage.closeStorage();
+  const raw = new DatabaseSync(join(currentDir, "velvarr.sqlite"));
+  const retired = 1_000_000_000_000;
+  const insert = raw.prepare(
+    `INSERT INTO acquisitions
+       (id, instance_id, provider, kind, external_id, state,
+        created_at, updated_at, last_observed_at,
+        whisparr_id, whisparr_path, whisparr_title, whisparr_monitored)
+     VALUES (?, ?, 'tpdb', 'movie', ?, 'imported', ?, ?, ?, ?, ?, ?, ?)`,
+  );
+  insert.run(
+    "retired-a",
+    "retired-a-instance",
+    MOVIE.id,
+    retired,
+    retired,
+    retired,
+    42,
+    "/data/whisparr/old/M.mkv",
+    "M",
+    1,
+  );
+  insert.run(
+    "retired-b",
+    "retired-b-instance",
+    MOVIE.id,
+    retired,
+    retired,
+    null,
+    null,
+    null,
+    null,
+  );
+  raw.close();
+
+  // Boot: the repair must leave retired rows alone. Unscoped, it healed B
+  // and stamped it with the boot time, so B became the
+  // latestAcquisitionForReference the next URL change carries from.
+  storage.initializeStorage();
+  storage.closeStorage();
+  const after = new DatabaseSync(join(currentDir, "velvarr.sqlite"));
+  const healed = after
+    .prepare(
+      "SELECT updated_at, whisparr_path FROM acquisitions WHERE id = 'retired-b'",
+    )
+    .get() as { updated_at: number; whisparr_path: string | null };
+  after.close();
+  assert.equal(
+    healed.updated_at,
+    retired,
+    "a retired row is never touched by boot repair",
+  );
+  assert.equal(
+    healed.whisparr_path,
+    null,
+    "a retired row gains no facts from boot repair",
+  );
+
+  // The next URL change must re-enqueue the in-flight title on the new
+  // identity, not replay identity A's stale import as a finished one.
+  const moved = deliveryConfig(true);
+  moved.whisparr = { ...moved.whisparr!, url: "http://127.0.0.1:6970" };
+  storage.saveConfig(moved);
+  const carried = storage.getAcquisitionByReference(MOVIE);
+  assert.ok(carried);
+  assert.equal(
+    carried.state,
+    "unsent",
+    "the in-flight title is re-enqueued, not carried as a stale import",
+  );
+  assert.ok(carried.dueAt, "the re-enqueued row is due");
+  assert.deepEqual(
+    storage.listDueAcquisitions(Date.now() + 60_000).map((a) => a.state),
+    ["unsent"],
+    "only the re-enqueued work is due on the new identity",
+  );
+
+  // A second boot changes nothing.
+  const updatedAt = carried.updatedAt;
+  storage.initializeStorage();
+  assert.equal(
+    storage.getAcquisitionByReference(MOVIE)?.updatedAt,
+    updatedAt,
+    "a second boot must not touch the re-enqueued row",
   );
 });
 
@@ -2642,10 +2911,16 @@ test("content preferences persist per account, survive reopen, and never leak be
   const { owner, other } = prefSetup();
   assert.deepEqual(
     storage.getContentPreferences(owner),
-    { hiddenTags: [], discoverOrder: DEFAULT_ORDER },
+    {
+      ...defaultPersonalSettings(),
+      hiddenTags: [],
+      discoverOrder: DEFAULT_ORDER,
+    },
     "fresh accounts start empty",
   );
   assert.deepEqual(storage.getContentPreferences(other), {
+    ...defaultPersonalSettings(),
+    ...defaultPersonalSettings(),
     hiddenTags: [],
     discoverOrder: DEFAULT_ORDER,
   });
@@ -2656,15 +2931,24 @@ test("content preferences persist per account, survive reopen, and never leak be
       { name: "ro-mance", stashdb: TAG_STASH },
     ],
   });
-  // The same label from both providers consolidates into one selection.
+  // Same-named tags remain independent selections from their own providers.
   assert.deepEqual(saved, {
-    hiddenTags: [{ name: "Rómance", tpdb: TAG_TPDB, stashdb: TAG_STASH }],
+    ...defaultPersonalSettings(),
+    ...defaultPersonalSettings(),
+    hiddenTags: [
+      { name: "Rómance", tpdb: TAG_TPDB },
+      { name: "ro-mance", stashdb: TAG_STASH },
+    ],
     discoverOrder: DEFAULT_ORDER,
   });
   assert.deepEqual(storage.getContentPreferences(owner), saved);
   assert.deepEqual(
     storage.getContentPreferences(other),
-    { hiddenTags: [], discoverOrder: DEFAULT_ORDER },
+    {
+      ...defaultPersonalSettings(),
+      hiddenTags: [],
+      discoverOrder: DEFAULT_ORDER,
+    },
     "another account is unaffected",
   );
 
@@ -2675,6 +2959,8 @@ test("content preferences persist per account, survive reopen, and never leak be
     "preferences survive close/reopen",
   );
   assert.deepEqual(storage.getContentPreferences(other), {
+    ...defaultPersonalSettings(),
+    ...defaultPersonalSettings(),
     hiddenTags: [],
     discoverOrder: DEFAULT_ORDER,
   });
@@ -2715,7 +3001,7 @@ test("malformed preferences are rejected atomically; unknown accounts are 404", 
       {
         hiddenTags: Array.from({ length: 26 }, (_, i) => ({
           name: `Tag ${i}`,
-          tpdb: TAG_TPDB,
+          tpdb: `00000000-0000-4000-8000-${String(i).padStart(12, "0")}`,
         })),
       },
     ],
@@ -2730,6 +3016,9 @@ test("malformed preferences are rejected atomically; unknown accounts are 404", 
   }
   // Every rejection above changed nothing.
   assert.deepEqual(storage.getContentPreferences(owner), {
+    ...defaultPersonalSettings(),
+    ...defaultPersonalSettings(),
+    ...defaultPersonalSettings(),
     hiddenTags: good.hiddenTags,
     discoverOrder: DEFAULT_ORDER,
   });
@@ -2744,12 +3033,12 @@ test("malformed preferences are rejected atomically; unknown accounts are 404", 
   assert.equal(labelOnly[0]!.tpdb, undefined);
   assert.equal(labelOnly[0]!.stashdb, undefined);
 
-  // 25 consolidated selections pass; the label rule keeps the dupes out.
+  // Native identity deduplicates a repeat while keeping the 25-tag cap.
   const capped: CatalogTagSelection[] = Array.from({ length: 25 }, (_, i) => ({
     name: `Tag ${i}`,
-    tpdb: TAG_TPDB,
+    tpdb: `00000000-0000-4000-8000-${String(i).padStart(12, "0")}`,
   }));
-  capped.push({ name: "TAG 0", stashdb: TAG_STASH });
+  capped.push({ name: "TAG 0", tpdb: capped[0]!.tpdb });
   assert.equal(
     storage.saveContentPreferences(other, { hiddenTags: capped }).hiddenTags
       .length,
@@ -2757,8 +3046,7 @@ test("malformed preferences are rejected atomically; unknown accounts are 404", 
   );
   assert.deepEqual(storage.getContentPreferences(other).hiddenTags[0], {
     name: "Tag 0",
-    tpdb: TAG_TPDB,
-    stashdb: TAG_STASH,
+    tpdb: capped[0]!.tpdb,
   });
 
   assert.throws(
@@ -2796,6 +3084,8 @@ test("stored hidden tags that can never match are pruned on read and saved back 
 
   // Reads prune the dead rows; the live selection survives untouched.
   assert.deepEqual(storage.getContentPreferences(owner), {
+    ...defaultPersonalSettings(),
+    ...defaultPersonalSettings(),
     hiddenTags: [{ name: "Romance", tpdb: TAG_TPDB }],
     discoverOrder: DEFAULT_ORDER,
   });
@@ -2835,7 +3125,10 @@ test("discover order persists per account, isolates accounts, and partial saves 
   assert.deepEqual(reordered.discoverOrder, [
     "genres",
     "new-releases",
+    "new-scenes",
+    "tmdb-new",
     "trending",
+    "tmdb-trending",
     "jellyfin-recent",
     "velvarr-requests",
     "studios",
@@ -2861,6 +3154,8 @@ test("discover order persists per account, isolates accounts, and partial saves 
   );
   assert.deepEqual(reopened.hiddenTags, []);
   assert.deepEqual(storage.getContentPreferences(other), {
+    ...defaultPersonalSettings(),
+    ...defaultPersonalSettings(),
     hiddenTags: [],
     discoverOrder: DEFAULT_ORDER,
   });
@@ -2944,6 +3239,7 @@ test("discover order rejects duplicates, unknown ids, and non-strings without to
 
   // Every rejection above left both fields exactly as last saved.
   assert.deepEqual(storage.getContentPreferences(owner), {
+    ...defaultPersonalSettings(),
     hiddenTags: savedTags,
     discoverOrder: storedOrder,
   });
@@ -3001,7 +3297,11 @@ test("schema 9 preferences survive the schema 10 upgrade: hidden tags kept, orde
   );
   assert.deepEqual(
     storage.getContentPreferences(other),
-    { hiddenTags: [], discoverOrder: DEFAULT_ORDER },
+    {
+      ...defaultPersonalSettings(),
+      hiddenTags: [],
+      discoverOrder: DEFAULT_ORDER,
+    },
     "accounts that never saved preferences keep every default",
   );
 

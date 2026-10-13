@@ -1,19 +1,42 @@
+import {
+  recentPopularWindow,
+  RECENT_POPULAR_DAYS,
+  RECENT_POPULAR_REGION,
+} from "../lib/tmdb-discovery.ts";
+import {
+  previewLimitError,
+  recentPopularLimitError,
+  type CatalogScanBudget,
+} from "./catalog-budget.ts";
 // TMDB movie reads only. Search pages stay lightweight; details are fetched on demand.
-import type { CatalogDetail, CatalogReference } from "../lib/contracts.ts";
-import { isCatalogId } from "../lib/contracts.ts";
+import type {
+  CatalogDetail,
+  CatalogReference,
+  CatalogTagSelection,
+} from "../lib/contracts.ts";
+import { isCatalogId, tagAppliesToProvider } from "../lib/contracts.ts";
 import type { CatalogSearchPage } from "./providers.ts";
 import { AppError } from "./http.ts";
+import { tagMatches } from "./catalog-visibility.ts";
+import { normalizeFacetName } from "../lib/contracts.ts";
 
 export type TmdbQuery = {
   provider: "tmdb";
   kind: "movie";
   query?: string;
   year?: number;
-  adultOnly?: boolean;
-  sort?: "relevance" | "recency";
+  sort?: "relevance" | "recency" | "popularity" | "recent-popular" | "trending";
+  recentDays?: number;
+  cast?: string;
+  company?: string;
+  includeTags?: CatalogTagSelection[];
+  excludeTags?: CatalogTagSelection[];
+  releaseDate?: { cutoff: string; operation: "=" | "<" | "<=" | ">" | ">=" };
   direction?: "asc" | "desc";
   page?: number;
   perPage?: number;
+  /** Internal preview policy, never forwarded to the provider. */
+  scanBudget?: CatalogScanBudget;
 };
 type Row = Record<string, unknown>;
 type Read = <T>(path: string) => Promise<T>;
@@ -41,14 +64,14 @@ function movie(
   if (!movieId || !title) return undefined;
   const tags = rows(r.genres).flatMap((g) =>
     id(g.id) && text(g.name, 120)
-      ? [{ id: id(g.id)!, name: text(g.name, 120)! }]
+      ? [{ id: "genre:" + id(g.id)!, name: text(g.name, 120)! }]
       : [],
   );
   if (tags.length === 0 && Array.isArray(r.genre_ids)) {
     for (const raw of r.genre_ids) {
       const gid = id(raw),
         name = gid ? genres.get(gid) : undefined;
-      if (gid && name) tags.push({ id: gid, name });
+      if (gid && name) tags.push({ id: "genre:" + gid, name });
     }
   }
   const date = text(r.release_date, 10);
@@ -77,6 +100,43 @@ function movie(
   };
 }
 
+// Resolve published keyword identities instead of guessing IDs or trusting the adult flag.
+export const DEFAULT_ADULT_KEYWORDS = [
+  "pornography",
+  "pornographic film",
+  "gay pornography",
+  "lesbian pornography",
+  "hardcore pornography",
+  "softcore pornography",
+  "hentai",
+  "adult",
+] as const;
+const adultKeywordMemo = new WeakMap<Read, { at: number; ids: string[] }>();
+
+async function adultKeywordIds(read: Read): Promise<string[]> {
+  const cached = adultKeywordMemo.get(read);
+  if (cached && Date.now() - cached.at < 3600000) return cached.ids;
+  const matches = await Promise.all(
+    DEFAULT_ADULT_KEYWORDS.map(async (name) =>
+      (await searchTmdbKeywords(read, name))
+        .filter(
+          (keyword) =>
+            normalizeFacetName(keyword.name) === normalizeFacetName(name),
+        )
+        .map((keyword) => keyword.id),
+    ),
+  );
+  const ids = [...new Set(matches.flat())];
+  if (!ids.length)
+    throw new AppError(
+      503,
+      "tmdb_adult_keywords_unavailable",
+      "TMDB did not return the adult-media keyword catalog. No unfiltered movie list was substituted.",
+    );
+  adultKeywordMemo.set(read, { at: Date.now(), ids });
+  return ids;
+}
+
 /** Bounded native pages, never a catalog download. Filtered totals stay unknown. */
 export async function searchTmdb(
   read: Read,
@@ -84,6 +144,27 @@ export async function searchTmdb(
 ): Promise<CatalogSearchPage> {
   if (query.kind !== "movie")
     throw new AppError(400, "invalid_search", "TMDB supports movies only.");
+  for (const value of [query.cast, query.company]) {
+    if (value !== undefined && !isCatalogId("tmdb", value))
+      throw new AppError(
+        400,
+        "invalid_search",
+        "Invalid TMDB cast or company ID.",
+      );
+  }
+  // Legacy TMDB Trending links now use the disclosed recent-popular query.
+  if (query.sort === "trending") query = { ...query, sort: "recent-popular" };
+  if (
+    query.recentDays !== undefined &&
+    !(RECENT_POPULAR_DAYS as readonly number[]).includes(query.recentDays)
+  )
+    throw new AppError(
+      400,
+      "invalid_search",
+      "Recent popularity window must be 30, 90, or 365 days.",
+    );
+  const recent = query.sort === "recent-popular";
+  const window = recent ? recentPopularWindow(query.recentDays) : undefined;
   const page = query.page ?? 1,
     perPage = query.perPage ?? 24;
   if (
@@ -96,10 +177,9 @@ export async function searchTmdb(
   )
     throw new AppError(400, "invalid_search", "Invalid TMDB page.");
   if (
-    (query.adultOnly !== undefined && typeof query.adultOnly !== "boolean") ||
-    (query.direction !== undefined &&
-      query.direction !== "asc" &&
-      query.direction !== "desc")
+    query.direction !== undefined &&
+    query.direction !== "asc" &&
+    query.direction !== "desc"
   )
     throw new AppError(
       400,
@@ -113,7 +193,12 @@ export async function searchTmdb(
       "invalid_search",
       "TMDB title search uses relevance order. Clear the title to browse by release date.",
     );
-  if (query.sort && query.sort !== "relevance" && query.sort !== "recency")
+  if (
+    query.sort &&
+    !["relevance", "recency", "popularity", "recent-popular"].includes(
+      query.sort,
+    )
+  )
     throw new AppError(400, "invalid_search", "Unsupported TMDB sort.");
   if (!q && query.sort === "relevance")
     throw new AppError(
@@ -130,17 +215,26 @@ export async function searchTmdb(
   const appliedSort = q
     ? { key: "relevance" as const, upstream: "relevance" }
     : {
-        key: "recency" as const,
+        key:
+          query.sort === "popularity"
+            ? ("popularity" as const)
+            : query.sort === "recent-popular"
+              ? ("recent-popular" as const)
+              : ("recency" as const),
         direction: query.direction ?? "desc",
-        upstream: `primary_release_date.${query.direction ?? "desc"}`,
+        upstream:
+          query.sort === "recent-popular"
+            ? "popularity." + (query.direction ?? "desc")
+            : (query.sort === "popularity"
+                ? "popularity."
+                : "primary_release_date.") + (query.direction ?? "desc"),
       };
   const params = new URLSearchParams({
     include_adult: "true",
     language: "en-US",
   });
   if (q) params.set("query", q.slice(0, 500));
-  else
-    params.set("sort_by", `primary_release_date.${query.direction ?? "desc"}`);
+  else params.set("sort_by", appliedSort.upstream);
   if (query.year !== undefined) {
     if (!Number.isInteger(query.year) || query.year < 1900 || query.year > 2100)
       throw new AppError(400, "invalid_search", "Invalid TMDB release year.");
@@ -160,13 +254,60 @@ export async function searchTmdb(
         : [],
     ),
   );
+  if (!q) {
+    if (query.cast) params.set("with_cast", query.cast);
+    if (query.company) params.set("with_companies", query.company);
+  }
+  const includes = (query.includeTags ?? []).filter((tag) =>
+    tagAppliesToProvider(tag, "tmdb"),
+  );
+  const excludes = (query.excludeTags ?? []).filter((tag) =>
+    tagAppliesToProvider(tag, "tmdb"),
+  );
+  const filtered = Boolean(
+    includes.length ||
+    excludes.length ||
+    query.releaseDate ||
+    query.cast ||
+    query.company ||
+    recent,
+  );
+  const nativeKeywords = !q;
+  const nativeIncludes = includes.flatMap((tag) =>
+    tag.tmdb ? [tag.tmdb] : [],
+  );
+  const adultIds = recent ? await adultKeywordIds(read) : [];
+  if (nativeKeywords && nativeIncludes.length)
+    params.set("with_keywords", nativeIncludes.join(","));
+  else if (recent) params.set("with_keywords", adultIds.join("|"));
+  if (window) {
+    params.set("region", RECENT_POPULAR_REGION);
+    params.set("release_date.gte", window.start);
+    params.set("release_date.lte", window.end);
+  }
+  if (nativeKeywords && excludes.some((tag) => tag.tmdb))
+    params.set(
+      "without_keywords",
+      excludes.flatMap((tag) => (tag.tmdb ? [tag.tmdb] : [])).join(","),
+    );
+  if (!q && query.releaseDate) {
+    const { cutoff, operation } = query.releaseDate;
+    if (["=", ">=", ">"].includes(operation))
+      params.set("primary_release_date.gte", cutoff);
+    if (["=", "<=", "<"].includes(operation))
+      params.set("primary_release_date.lte", cutoff);
+  }
   const offset = (page - 1) * perPage;
-  let nativePage = query.adultOnly ? 1 : Math.floor(offset / 20) + 1;
-  let skip = query.adultOnly ? offset : offset % 20;
+  let nativePage = filtered ? 1 : Math.floor(offset / 20) + 1;
+  let skip = filtered ? offset : offset % 20;
   const items: CatalogDetail[] = [];
   let total: number | undefined,
     more = false;
-  for (let fetched = 0; fetched < 40; fetched++, nativePage++) {
+  for (
+    let fetched = 0;
+    fetched < (query.scanBudget?.maxPages ?? 40);
+    fetched++, nativePage++
+  ) {
     if (nativePage > 500)
       throw new AppError(
         422,
@@ -175,7 +316,7 @@ export async function searchTmdb(
       );
     params.set("page", String(nativePage));
     const data = await read<Row>(
-      `/3/${q ? "search" : "discover"}/movie?${params}`,
+      `/3/${q ? "search" : "discover"}/movie` + "?" + params,
     );
     if (
       !Array.isArray(data.results) ||
@@ -192,18 +333,113 @@ export async function searchTmdb(
       );
     total = Number(data.total_results);
     more = false;
-    const candidates = rows(data.results)
-      .filter((r) => !query.adultOnly || r.adult === true)
-      .flatMap((r) => {
-        const d = movie(r, genres);
-        if (!d)
-          throw new AppError(
-            502,
-            "upstream_bad_response",
-            "TMDB returned an unusable movie row.",
-          );
-        return [d];
+    let candidates = rows(data.results).flatMap((r) => {
+      const d = movie(r, genres);
+      if (!d)
+        throw new AppError(
+          502,
+          "upstream_bad_response",
+          "TMDB returned an unusable movie row.",
+        );
+      return [d];
+    });
+    // Discover applies regional release dates; rows expose the primary date, which may differ.
+    if (q && (query.cast || query.company)) {
+      const qualified = await Promise.all(
+        candidates.map(async (detail) => {
+          let metadata: Row;
+          try {
+            metadata = await read<Row>(
+              "/3/movie/" + detail.reference.id + "?append_to_response=credits",
+            );
+          } catch (error) {
+            if (error instanceof AppError && error.upstreamStatus === 404)
+              return null;
+            throw error;
+          }
+          if (id(metadata.id) !== detail.reference.id)
+            throw new AppError(
+              502,
+              "upstream_bad_response",
+              "TMDB returned a different movie while filtering.",
+            );
+          if (
+            (query.cast && !Array.isArray(row(metadata.credits).cast)) ||
+            (query.company && !Array.isArray(metadata.production_companies))
+          )
+            throw new AppError(
+              502,
+              "upstream_bad_response",
+              "TMDB returned unusable cast or company metadata.",
+            );
+          const matchesCast =
+            !query.cast ||
+            rows(row(metadata.credits).cast).some(
+              (cast) => id(cast.id) === query.cast,
+            );
+          const matchesCompany =
+            !query.company ||
+            rows(metadata.production_companies).some(
+              (company) => id(company.id) === query.company,
+            );
+          return matchesCast && matchesCompany ? detail : null;
+        }),
+      );
+      candidates = qualified.filter(
+        (detail): detail is CatalogDetail => detail !== null,
+      );
+    }
+    if (includes.length || excludes.length || recent) {
+      const tagged = await Promise.all(
+        candidates.map(async (detail) => {
+          let keywords: Row;
+          try {
+            keywords = await read<Row>(
+              "/3/movie/" + detail.reference.id + "/keywords",
+            );
+          } catch (error) {
+            // A removed movie cannot satisfy tag filters; keep the other rows.
+            if (error instanceof AppError && error.upstreamStatus === 404)
+              return null;
+            throw error;
+          }
+          if (!Array.isArray(keywords.keywords))
+            throw new AppError(
+              502,
+              "upstream_bad_response",
+              "TMDB returned unusable keywords.",
+            );
+          detail.tags.push(...keywordRows(keywords.keywords));
+          return detail;
+        }),
+      );
+      candidates = tagged
+        .filter((detail): detail is CatalogDetail => detail !== null)
+        .filter(
+          (detail) =>
+            (!recent || detail.tags.some((tag) => adultIds.includes(tag.id))) &&
+            includes.every((tag) =>
+              tagMatches(detail, tag, tag.tmdb ? "exact" : "substring"),
+            ) &&
+            !excludes.some((tag) => tagMatches(detail, tag, "family")),
+        );
+    }
+    if (query.releaseDate) {
+      const { cutoff, operation } = query.releaseDate;
+      candidates = candidates.filter((detail) => {
+        const date = detail.releaseDate;
+        if (!date) return false;
+        return operation === "="
+          ? date === cutoff
+          : operation === "<"
+            ? date < cutoff
+            : operation === "<="
+              ? date <= cutoff
+              : operation === ">"
+                ? date > cutoff
+                : date >= cutoff;
       });
+    }
     for (let i = 0; i < candidates.length; i++) {
       if (skip > 0) {
         skip--;
@@ -225,12 +461,26 @@ export async function searchTmdb(
         items,
         sort: appliedSort,
         hasMore: more,
-        totalCountKnown: !query.adultOnly && Number(data.total_pages) <= 500,
-        ...(!query.adultOnly && Number(data.total_pages) <= 500
-          ? { total }
-          : {}),
+        totalCountKnown: !filtered && Number(data.total_pages) <= 500,
+        ...(!filtered && Number(data.total_pages) <= 500 ? { total } : {}),
       };
   }
+  if (query.scanBudget || query.sort === "recent-popular")
+    return {
+      provider: "tmdb",
+      kind: "movie",
+      page,
+      perPage,
+      items,
+      sort: appliedSort,
+      hasMore: false,
+      totalCountKnown: false,
+      errors: [
+        query.sort === "recent-popular"
+          ? recentPopularLimitError()
+          : previewLimitError("tmdb"),
+      ],
+    };
   throw new AppError(
     422,
     "query_too_broad",
@@ -251,7 +501,7 @@ export async function detailTmdb(
   let data: Row;
   try {
     data = await read<Row>(
-      `/3/movie/${reference.id}?append_to_response=credits,recommendations,alternative_titles,external_ids`,
+      `/3/movie/${reference.id}?append_to_response=credits,recommendations,alternative_titles,external_ids,keywords`,
     );
   } catch (err) {
     if (err instanceof AppError && err.upstreamStatus === 404) return null;
@@ -264,6 +514,7 @@ export async function detailTmdb(
       "upstream_bad_response",
       "TMDB returned a different or unusable movie.",
     );
+  detail.tags.push(...keywordRows(row(data.keywords).keywords));
   detail.aliases = rows(row(data.alternative_titles).titles)
     .flatMap((a) => (text(a.title, 500) ? [text(a.title, 500)!] : []))
     .slice(0, 50);
@@ -294,4 +545,51 @@ export async function detailTmdb(
       label: "IMDb",
     });
   return detail;
+}
+
+function keywordRows(value: unknown): { id: string; name: string }[] {
+  return rows(value).flatMap((entry) =>
+    id(entry.id) && text(entry.name, 120)
+      ? [{ id: id(entry.id)!, name: text(entry.name, 120)! }]
+      : [],
+  );
+}
+export async function searchTmdbKeywords(
+  read: Read,
+  term: string,
+): Promise<{ id: string; name: string }[]> {
+  const data = await read<Row>(
+    "/3/search/keyword?query=" + encodeURIComponent(term) + "&page=1",
+  );
+  if (!Array.isArray(data.results))
+    throw new AppError(
+      502,
+      "upstream_bad_response",
+      "TMDB returned an unusable keyword search.",
+    );
+  return keywordRows(data.results)
+    .filter((entry) => normalizeFacetName(entry.name) !== "")
+    .slice(0, 25);
+}
+
+/** Cast and production-company choices remain filters over movies, not deliverable identities. */
+export async function searchTmdbFacets(
+  read: Read,
+  kind: "performer" | "studio",
+  term: string,
+): Promise<{ id: string; name: string }[]> {
+  const data = await read<Row>(
+    "/3/search/" +
+      (kind === "performer" ? "person" : "company") +
+      "?query=" +
+      encodeURIComponent(term) +
+      "&page=1",
+  );
+  if (!Array.isArray(data.results))
+    throw new AppError(
+      502,
+      "upstream_bad_response",
+      "TMDB returned an unusable facet search.",
+    );
+  return keywordRows(data.results).slice(0, 25);
 }
