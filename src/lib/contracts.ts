@@ -285,6 +285,26 @@ export function tagAppliesToProvider(
   );
 }
 
+/** Keep only tags and native IDs applicable to the selected catalog sources.
+ * Saved preferences are untouched; explicit free-text terms remain global. */
+export function scopeTagSelections(
+  tags: CatalogTagSelection[],
+  providers: readonly CatalogProvider[],
+): CatalogTagSelection[] {
+  return tags
+    .filter((tag) =>
+      providers.some((provider) => tagAppliesToProvider(tag, provider)),
+    )
+    .map((tag) => {
+      const selection: CatalogTagSelection = { name: tag.name };
+      for (const provider of providers) {
+        const id = tag[provider];
+        if (id !== undefined) selection[provider] = id;
+      }
+      return selection;
+    });
+}
+
 /** Native provider identity keeps same-named tags independently selectable.
  * Label-only terms deduplicate by their normalized text instead. */
 export function tagSelectionKey(tag: CatalogTagSelection): string {

@@ -1,3 +1,4 @@
+import { scopeBrowseTags } from "../../../../lib/browse-url.ts";
 import { searchTmdbFacets } from "../../../../server/tmdb.ts";
 import { tmdbGet } from "../../../../server/providers.ts";
 import { shelfError } from "./discover.ts";
@@ -488,18 +489,31 @@ export async function browseRoute(
   ctx: AuthContext,
 ): Promise<Response> {
   const preferences = getContentPreferences(ctx.account.id);
-  const hiddenTags = preferences.hiddenTags;
   const params = new URL(request.url).searchParams;
   const parsedQuery = parseBrowseQuery(params);
-  const preferred =
+  const hiddenTags = scopeBrowseTags(
+    preferences.hiddenTags,
+    parsedQuery.type,
+    parsedQuery.movieSource,
+  );
+  const preferred = scopeBrowseTags(
     params.get("preferredTags") === "1" ||
-    (preferences.applyIncludeTags && params.get("preferredTags") !== "0")
+      (preferences.applyIncludeTags && params.get("preferredTags") !== "0")
       ? preferences.includeTags
-      : [];
-  parsedQuery.include = parseTagSelections([
-    ...parsedQuery.include,
-    ...preferred,
-  ]);
+      : [],
+    parsedQuery.type,
+    parsedQuery.movieSource,
+  );
+  parsedQuery.include = scopeBrowseTags(
+    parseTagSelections([...parsedQuery.include, ...preferred]),
+    parsedQuery.type,
+    parsedQuery.movieSource,
+  );
+  parsedQuery.exclude = scopeBrowseTags(
+    parsedQuery.exclude,
+    parsedQuery.type,
+    parsedQuery.movieSource,
+  );
   // Only StashDB-side identities can match — TPDB has no multi-performer
   // criterion (ponytail: TPDB-only follows are invisible to this filter; N
   // filmography streams if movies ever need it).
@@ -562,7 +576,23 @@ export async function browseRoute(
     ];
     const settled = await Promise.allSettled(
       queries.map((query) =>
-        browseTitles(query, hiddenTags, starredPerformerIds),
+        browseTitles(
+          {
+            ...query,
+            include: scopeBrowseTags(
+              query.include,
+              query.type,
+              query.movieSource,
+            ),
+            exclude: scopeBrowseTags(
+              query.exclude,
+              query.type,
+              query.movieSource,
+            ),
+          },
+          scopeBrowseTags(hiddenTags, query.type, query.movieSource),
+          starredPerformerIds,
+        ),
       ),
     );
     return json({

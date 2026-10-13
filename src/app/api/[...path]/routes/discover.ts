@@ -16,6 +16,7 @@ import type {
 import {
   normalizeFacetName,
   tagAppliesToProvider,
+  scopeTagSelections,
 } from "../../../../lib/contracts.ts";
 import {
   getContentPreferences,
@@ -682,8 +683,11 @@ export async function discover(ctx: AuthContext): Promise<Response> {
       );
       params.set("page", "1");
       params.set("perPage", String(SHELF_ITEMS));
-      if (include.length) params.set("include", JSON.stringify(include));
-      if (definition.id === "trending" && include.length === 0) {
+      const sourceIncludes = scopeTagSelections(include, [definition.source]);
+      const sourceHidden = scopeTagSelections(hiddenTags, [definition.source]);
+      if (sourceIncludes.length)
+        params.set("include", JSON.stringify(sourceIncludes));
+      if (definition.id === "trending" && sourceIncludes.length === 0) {
         return searchVisibleCatalog(
           {
             provider: "stashdb",
@@ -692,17 +696,17 @@ export async function discover(ctx: AuthContext): Promise<Response> {
             direction: "desc",
             page: 1,
             perPage: SHELF_ITEMS,
-            tagsExclude: hiddenTags
+            tagsExclude: sourceHidden
               .flatMap((tag) => (tag.stashdb ? [tag.stashdb] : []))
               .slice(0, TAG_FILTER_ID_CAP),
           },
-          hiddenTags,
+          sourceHidden,
           DISCOVER_SCAN_BUDGET,
         ).then((page) => ({ ...page, errors: page.errors ?? [] }));
       }
       return browseTitles(
         parseBrowseQuery(params),
-        hiddenTags,
+        sourceHidden,
         [],
         DISCOVER_SCAN_BUDGET,
       );
@@ -718,7 +722,10 @@ export async function discover(ctx: AuthContext): Promise<Response> {
         (pair): pair is [string, string] => typeof pair[1] === "string",
       ),
     );
-    if (include.length) params.include = JSON.stringify(include);
+    const sourceIncludes = scopeTagSelections(include, [definition.source]);
+    if (sourceIncludes.length) params.include = JSON.stringify(sourceIncludes);
+    // The link carries this row’s effective preference snapshot explicitly.
+    params.preferredTags = "0";
     return browseShelf(
       {
         id: definition.id,

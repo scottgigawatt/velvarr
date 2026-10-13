@@ -314,11 +314,19 @@ export async function searchTmdb(
       );
     }
     if (includes.length || excludes.length) {
-      candidates = await Promise.all(
+      const tagged = await Promise.all(
         candidates.map(async (detail) => {
-          const keywords = await read<Row>(
-            "/3/movie/" + detail.reference.id + "/keywords",
-          );
+          let keywords: Row;
+          try {
+            keywords = await read<Row>(
+              "/3/movie/" + detail.reference.id + "/keywords",
+            );
+          } catch (error) {
+            // A removed movie cannot satisfy tag filters; keep the other rows.
+            if (error instanceof AppError && error.upstreamStatus === 404)
+              return null;
+            throw error;
+          }
           if (!Array.isArray(keywords.keywords))
             throw new AppError(
               502,
@@ -329,12 +337,14 @@ export async function searchTmdb(
           return detail;
         }),
       );
-      candidates = candidates.filter(
-        (detail) =>
-          includes.every((tag) =>
-            tagMatches(detail, tag, tag.tmdb ? "exact" : "substring"),
-          ) && !excludes.some((tag) => tagMatches(detail, tag, "family")),
-      );
+      candidates = tagged
+        .filter((detail): detail is CatalogDetail => detail !== null)
+        .filter(
+          (detail) =>
+            includes.every((tag) =>
+              tagMatches(detail, tag, tag.tmdb ? "exact" : "substring"),
+            ) && !excludes.some((tag) => tagMatches(detail, tag, "family")),
+        );
     }
     if (query.releaseDate) {
       const { cutoff, operation } = query.releaseDate;

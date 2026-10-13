@@ -9,6 +9,8 @@ import {
   type CatalogProvider,
 } from "../src/lib/contracts.ts";
 import { tagMatches, isHiddenTitle } from "../src/server/catalog-visibility.ts";
+import { scopeBrowseTags, countActiveFilters } from "../src/lib/browse-url.ts";
+import { scopeTagSelections } from "../src/lib/contracts.ts";
 import { parseTagSelections } from "../src/server/storage.ts";
 
 const providers: CatalogProvider[] = ["tmdb", "tpdb", "stashdb"];
@@ -60,5 +62,39 @@ test("same-named picked tags stay separate from other providers and free text", 
   assert.deepEqual(
     parsed.map(tagSelectionKey),
     selections.map(tagSelectionKey),
+  );
+});
+
+test("a TMDB trending link and stale mixed-provider URL show only the active TMDB tag", () => {
+  const tags = [
+    { name: "gay pornography", tmdb: "44" },
+    { name: "Gay", tpdb: "00000000-0000-4000-8000-000000000033" },
+    { name: "Gay", stashdb: "00000000-0000-4000-8000-000000000044" },
+  ];
+  assert.deepEqual(scopeBrowseTags(tags, "movie", "tmdb"), [tags[0]]);
+  assert.deepEqual(scopeBrowseTags(tags, "movie", "tpdb"), [tags[1]]);
+  assert.deepEqual(scopeBrowseTags(tags, "scene", "tmdb"), [tags[2]]);
+  assert.deepEqual(scopeBrowseTags(tags, "all", "tmdb"), [tags[0], tags[2]]);
+  assert.equal(
+    countActiveFilters({
+      include: scopeBrowseTags(tags, "movie", "tmdb"),
+      sort: "trending",
+      movieSource: "tmdb",
+    }),
+    3,
+  );
+  assert.equal(tags.length, 3, "saved preferences must remain intact");
+  assert.deepEqual(
+    scopeTagSelections(
+      [
+        {
+          name: "Explicit pair",
+          tmdb: "44",
+          tpdb: "00000000-0000-4000-8000-000000000033",
+        },
+      ],
+      ["tmdb"],
+    ),
+    [{ name: "Explicit pair", tmdb: "44" }],
   );
 });

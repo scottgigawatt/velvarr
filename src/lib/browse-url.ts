@@ -1,3 +1,8 @@
+import {
+  scopeTagSelections,
+  type CatalogProvider,
+  type CatalogTagSelection,
+} from "./contracts.ts";
 // Client mirror of the server's planBrowseSides refusals (src/server/browse.ts):
 // pure URL policy, no React, no IO. Every function returns a param patch for
 // useParamsSetter — null deletes a key. The server side stays the authority;
@@ -15,6 +20,27 @@ import {
 } from "./sorts.ts";
 
 export type BrowseType = "all" | "movie" | "scene";
+
+/** The catalog sources whose tag filters are active on this Browse view. */
+export function browseTagProviders(
+  type: BrowseType,
+  movieSource: "tmdb" | "tpdb" = "tpdb",
+): CatalogProvider[] {
+  return type === "scene"
+    ? ["stashdb"]
+    : type === "movie"
+      ? [movieSource]
+      : [movieSource, "stashdb"];
+}
+
+/** Shared UI/API scoping prevents inactive provider tags appearing as filters. */
+export function scopeBrowseTags(
+  tags: CatalogTagSelection[],
+  type: BrowseType,
+  movieSource: "tmdb" | "tpdb" = "tpdb",
+): CatalogTagSelection[] {
+  return scopeTagSelections(tags, browseTagProviders(type, movieSource));
+}
 
 export const BROWSE_KEYS = [
   "type",
@@ -48,9 +74,8 @@ export function clearBrowseKeys(
 }
 
 // Sorts are per-type: one the new type does not support is dropped.
-// Filters never drop on a tab switch: a source-scoped filter on the wrong
-// tab yields an honest empty page (the server runs no side), so the chips
-// and the URL stay truthful while the tab shows no results.
+// URL selections survive tab switches; only the active sources
+// contribute tag chips, counts, and provider requests.
 function sortPair(
   type: BrowseType,
   sortRaw: string,

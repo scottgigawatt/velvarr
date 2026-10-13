@@ -793,7 +793,7 @@ test("foreign picked tags do not trigger TMDB keyword reads or change its native
   );
 });
 
-test("saved TMDB preferences filter TMDB rows without filtering TPDB or StashDB Browse and Discover", async () => {
+test("three provider preferences produce scoped Discover links and Browse counts without rewriting saved tags", async () => {
   await withFixture(
     (req, res, body) => {
       const path = pathOf(req.url ?? "");
@@ -807,6 +807,17 @@ test("saved TMDB preferences filter TMDB rows without filtering TPDB or StashDB 
           total_results: 1,
           results: [{ id: 1, title: "TMDB match", release_date: "2020-01-01" }],
         });
+      else if (path === "/tags")
+        sendJson(res, 200, {
+          data: [
+            {
+              id: 11,
+              uuid: "00000000-0000-4000-8000-000000000033",
+              name: "Gay",
+            },
+          ],
+          links: { next: null },
+        });
       else if (path === "/movies")
         sendJson(res, 200, {
           data: [
@@ -814,7 +825,13 @@ test("saved TMDB preferences filter TMDB rows without filtering TPDB or StashDB 
               id: "00000000-0000-4000-8000-000000000011",
               title: "TPDB unrelated",
               date: "2020-01-01",
-              tags: [],
+              tags: [
+                {
+                  id: 11,
+                  uuid: "00000000-0000-4000-8000-000000000033",
+                  name: "Gay",
+                },
+              ],
               performers: [],
               scenes: [],
               movies: [],
@@ -829,10 +846,13 @@ test("saved TMDB preferences filter TMDB rows without filtering TPDB or StashDB 
         const gql = JSON.parse(body) as {
           variables: { f?: { tags?: unknown } };
         };
-        assert.equal(
+        assert.deepEqual(
           gql.variables.f?.tags,
-          undefined,
-          "TMDB preferences must not become StashDB tag criteria",
+          {
+            value: ["00000000-0000-4000-8000-000000000044"],
+            modifier: "INCLUDES_ALL",
+          },
+          "Scenes must carry only their StashDB preference",
         );
         sendJson(res, 200, {
           data: {
@@ -843,7 +863,9 @@ test("saved TMDB preferences filter TMDB rows without filtering TPDB or StashDB 
                   id: "00000000-0000-4000-8000-000000000022",
                   title: "StashDB unrelated",
                   date: "2020-01-01",
-                  tags: [],
+                  tags: [
+                    { id: "00000000-0000-4000-8000-000000000044", name: "Gay" },
+                  ],
                   performers: [],
                   studio: null,
                   urls: [],
@@ -873,7 +895,11 @@ test("saved TMDB preferences filter TMDB rows without filtering TPDB or StashDB 
           },
         });
         storage.saveContentPreferences(owner.id, {
-          includeTags: [{ name: "Wanted", tmdb: "44" }],
+          includeTags: [
+            { name: "Wanted", tmdb: "44" },
+            { name: "Gay", tpdb: "00000000-0000-4000-8000-000000000033" },
+            { name: "Gay", stashdb: "00000000-0000-4000-8000-000000000044" },
+          ],
           hiddenTags: [{ name: "Unrelated", tmdb: "55" }],
         });
         for (const source of ["tmdb", "tpdb"]) {
@@ -885,6 +911,7 @@ test("saved TMDB preferences filter TMDB rows without filtering TPDB or StashDB 
             ctx,
           );
           const page = await response.json();
+          assert.equal(page.preferredTagCount, 2);
           assert.equal(page.groups[0].items.length, 1);
           assert.equal(page.groups[1].items.length, 1);
           assert.deepEqual(page.groups[1].errors, []);
@@ -904,7 +931,32 @@ test("saved TMDB preferences filter TMDB rows without filtering TPDB or StashDB 
           );
           assert.ok(shelf, shelfId);
           assert.equal(shelf.items.length, 1, shelfId);
+          const expected =
+            shelf.source === "tmdb"
+              ? "tmdb"
+              : shelf.source === "tpdb"
+                ? "tpdb"
+                : "stashdb";
+          const selections = JSON.parse(shelf.browse.params.include);
+          assert.equal(selections.length, 1, shelfId);
+          assert.ok(selections[0][expected], shelfId);
+          const query = new URLSearchParams(shelf.browse.params);
+          const browse = await browseRoute(
+            new Request("http://localhost/api/browse?" + query),
+            ctx,
+          );
+          const result = await browse.json();
+          assert.equal(result.items.length, 1, shelfId);
+          assert.equal(
+            result.preferredTagCount,
+            0,
+            "explicit row tags must not reapply the whole preference list",
+          );
         }
+        assert.equal(
+          storage.getContentPreferences(owner.id).includeTags.length,
+          3,
+        );
       } finally {
         keys.forEach((key, index) => {
           if (previous[index] === undefined) delete process.env[key];
@@ -913,5 +965,58 @@ test("saved TMDB preferences filter TMDB rows without filtering TPDB or StashDB 
         resetMetaCache();
       }
     },
+  );
+});
+
+test("a missing TMDB keyword record skips only that title while provider failures remain errors", async () => {
+  const read = async <T>(path: string): Promise<T> => {
+    if (path === "/3/movie/1/keywords")
+      throw new AppError(404, "upstream_not_found", "Missing movie", 404);
+    return (
+      path.startsWith("/3/genre/movie/list")
+        ? { genres: [] }
+        : path.endsWith("/keywords")
+          ? { keywords: [{ id: 44, name: "Wanted" }] }
+          : {
+              page: 1,
+              total_pages: 1,
+              total_results: 2,
+              results: [
+                { id: 1, title: "Removed" },
+                { id: 2, title: "Matching title" },
+              ],
+            }
+    ) as T;
+  };
+  const query = {
+    provider: "tmdb" as const,
+    kind: "movie" as const,
+    sort: "trending" as const,
+    includeTags: [{ name: "Wanted", tmdb: "44" }],
+  };
+  const result = await searchTmdb(read, query);
+  assert.deepEqual(
+    result.items.map((item) => item.reference.id),
+    ["2"],
+  );
+  for (const status of [401, 500]) {
+    await assert.rejects(
+      searchTmdb(async <T>(path: string): Promise<T> => {
+        if (path.endsWith("/keywords"))
+          throw new AppError(502, "upstream_unavailable", "Failure", status);
+        return read<T>(path);
+      }, query),
+      (error: unknown) =>
+        error instanceof AppError && error.upstreamStatus === status,
+    );
+  }
+  await assert.rejects(
+    searchTmdb(async <T>(path: string): Promise<T> => {
+      if (path.startsWith("/3/trending/"))
+        throw new AppError(404, "upstream_not_found", "Missing listing", 404);
+      return read<T>(path);
+    }, query),
+    (error: unknown) =>
+      error instanceof AppError && error.upstreamStatus === 404,
   );
 });

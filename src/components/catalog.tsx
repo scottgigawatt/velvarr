@@ -55,6 +55,7 @@ import { mergePageItems } from "../lib/browse-items.ts";
 // table the server's acceptance comes from.
 import {
   clearBrowseKeys,
+  scopeBrowseTags,
   countActiveFilters,
   performerStashdbPatch,
   performerTpdbPatch,
@@ -886,8 +887,16 @@ function SingleTitlesView() {
   const tmdbPerformer = params.get("tmdbPerformer");
   const tmdbStudio = params.get("tmdbStudio");
   const q = params.get("q") ?? "";
-  const include = parseTags(params.get("include"));
-  const exclude = parseTags(params.get("exclude"));
+  const include = scopeBrowseTags(
+    parseTags(params.get("include")),
+    type,
+    movieSource,
+  );
+  const exclude = scopeBrowseTags(
+    parseTags(params.get("exclude")),
+    type,
+    movieSource,
+  );
   const studioTpdb = params.get("studioTpdb") ?? "";
   const studioStashdb = params.get("studioStashdb") ?? "";
   const performerTpdb = params.get("performerTpdb") ?? "";
@@ -1393,7 +1402,12 @@ function SingleTitlesView() {
     chips.push(
       <FilterChip
         key={`include:${tag.name}:${tag.tpdb ?? ""}:${tag.stashdb ?? ""}:${i}`}
-        label={`Tag: ${tag.name} (include)`}
+        label={`Tag: ${tag.name} (${
+          (["tmdb", "tpdb", "stashdb"] as const)
+            .filter((provider) => tag[provider] !== undefined)
+            .map(providerLabel)
+            .join(", ") || "Free text"
+        }; include)`}
         onRemove={() => onInclude(include.filter((t) => t !== tag))}
       />,
     );
@@ -1402,7 +1416,12 @@ function SingleTitlesView() {
     chips.push(
       <FilterChip
         key={`exclude:${tag.name}:${tag.tpdb ?? ""}:${tag.stashdb ?? ""}:${i}`}
-        label={`Tag: ${tag.name} (exclude)`}
+        label={`Tag: ${tag.name} (${
+          (["tmdb", "tpdb", "stashdb"] as const)
+            .filter((provider) => tag[provider] !== undefined)
+            .map(providerLabel)
+            .join(", ") || "Free text"
+        }; exclude)`}
         onRemove={() => onExclude(exclude.filter((t) => t !== tag))}
       />,
     );
@@ -1806,8 +1825,16 @@ function GroupedTitlesView() {
   const source = params.get("movieSource") === "tmdb" ? "tmdb" : "tpdb";
   const q = params.get("q") ?? "";
   const year = params.get("year") ?? "";
-  const include = parseTags(params.get("include"));
-  const exclude = parseTags(params.get("exclude"));
+  const include = scopeBrowseTags(
+    parseTags(params.get("include")),
+    "all",
+    source,
+  );
+  const exclude = scopeBrowseTags(
+    parseTags(params.get("exclude")),
+    "all",
+    source,
+  );
   const [filtersOpen, setFiltersOpen] = useState(false);
   const preferences = useApiGet<ContentPreferences>("/api/me/preferences", []);
   const query = new URLSearchParams({ grouped: "1" });
@@ -1834,6 +1861,13 @@ function GroupedTitlesView() {
   ]) {
     const value = params.get(key);
     if (value !== null) query.set(key, value);
+  }
+  for (const [key, tags] of [
+    ["include", include],
+    ["exclude", exclude],
+  ] as const) {
+    if (tags.length) query.set(key, JSON.stringify(tags));
+    else query.delete(key);
   }
   const path = "/api/browse?" + query;
   const page = useApiGet<{
@@ -1881,6 +1915,15 @@ function GroupedTitlesView() {
     values.delete("rowLimit");
     values.set("view", "titles");
     values.set("type", group.type);
+    for (const key of ["include", "exclude"]) {
+      const tags = scopeBrowseTags(
+        parseTags(values.get(key)),
+        group.type,
+        source,
+      );
+      if (tags.length) values.set(key, JSON.stringify(tags));
+      else values.delete(key);
+    }
     return "/?" + values;
   };
   return (

@@ -3875,7 +3875,12 @@ test("discover: mixed new releases, honest trending, facets, grants, not-configu
   assert.equal(trending?.description, "StashDB's scene trending signal.");
   assert.deepEqual(trending?.browse, {
     view: "titles",
-    params: { type: "scene", sort: "trending", direction: "desc" },
+    params: {
+      type: "scene",
+      sort: "trending",
+      direction: "desc",
+      preferredTags: "0",
+    },
   });
   assert.deepEqual(trending?.items?.[0]?.reference, {
     provider: "stashdb",
