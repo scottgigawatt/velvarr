@@ -24,7 +24,7 @@
 - **One Browse surface** — TPDB movies and StashDB scenes in a single grid with title search, tag include/exclude (an included picked tag matches exactly and a typed include term keeps titles with any tag containing it; an exclusion, picked or typed, also drops tags that contain it as a word — Anal drops Anal Creampie, never Analingus), studio, performer, year, and date filters; every constraint rides in the URL
 - **Global search** across both providers, plus unified **Studios** and **Genres** rails; results are never merged across providers and cross-provider identity comes only from links the providers publish — never name matching
 - **Durable requests** with administrator or moderator approval and an optional per-account auto-approve grant; the Requests list filters by media type and status and sorts by most recent or last modified
-- **Crash-safe acquisition worker** — every attempt is persisted before any network call and reconciled by exact identity after a restart; never a lost or duplicated add
+- **Crash-safe acquisition worker** — every attempt is persisted before any network call and reconciled by exact identity after a restart; never a lost or duplicated add. A permanently unresolvable identity, or one Whisparr no longer holds, is terminal: the worker stops re-checking it and the request reads "will not be retried".
 - **Per-user Jellyfin availability** and credential-free watch links
 - **Performer follows** — follow a performer once to track them on both providers (Following view, a Discover rail); when the providers never linked two entries, Merge pairs the current entry with an already-followed entry on the other provider and follows the current one if needed. Failed merges leave follows unchanged.
 - **Personal preferences** — per-account hidden tags (matched like exclusions) and Discover shelf ordering
@@ -36,6 +36,15 @@
 ## Getting started
 
 **Docker** (recommended):
+
+Before the first start, create `.env.local` next to `compose.yaml` with the operator secrets (what they do: [Configuration](#configuration)). Without it the container starts, but no owner account can be created because the setup gate has no secrets to check:
+
+```sh
+printf 'VELVARR_SECRET_KEY=%s\nVELVARR_SETUP_SECRET=%s\n' \
+  "$(openssl rand -hex 32)" "$(openssl rand -base64 32 | tr '+/' '-_' | tr -d '=')" > .env.local
+```
+
+In a source checkout, `bun run setup` writes the same file instead and never overwrites an existing one. **Back up `VELVARR_SECRET_KEY`**: losing it makes the stored database and every backup unreadable.
 
 ```sh
 docker compose up -d   # pulls ghcr.io/skare69/velvarr
@@ -69,8 +78,8 @@ bun run dev     # http://127.0.0.1:6699
 | `VELVARR_DISCORD_WEBHOOK_URL`| no               | Private Discord webhook for notifications; https only.                               |
 | `VELVARR_DISCORD_DETAIL`     | no               | `1` includes titles in notifications; off by default, messages stay identity-only.   |
 | `TMDB_READ_TOKEN` | no | Optional TMDB API read access token for movie metadata; a stored token takes precedence. |
-| `TYPESAFE_API_KEY`           | no               | TypeSafe key for AI-assisted matching when TypeSafe is selected; a stored key takes precedence. |
-| `VELVARR_JUDGMENT_PROVIDER` | no | `typesafe` (default), `ollama`, or `none`; stored AI-assisted matching settings take precedence. |
+| `TYPESAFE_API_KEY`           | no               | TypeSafe key for AI-assisted matching when TypeSafe is selected; a stored key takes precedence. Tag suggestions send member search terms, so they run only with a key saved in Settings. |
+| `VELVARR_JUDGMENT_PROVIDER` | no | `typesafe` (default), `ollama`, or `none`; stored AI-assisted matching settings take precedence. An environment-only choice keeps title review and related-title ranking, but tag suggestions start only after the choice is saved in Settings. |
 | `OLLAMA_BASE_URL` | no | Ollama API root; default `http://localhost:11434`. |
 | `OLLAMA_MODEL` | no | Downloaded decision model; default `nimble`. |
 | `VELVARR_UPDATE_CHECK`       | no               | `0` disables the release check. By default the server asks GitHub (`api.github.com`) for the latest release at most once an hour — ten minutes after a failure — to show the update chip. |
@@ -104,7 +113,7 @@ Connection settings contain one Jellyfin area and one Whisparr area, with a sepa
 
 **Allow private HTTP** in Connections saves an administrator policy without editing the container environment. It permits trusted private addresses, local names, and Docker hosts; public addresses still require HTTPS. An explicit saved choice overrides the deployment fallback. Change any saved non-loopback HTTP connection to HTTPS before disabling it, so the switch cannot cut off the Jellyfin sign-in path. Before first-time setup, `VELVARR_ALLOW_HTTP=1` remains available as a deployment fallback.
 
-This feature advances the database to schema 13. Back up the data directory and retain its secret key before upgrading; older images cannot open the upgraded database.
+This feature advances the fork database to schema 15 (upstream discovery caching and terminal acquisition failures are added after the fork's existing migrations). Back up the data directory and retain its secret key before upgrading; older images cannot open the upgraded database.
 
 ## TMDB movies and multiple Whisparr connections
 
@@ -136,6 +145,32 @@ If the collection still exceeds the allowance, measure its decoded size and set 
 Pass the setting into the container's runtime environment and recreate the container after changing it. Compose `.env` files only supply interpolation values unless the chart also forwards the variable under `environment` or uses `env_file`. For the upstream chart's `.env.local`, add the setting there. No library titles, paths, API keys, or complete JSON responses are needed to diagnose the size limit.
 
 Each failed sign-in writes one warning line to the server log: `[auth] failed sign-in attempt: account="<name>" ip="<address>"`. The password is never logged. The address is the first `X-Forwarded-For` entry, or `unknown` when no proxy sends the header. A client can set this header, so trust the address only when your proxy replaces `X-Forwarded-For` instead of appending to it.
+
+## Phone access
+
+Velvarr is an installable app: served over HTTPS, the browser's menu offers **Add to home screen** and Velvarr opens in its own window, with build assets cached by a service worker so reloads are fast (live data and `/api` are never cached). The install prompt needs a secure origin; the low-effort answer is [Tailscale](https://tailscale.com):
+
+1. Enable MagicDNS and HTTPS certificates in the Tailscale admin console.
+2. On the machine running Velvarr: `tailscale serve --bg 6699`.
+3. Open `https://<machine>.<tailnet>.ts.net` on the phone and use **Add to home screen**.
+
+`tailscale serve` terminates TLS with certificates the household's browsers already trust and sets `X-Forwarded-Proto: https`, which marks the session cookie `Secure`. Optionally pin `VELVARR_ORIGIN=https://<machine>.<tailnet>.ts.net` to make that origin the only one allowed to mutate, independent of proxy headers. If `VELVARR_ORIGIN` is already pinned to another address (for example your LAN origin), sign-in from the phone fails with `origin_mismatch`. Change the pin to the ts.net address, or remove the variable. Only one origin can be pinned, so LAN access and Tailscale access are mutually exclusive while a pin is set. On plain HTTP on a non-loopback address the worker does not register; everything else works. Loopback HTTP (`127.0.0.1`, `localhost`) is a secure context, so a production build registers there too. Development builds never register the worker: Turbopack keeps dev chunk URLs stable while their content changes, so a cache-first worker would pin the first dev build.
+
+## Local AI-assisted matching with Ollama
+
+Use Ollama 0.35 or later with a decision model such as `nimble` or `tev1`. Ordinary chat models do not support the required `/v1/systemone` endpoint. Download the model on the machine running Ollama:
+
+```sh
+ollama pull nimble
+```
+
+In **Settings → Metadata providers → AI-assisted matching**, select **Ollama (local)**, enter its URL and the downloaded model name shown by `ollama list`, save, and use **Test saved connection**. No API key is required. Selecting Ollama never falls back to the paid TypeSafe service. Connection failures retain ordinary matching and the existing tag-based related-title order.
+
+For Velvarr running natively on the same machine, use `http://localhost:11434`. For Velvarr in Docker Desktop on a Mac with Ollama running natively, use `http://host.docker.internal:11434` and set `VELVARR_ALLOW_HTTP=1` in Velvarr's runtime environment. `localhost` inside a container refers to that container. For a different host, use Ollama's reachable private address and follow its [network configuration guidance](https://docs.ollama.com/faq#how-do-i-configure-ollama-server).
+
+Alternatively, set `VELVARR_JUDGMENT_PROVIDER=ollama`, `OLLAMA_BASE_URL`, and `OLLAMA_MODEL` in the runtime environment. **Use environment settings** clears the stored selection, URL, and model. Environment-only Ollama serves title review and related-title ranking; tag suggestions send member search terms, so they start only after the Ollama choice is saved in Settings. Existing TypeSafe deployments retain their behavior until Ollama is explicitly selected.
+
+The existing matching rules remain unchanged: AI can flag a possible title match for administrator review, never mark it available or grant playback. Local tag suggestions use bounded batches because decision models limit the number of choices; large tag lists can require multiple inference calls. Related-title ranking only reorders existing candidates. Models have different accuracy and latency, so test representative naming variants and mismatches before choosing one.
 
 ## Backup and recovery
 

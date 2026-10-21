@@ -29,8 +29,8 @@ import type { TmdbQuery } from "./tmdb.ts";
 
 import { isHiddenTitle, tagMatches } from "./catalog-visibility.ts";
 
-import { AppError } from "./http.ts";
-import { judgmentConfigured, suggestTags } from "./judgment.ts";
+import { AppError, sourceError } from "./http.ts";
+import { suggestTags, tagSuggestionsAllowed } from "./judgment.ts";
 import {
   listCatalogTags,
   searchCatalog,
@@ -573,21 +573,9 @@ class Stream {
         throw err;
       }
       this.exhausted = true;
-      this.error = {
-        provider: this.base.provider,
-        code: err instanceof AppError ? err.code : "provider_error",
-        message: err instanceof Error ? err.message : String(err),
-      };
+      this.error = sourceError(this.base.provider, err);
     }
   }
-}
-
-function sourceError(provider: CatalogProvider, err: unknown): SourceError {
-  return {
-    provider,
-    code: err instanceof AppError ? err.code : "provider_error",
-    message: err instanceof Error ? err.message : String(err),
-  };
 }
 
 function allSourcesFailed(streams: Stream[]): never {
@@ -638,9 +626,13 @@ async function mergeStreams(
     // browse: keep pulling that stream until it yields a visible row or
     // genuinely runs out (a hard scan ceiling throws; a soft one ends the
     // stream with its named scan_ceiling error).
-    for (const s of streams) {
-      while (s.buffer.length === 0 && s.live) await s.fetch();
-    }
+    // Streams are independent (one per provider side), so they refill
+    // together: a mixed page waits for the slowest provider, not the sum.
+    await Promise.all(
+      streams.map(async (s) => {
+        while (s.buffer.length === 0 && s.live) await s.fetch();
+      }),
+    );
     const ready = streams.filter((s) => s.buffer.length > 0);
     if (ready.length === 0) break;
     // Unordered queries concatenate stably (TPDB movies first, then StashDB
@@ -1334,6 +1326,7 @@ export async function searchBrowseTags(
       "Enter at least 2 characters to search.",
     );
   }
+  if (q.length > 200) throw new AppError(400, "invalid_query", "Invalid q.");
   const providers: CatalogProvider[] = selectedProvider
     ? [selectedProvider]
     : ["tpdb", "stashdb"];
@@ -1375,7 +1368,7 @@ export async function searchBrowseTags(
   ) {
     try {
       const settings = getConfig()?.providers;
-      if (judgmentConfigured(settings)) {
+      if (tagSuggestionsAllowed(settings)) {
         const candidates: {
           id: string;
           name: string;

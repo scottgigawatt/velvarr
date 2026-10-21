@@ -13,6 +13,13 @@ import { readSessionToken } from "../../../server/security.ts";
 import { AppError } from "../../../server/http.ts";
 import { validateUser } from "../../../server/jellyfin.ts";
 
+// Stryker disable all — the session-cache and requireSession glue between
+// here and the rate-budget section is effect-heavy admission (storage,
+// Jellyfin validateUser): the api suite covers its behavior, but per-mutant
+// kill data here would only add unreachable survivors, same as the other
+// effect adapters kept out of the mutate set. The rate-budget section below
+// restores mutation for itself.
+
 export interface AuthContext {
   config: IntegrationConfig;
   account: Account;
@@ -149,11 +156,155 @@ export async function requireAdmin(request: Request): Promise<AuthContext> {
   return ctx;
 }
 
+// Stryker restore all — the per-account rate budget is under mutation
+// testing: the cap-eviction and refill logic below is pure decision logic
+// whose regression ships green (see the api suite's rate-budget tests).
+// --- per-account rate budget ---
+// One household shares the TPDB/StashDB credentials: an unbounded loop of
+// provider reads from one member session (or a stolen one) can drain the
+// shared quota and starve discovery and search for every other account. A
+// token bucket per account id and lane, charged at dispatch for every
+// session and admin request before the handler runs (artwork routes
+// excepted, see RouteDef), bounds the request rate; the providers' own
+// throttles stay the only bound
+// inside one request (a single filtered browse may still fan out to its scan
+// ceiling). In-memory per process like every limiter here; a restart resets.
+// Two lanes, independent budgets: "dispatch" meters API calls, "artwork"
+// meters the catalog artwork proxy's upstream misses — a cold page fetches
+// one image per tile and must not drain (or starve on) the dispatch lane.
+// Calibration (VELV-38): Velvarr serves one or a few users on a local
+// network, so every lane is sized past what such a household can produce —
+// several of the biggest pages plus active hovering — and keeps only the
+// runaway-loop bound: a broken or stolen client still caps at its lane's
+// refill per minute, and the providers' own throttles stay the real quota
+// guard for the shared TPDB/StashDB credentials. ponytail: these numbers
+// are calibration, not a security boundary — if a real session still trips
+// a lane, raise it; dropping the limiter entirely would leave a runaway
+// client unbounded against the shared provider quota.
+export const RATE_BURST = 240;
+export const RATE_REFILL_PER_MINUTE = 120;
+// Artwork misses get their own lane: a cold page legitimately fetches one
+// image per tile (a discover page ≈ 5–7 rails × up to 32 tiles, a movie
+// detail ≈ 50 avatars, stills and related posters), and those misses must
+// neither drain the dispatch budget that guards the rate-limited provider
+// APIs nor be starved by it. Still bounded: sustained enumeration of the
+// artwork proxy caps at ARTWORK_REFILL_PER_MINUTE misses per minute.
+export const ARTWORK_BURST = 800;
+export const ARTWORK_REFILL_PER_MINUTE = 400;
+// Card preloads get their own lane for the same reason: every
+// RequestableCard (one per rail tile and per related item) fires
+// /api/catalog/:p/:k/:id and /api/availability/:p/:k/:id after page load,
+// so a cold discover page of 4 provider rails × 32 tiles sends ~256 of
+// them and a detail page ~64 more, and hovering a card before its preload
+// runs adds two more per card (VELV-38: the mouse-over 429s). The burst
+// covers four of the biggest pages plus the hover traffic; the refill
+// still caps sustained distinct-id enumeration at PRELOAD_REFILL_PER_MINUTE
+// reads per minute.
+export const PRELOAD_BURST = 1200;
+export const PRELOAD_REFILL_PER_MINUTE = 600;
+export const RATE_BUCKETS_CAP = 256;
+
+type RateLane = "dispatch" | "preload" | "artwork";
+const LANES: Record<RateLane, { burst: number; refill: number }> = {
+  dispatch: { burst: RATE_BURST, refill: RATE_REFILL_PER_MINUTE },
+  preload: { burst: PRELOAD_BURST, refill: PRELOAD_REFILL_PER_MINUTE },
+  artwork: { burst: ARTWORK_BURST, refill: ARTWORK_REFILL_PER_MINUTE },
+};
+export type { RateLane };
+
+const rateBuckets = new Map<
+  string,
+  { tokens: number; at: number; lane: RateLane }
+>();
+
+/** Test hook: the buckets are module-global, so a flood test would otherwise
+ * leak a drained budget into every later test on the same account. */
+export function resetRateBuckets(): void {
+  rateBuckets.clear();
+}
+
+/** Refill a bucket to `now` and cap it at its lane's burst. Shared by the
+ * charge path and the cap's eviction scan, which must compare refilled
+ * tokens — comparing stored tokens alone would treat an idle-but-drained
+ * bucket as live, or a just-recharged one as evictable. */
+function refilledTokens(
+  bucket: { tokens: number; at: number; lane: RateLane },
+  now: number,
+): number {
+  const { burst, refill } = LANES[bucket.lane];
+  return Math.min(
+    burst,
+    // A wall-clock step backwards must not turn a full bucket negative.
+    Math.max(bucket.tokens, 0) + ((now - bucket.at) / 60_000) * refill,
+  );
+}
+
+export function chargeRateBudget(
+  accountId: string,
+  lane: RateLane = "dispatch",
+): void {
+  const now = Date.now();
+  const key = `${lane}:${accountId}`;
+  let bucket = rateBuckets.get(key);
+  if (bucket) {
+    bucket.tokens = refilledTokens(bucket, now);
+    bucket.at = now;
+  } else {
+    if (rateBuckets.size >= RATE_BUCKETS_CAP) {
+      // The map's order is insertion, not last charge: a bucket stops
+      // moving when a charge throws, so the oldest key can be a drained
+      // one. Evicting it would hand that account a fresh burst and defeat
+      // the per-account bound. Evict only a bucket already refilled to
+      // full (idle for a whole refill window); if every slot belongs to a
+      // live account, refuse the new allocation instead.
+      let evicted = false;
+      for (const [key, candidate] of rateBuckets) {
+        if (refilledTokens(candidate, now) >= LANES[candidate.lane].burst) {
+          rateBuckets.delete(key);
+          evicted = true;
+          break;
+        }
+      }
+      if (!evicted) {
+        throw new AppError(
+          429,
+          "rate_limited",
+          "Too many requests; slow down and try again shortly.",
+        );
+      }
+    }
+    bucket = { tokens: LANES[lane].burst, at: now, lane };
+  }
+  if (bucket.tokens < 1) {
+    throw new AppError(
+      429,
+      "rate_limited",
+      "Too many requests; slow down and try again shortly.",
+    );
+  }
+  bucket.tokens -= 1;
+  // Re-insert so the cap scans past recently charged accounts first.
+  rateBuckets.delete(key);
+  rateBuckets.set(key, bucket);
+}
+
+// Stryker disable all — the RouteDef contract below is type-only.
+
 // The route declaration contract: admission is part of the route type, so a
 // new route cannot ship without declaring none|session|admin. `segments`
 // exclude the `/api` prefix; a segment starting with `:` captures one
 // path parameter. Matching is exact (method + count + literal/:param), so no
-// entry can shadow another.
+// entry can shadow another. Every session and admin route charges the
+// per-account budget at dispatch, as the audit installed it — by default the
+// "dispatch" lane, or the route's own `lane` for routes a page load fires
+// per tile (the card preload routes: every RequestableCard asks for its
+// detail and availability after load). `exemptFromBudget` marks routes
+// charged nowhere at dispatch (Jellyfin/artwork bytes): a page load fires
+// one artwork request per tile — dozens — and charging every tile locked a
+// member out after a few F5s. The exemption covers the cached-tile flood
+// only: a route whose upstream work reaches TPDB/StashDB bounds itself —
+// the catalog artwork proxy charges each upstream miss on the artwork lane
+// in its handler. Anything else that reads TPDB/StashDB stays charged.
 export type RouteDef = {
   method: "GET" | "POST" | "PATCH" | "DELETE";
   segments: string[];
@@ -163,4 +314,7 @@ export type RouteDef = {
     request: Request,
     params: Record<string, string>,
   ) => Promise<Response>;
+  /** Charged instead of the dispatch lane for per-tile page-load routes. */
+  lane?: RateLane;
+  exemptFromBudget?: boolean;
 };

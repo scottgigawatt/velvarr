@@ -450,7 +450,7 @@ test("legacy approvals and claims survive a real schema-11 upgrade and keep Main
   const db = new DatabaseSync(dbPath);
   // Remove the new column/index to reconstruct the pre-feature requests shape.
   db.exec(
-    "ALTER TABLE accounts DROP COLUMN personal_settings; DROP INDEX requests_target; ALTER TABLE requests DROP COLUMN target_instance_id; PRAGMA user_version = 11;",
+    "ALTER TABLE accounts DROP COLUMN personal_settings; DROP TABLE discover_cache; DROP INDEX requests_target; ALTER TABLE requests DROP COLUMN target_instance_id; PRAGMA user_version = 11;",
   );
   db.close();
   storage.initializeStorage();

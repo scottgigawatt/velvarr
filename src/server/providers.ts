@@ -139,6 +139,7 @@ export function resetMetaCache(): void {
   tpdbTagNumbers.clear();
   counterpartMemo.clear();
   tagListingMemo.clear();
+  tagListingWarm.clear();
 }
 
 /** Learns the numeric filter key behind a TPDB tag uuid while rows map.
@@ -422,10 +423,16 @@ const IMAGE_BYTE_CAP = 8 * 1024 * 1024;
  * record. Never sends provider credentials, never follows redirects (the
  * transport errors on 3xx). Successful image responses are cached in process
  * memory for a day (Seerr's default for hosts without max-age) and never
- * written to disk. */
+ * written to disk. `onMiss` runs synchronously when and only when an upstream
+ * fetch is about to start — once per coalesced burst, never on a cache hit or
+ * an in-flight join — so callers can bound their upstream fetches. */
 export async function fetchProviderArtwork(
   url: string,
-  options: { timeoutMs?: number; sizeLimit?: number } = {},
+  options: {
+    timeoutMs?: number;
+    sizeLimit?: number;
+    onMiss?: () => void;
+  } = {},
 ): Promise<{ bytes: Uint8Array; contentType: string }> {
   // Validation always runs, even on a cache hit: the cache key is only as
   // trustworthy as the gate that fed it.
@@ -445,9 +452,9 @@ export async function fetchProviderArtwork(
     contentType: string;
   }> => {
     const u = new URL(url);
-    // ponytail: requestBytes rejoins origin+pathname, dropping any query string;
-    // provider artwork URLs carry none today — a future query-bearing URL fails
-    // visibly at the CDN instead of silently changing what is served.
+    // The gate rejects query strings and fragments, so origin+pathname is
+    // the whole URL: the raw-URL cache key can never diverge from what is
+    // fetched here.
     const { bytes, contentType } = await requestBytes(
       u.origin,
       u.pathname,
@@ -482,6 +489,9 @@ export async function fetchProviderArtwork(
   }
   const inFlight = artworkInFlight.get(url);
   if (inFlight) return inFlight;
+  // Exactly one caller per coalesced burst reaches this synchronous window,
+  // so onMiss charges once per upstream fetch; hits and joins never do.
+  options.onMiss?.();
   const pending = fetchOnce()
     .then((entry) => {
       artworkCache.set(url, { at: Date.now(), ...entry });
@@ -1083,9 +1093,11 @@ function parseTpdbPage(
       .filter((d): d is CatalogDetail => d !== undefined),
     (d) => `${d.reference.kind}:${d.reference.id}`,
   );
-  // rows > 0 AND a provider-issued next link: TPDB clamps beyond-end pages
-  // and emits no next link there, so this terminates even under fake totals.
-  const hasMore = items.length > 0 && typeof body.links?.next === "string";
+  // Raw rows > 0 AND a provider-issued next link: TPDB clamps beyond-end
+  // pages and emits no next link there, so this terminates even under fake
+  // totals. Raw rows, not mapped survivors: a page whose rows all fail the
+  // mapper must still continue, later pages can hold valid rows.
+  const hasMore = body.data.length > 0 && typeof body.links?.next === "string";
   const rawTotal = body.meta?.total;
   // TPDB reports min(real, 10000): anything below the cap is the provider's
   // attestation, an attested zero included; exactly 10000 stays unproven.
@@ -1519,8 +1531,9 @@ export async function searchCatalog(
     page,
     perPage,
     // StashDB counts are always real, so page*perPage < count is a true
-    // continuation signal.
-    hasMore: items.length > 0 && totalReal && page * perPage < rawCount,
+    // continuation signal. The raw count, not mapped survivors: a page whose
+    // rows all fail the mapper must still continue.
+    hasMore: totalReal && page * perPage < rawCount,
     ...(totalReal ? { total: rawCount } : {}),
     totalCountKnown: totalReal,
     items,
@@ -1671,22 +1684,35 @@ interface TagListing {
 }
 
 // Process-lifetime listing memo, keyed by provider: the walk is one bounded
-// burst of paged reads whose answer feeds every free-text expansion, and
-// published vocabularies change slowly. Entries carry their read time and
-// are re-walked once older than the window: a tag the provider publishes,
-// renames or deletes after the first walk must reach expansions that still
-// claim complete, and a Velvarr container runs for weeks. Incomplete walks
-// memoize too, under the same window — retrying per request would re-pay
-// the burst for the same capped answer. The 10-minute page cache and
-// metaInFlight keep a re-walk cheap. ponytail: fixed one-hour window on
-// the wall clock (worst-case staleness ~70min with the page cache);
+// burst of paged reads whose answer feeds every free-text expansion and the
+// tag picker's search, and published vocabularies change slowly. Entries
+// carry their read time and are re-walked once older than the window: a tag
+// the provider publishes, renames or deletes after the first walk must
+// reach reads that still claim complete, and a Velvarr container runs for
+// weeks. Incomplete walks memoize too, under the same window — retrying per
+// request would re-pay the burst for the same capped answer. The 10-minute
+// page cache and metaInFlight keep a re-walk cheap. Two windows share one
+// entry: TAG_LISTING_TTL_MS bounds reads that claim completeness (expansion
+// exact totals and exact absence, counterpart side disqualification), while
+// TAG_SUGGESTION_TTL_MS bounds the tag picker's suggestion search, where a
+// month-old listing only misses tags created in that window and no absence
+// is claimed. ponytail: fixed windows on the wall clock (worst-case
+// staleness ~70min for the one-hour window with the page cache);
 // per-provider windows or conditional GETs only if a real vocabulary
 // churns faster.
 const TAG_LISTING_TTL_MS = 60 * 60_000;
+const TAG_SUGGESTION_TTL_MS = 30 * 24 * 60 * 60_000;
+// The tag picker's empty answer must not claim absence over a memo older
+// than the completeness window: searchCatalogTags re-checks the provider
+// natively in that case, so a tag published after the walk still answers.
 const tagListingMemo = new Map<
   CatalogProvider,
   { at: number; listing: TagListing }
 >();
+// The picker's cold-path background walk: at most one in flight per
+// provider, so a keystroke burst joins the first warm instead of stacking
+// walks.
+const tagListingWarm = new Map<CatalogProvider, Promise<void>>();
 
 /** Shared StashDB tag-row parsing for the flat [Tag] {id, name} shapes
  * (searchTag, queryTags): validated, deduplicated by id. */
@@ -1716,10 +1742,11 @@ function stashTagRows(rows: unknown[]): { id: string; name: string }[] {
  * matches. */
 async function catalogTagListing(
   provider: CatalogProvider,
-): Promise<TagListing> {
+  maxAgeMs: number = TAG_LISTING_TTL_MS,
+): Promise<TagListing & { at: number }> {
   const memo = tagListingMemo.get(provider);
-  if (memo !== undefined && Date.now() - memo.at < TAG_LISTING_TTL_MS) {
-    return memo.listing;
+  if (memo !== undefined && Date.now() - memo.at < maxAgeMs) {
+    return { ...memo.listing, at: memo.at };
   }
   const rows: { id: string; name: string }[] = [];
   let complete = true;
@@ -1796,8 +1823,29 @@ async function catalogTagListing(
     }
   }
   const listing: TagListing = { rows: dedupeBy(rows, (t) => t.id), complete };
-  tagListingMemo.set(provider, { at: Date.now(), listing });
-  return listing;
+  const at = Date.now();
+  tagListingMemo.set(provider, { at, listing });
+  return { ...listing, at };
+}
+
+/** Warms the provider's tag listing without blocking the caller: at most
+ * one walk in flight per provider, and it never rejects — a failed warm
+ * leaves the memo cold and the next picker search re-warms. The picker
+ * fires this on a cold memo so the keystroke answers from the native
+ * search while up to 50 sequential listing reads run in the background. */
+export function warmCatalogTagListing(
+  provider: CatalogProvider,
+): Promise<void> {
+  const pending = tagListingWarm.get(provider);
+  if (pending !== undefined) return pending;
+  const warm = catalogTagListing(provider)
+    .then(() => undefined)
+    .catch(() => undefined);
+  tagListingWarm.set(provider, warm);
+  void warm.finally(() => {
+    if (tagListingWarm.get(provider) === warm) tagListingWarm.delete(provider);
+  });
+  return warm;
 }
 
 /** Free-text include expansion on one provider: every published tag whose
@@ -1828,9 +1876,23 @@ export async function expandCatalogTagTerm(
   return { ids, dropped, complete };
 }
 
-/** Tag lookup for filter pickers: provider-native {id, name} pairs for a
- * search term. TPDB /tags and StashDB searchTag; ids are never mapped across
- * providers. First page/limit only — enough to build a filter list. */
+/** Tag lookup for filter pickers. A warm listing serves the folded
+ * substring rule over the provider's cached complete tag listing — the
+ * same rule free-text include filtering applies, so what the picker offers
+ * is exactly what the filter would match — under the month-long suggestion
+ * window: typing queries nothing upstream once the listing is warm. An
+ * empty answer against a memo older than the completeness window falls to
+ * the native search — a miss there claims an absence the month-old copy
+ * cannot prove, while the native search sees the provider's current
+ * vocabulary; a fresh walk's miss is an honest absence and answers empty.
+ * On a cold memo (a restart, or a listing past the window) the keystroke
+ * is answered from the native relevance search immediately while
+ * warmCatalogTagListing re-walks the listing in the background — the
+ * first search after a restart must not wait on up to 50 sequential
+ * reads. The native search stays as the fallback for a listing past the
+ * walk cap and for terms whose fold is empty (non-Latin text, symbols),
+ * where folding cannot match. Ids are never mapped across providers; the
+ * cap bounds the returned list. */
 export async function searchCatalogTags(
   provider: CatalogProvider,
   term: string,
@@ -1843,6 +1905,33 @@ export async function searchCatalogTags(
       "invalid_search",
       "Tag lookup requires a search term.",
     );
+  }
+  const needle = normalizeFacetName(q);
+  if (needle !== "") {
+    const memo = tagListingMemo.get(provider);
+    if (memo !== undefined && Date.now() - memo.at < TAG_SUGGESTION_TTL_MS) {
+      if (memo.listing.complete) {
+        const exact: { id: string; name: string }[] = [];
+        const prefixed: typeof exact = [];
+        const contained: typeof exact = [];
+        for (const row of memo.listing.rows) {
+          const folded = normalizeFacetName(row.name);
+          if (!folded.includes(needle)) continue;
+          if (folded === needle) exact.push(row);
+          else if (folded.startsWith(needle)) prefixed.push(row);
+          else contained.push(row);
+        }
+        const hits = [...exact, ...prefixed, ...contained].slice(0, MAX.tags);
+        if (hits.length > 0 || Date.now() - memo.at < TAG_LISTING_TTL_MS) {
+          return hits;
+        }
+      }
+    } else {
+      // Cold memo: answer from the native search below; the background
+      // warm serves the folded-substring listing from the next keystroke
+      // on. One walk per provider — a burst of keystrokes joins it.
+      void warmCatalogTagListing(provider);
+    }
   }
   if (provider === "tpdb") {
     const body = await tpdbGet<TpdbListBody>(
@@ -2117,7 +2206,13 @@ export type TagReference =
  * only a uuid-less row matches (TPDB numeric-string ids), the reference
  * reports `native: false` — the label exists on the other provider, but its
  * id can never ride a native tag filter. No exact-label match at all →
- * undefined: the one honest absence. An upstream failure throws so callers
+ * undefined: the one honest absence. A capped or contradicted walk
+ * (`complete: false`) cannot prove absence — the label may sit below the
+ * walk cap — so the provider's native exact-term search decides pairing in
+ * that case. The read is the one-hour listing
+ * window, not the month-long suggestion window: an absence here
+ * disqualifies a whole browse side, so it must not rest on a month-old
+ * vocabulary. An upstream failure throws so callers
  * record the outage instead of reading it as absence. */
 export async function tagCounterpart(
   from: CatalogProvider,
@@ -2127,17 +2222,26 @@ export async function tagCounterpart(
   const target = normalizeFacetName(name);
   if (target === "") return undefined; // an empty label identifies nothing
   const other: CatalogProvider = from === "tpdb" ? "stashdb" : "tpdb";
-  const rows = await searchCatalogTags(other, name);
-  const nativeRow = rows.find(
-    (r) => normalizeFacetName(r.name) === target && isUuid(r.id),
-  );
+  const listing = await catalogTagListing(other);
+  const exact = (r: { name: string }) => normalizeFacetName(r.name) === target;
+  const nativeRow = listing.rows.find((r) => exact(r) && isUuid(r.id));
   if (nativeRow !== undefined) {
     return { provider: other, id: nativeRow.id, native: true };
   }
-  const labelRow = rows.find((r) => normalizeFacetName(r.name) === target);
-  return labelRow === undefined
-    ? undefined
-    : { provider: other, native: false };
+  const labelRow = listing.rows.find(exact);
+  if (labelRow !== undefined) return { provider: other, native: false };
+  // An incomplete listing hides rows below the walk cap: its absence is not
+  // evidence. The native exact-term search does not depend on the walk, so
+  // it decides; its upstream failures throw like the listing's do.
+  if (!listing.complete) {
+    const rows = await searchCatalogTags(other, name);
+    const nativeHit = rows.find((r) => exact(r) && isUuid(r.id));
+    if (nativeHit !== undefined) {
+      return { provider: other, id: nativeHit.id, native: true };
+    }
+    if (rows.some(exact)) return { provider: other, native: false };
+  }
+  return undefined;
 }
 
 /** Tag-label normalization lives in lib/contracts.ts (shared with storage

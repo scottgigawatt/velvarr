@@ -1022,10 +1022,60 @@ test("v1 database migrates in place preserving config, accounts, sessions, and g
     raw.prepare("PRAGMA user_version").get() as { user_version: number }
   ).user_version;
   raw.close();
-  assert.equal(version, 13, "v1 database must migrate to schema 13");
+  // Fork schema 15 admits the terminal failed_permanent acquisition state.
+  assert.equal(version, 15, "v1 database must migrate to the current schema");
   // A v1 database never contained the removal tables (current migration 5
   // creates none), so nothing here can assert about them; the schema-10 test
-  // below owns the claim that migration 11 drops them.
+  // below owns the claim that migration 11 drops them. Migration 14 is a
+  // plain additive table (discover_cache), covered by the cache test below.
+});
+
+test("migration 14 adds the discover cache; put/get/prune/clear round-trip", () => {
+  // freshDir() re-points VELVARR_DATA_DIR; the path itself is unused here.
+  freshDir();
+  storage.bootstrap(testConfig(), ownerUser(), "jf-owner-token");
+
+  // Absent key reads as undefined, never as a row-shaped object.
+  assert.equal(storage.getDiscoverCache("discover:releases:none"), undefined);
+
+  const now = Date.now();
+  storage.putDiscoverCache("discover:releases:a", '{"v":1}', now);
+  storage.putDiscoverCache("discover:trending:a", '{"v":2}', now);
+  const hit = storage.getDiscoverCache("discover:releases:a");
+  assert.deepEqual(hit, { payload: '{"v":1}', fetchedAt: now });
+
+  // INSERT OR REPLACE: same key overwrites, no duplicate rows.
+  storage.putDiscoverCache("discover:releases:a", '{"v":3}', now + 5);
+  assert.deepEqual(storage.getDiscoverCache("discover:releases:a"), {
+    payload: '{"v":3}',
+    fetchedAt: now + 5,
+  });
+
+  // prune deletes only rows older than the window; fresh rows survive.
+  storage.putDiscoverCache("discover:releases:old", "{}", now - 60_000);
+  assert.equal(storage.pruneDiscoverCache(30_000), 1);
+  assert.equal(storage.getDiscoverCache("discover:releases:old"), undefined);
+  assert.ok(storage.getDiscoverCache("discover:releases:a"));
+  assert.ok(storage.getDiscoverCache("discover:trending:a"));
+  // An at least full sweep clears everything.
+  storage.clearDiscoverCache();
+  assert.equal(storage.getDiscoverCache("discover:trending:a"), undefined);
+});
+
+test("pruneDiscoverCache caps the table at the newest maxRows rows", () => {
+  freshDir();
+  storage.bootstrap(testConfig(), ownerUser(), "jf-owner-token");
+  const now = Date.now();
+  for (let i = 0; i < 4; i++) {
+    storage.putDiscoverCache(`discover:cap:${i}`, "{}", now + i);
+  }
+  // The window deletes nothing (every row is fresh); the cap keeps only
+  // the newest 2 — age alone never bounds row cardinality.
+  assert.equal(storage.pruneDiscoverCache(60_000, 2), 2);
+  assert.equal(storage.getDiscoverCache("discover:cap:0"), undefined);
+  assert.equal(storage.getDiscoverCache("discover:cap:1"), undefined);
+  assert.ok(storage.getDiscoverCache("discover:cap:2"));
+  assert.ok(storage.getDiscoverCache("discover:cap:3"));
 });
 
 test("a schema-10 database migrates to 11: every removal object is dropped, rows are kept", () => {
@@ -1161,6 +1211,7 @@ test("a schema-10 database migrates to 11: every removal object is dropped, rows
   raw.exec(
     "ALTER TABLE accounts DROP COLUMN personal_settings; PRAGMA user_version = 10",
   );
+  raw.exec("DROP TABLE IF EXISTS discover_cache;");
   raw.close();
   storage.closeStorage();
 
@@ -1193,8 +1244,8 @@ test("a schema-10 database migrates to 11: every removal object is dropped, rows
   );
   assert.equal(
     versionRow.user_version,
-    13,
-    "schema 10 database must migrate to schema 13",
+    15,
+    "schema 10 database must migrate to the current schema",
   );
   assert.ok(
     grantRow !== null &&
@@ -2141,7 +2192,10 @@ test("observations update changed facts; a proven absence is distinct from an ou
   assert.equal(absent.whisparrId, null);
   assert.equal(absent.whisparrPath, null);
   assert.equal(absent.whisparrTitle, null);
-  assert.equal(absent.state, "downloading", "absence keeps the recorded state");
+  // VELV-18: a proven absence is terminal — the row becomes failed_permanent
+  // whatever it was, so an identity Whisparr dropped costs no more reads.
+  assert.equal(absent.state, "failed_permanent", "absence is terminal");
+  assert.equal(absent.dueAt, null, "terminal rows are never scheduled");
   assert.equal(
     absent.lastObservedAt,
     healed.lastObservedAt,
@@ -2505,6 +2559,54 @@ test("a failed migration rolls back completely: version, schema, and every row s
     id: MOVIE.id,
   });
   assert.equal(catalog?.title, "Restore Target");
+});
+
+test("migration 15 admits failed_permanent and preserves acquisition rows", () => {
+  const dir = freshDir();
+  storage.closeStorage();
+  for (const suffix of ["", "-wal", "-shm"])
+    rmSync(join(dir, `velvarr.sqlite${suffix}`), { force: true });
+
+  fabricateV3(dir);
+  // fabricateV3 seeds a duplicate identity on purpose (it powers the
+  // rollback test above); resolve it so migrations run through to 13.
+  const repair = new DatabaseSync(join(dir, "velvarr.sqlite"));
+  repair.prepare("DELETE FROM catalog_identities WHERE id = 'cat-v3-2'").run();
+  repair.close();
+  assert.equal(storage.isInitialized(), true);
+
+  const raw = new DatabaseSync(join(dir, "velvarr.sqlite"));
+  try {
+    const versionRow = raw.prepare("PRAGMA user_version").get() as {
+      user_version: number;
+    };
+    assert.equal(versionRow.user_version, 15);
+    // The fabricated row survives the rebuild intact.
+    const row = raw
+      .prepare(
+        "SELECT state, attempt_token FROM acquisitions WHERE id = 'acq-v3-1'",
+      )
+      .get() as { state: string; attempt_token: string };
+    assert.equal(row.state, "submitting");
+    assert.equal(row.attempt_token, "attempt-v3");
+    // The rebuilt CHECK admits the terminal state (distinct external_id:
+    // acq-v3-1 owns this instance's MOVIE identity).
+    raw
+      .prepare(
+        "INSERT INTO acquisitions (id, instance_id, provider, kind, external_id, state, created_at, updated_at) VALUES ('acq-v3-perm', 'instance-v3', 'tpdb', 'movie', ?, 'failed_permanent', 1, 1)",
+      )
+      .run("33333333-3333-4333-8833-333333333333");
+    // And still guards against nonsense.
+    assert.throws(() =>
+      raw
+        .prepare(
+          "INSERT INTO acquisitions (id, instance_id, provider, kind, external_id, state, created_at, updated_at) VALUES ('acq-v3-bad', 'instance-v3', 'tpdb', 'movie', ?, 'nonsense', 1, 1)",
+        )
+        .run("44444444-4444-4333-8833-444444444444"),
+    );
+  } finally {
+    raw.close();
+  }
 });
 
 test("backup restores into a fresh data directory with everything intact; a wrong key fails safely", () => {
@@ -3278,6 +3380,7 @@ test("schema 9 preferences survive the schema 10 upgrade: hidden tags kept, orde
     ALTER TABLE accounts_schema9 RENAME TO accounts;
     CREATE UNIQUE INDEX accounts_single_owner ON accounts (is_owner)
       WHERE is_owner = 1;
+    DROP TABLE IF EXISTS discover_cache;
     PRAGMA user_version = 9;
   `);
   raw.close();

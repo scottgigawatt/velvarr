@@ -13,7 +13,7 @@ import {
   hasAuthoritativeAbsence,
   isObservationStale,
 } from "../../../../server/storage.ts";
-import { AppError } from "../../../../server/http.ts";
+import { AppError, shelfError } from "../../../../server/http.ts";
 import { resolvePlaybackAccess } from "../../../../server/jellyfin.ts";
 import {
   getCatalogDetail,
@@ -247,7 +247,7 @@ export async function globalSearch(
 /** A matched route: what to run, and the admission it needs. The auth level
  * is part of the shape, so a new branch cannot ship without declaring one;
  * the previous table enforced "remember requireSession here" by discipline. */
-import { shelfError, SEARCH_PER_PAGE } from "./discover.ts";
+import { SEARCH_PER_PAGE } from "./discover.ts";
 import { browseRoute, browseTagsRoute } from "./catalog.ts";
 import type { RouteDef } from "../admission.ts";
 
@@ -265,9 +265,16 @@ export const routes: RouteDef[] = [
     run: async (_ctx, request) => browseTagsRoute(request),
   },
   {
+    // Card preload: the second call every RequestableCard fires after page
+    // load (see the catalog detail route). Charges the preload lane, not
+    // dispatch — a page of cards must not drain the API budget. The route's
+    // only provider read is identityHints' title-hint detail, shared with
+    // the card's detail call through the meta cache; the lane bounds
+    // distinct-id loops through either route.
     method: "GET",
     segments: ["availability", ":provider", ":kind", ":id"],
     auth: "session",
+    lane: "preload",
     run: async (ctx, _request, p) =>
       availability(ctx, p.provider!, p.kind!, p.id!),
   },

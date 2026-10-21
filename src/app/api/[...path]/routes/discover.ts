@@ -1,3 +1,4 @@
+import { defaultPersonalSettings } from "../../../../lib/personalization.ts";
 import { TAG_FILTER_ID_CAP } from "../../../../lib/browse-includes.ts";
 import { DISCOVER_SCAN_BUDGET } from "../../../../server/catalog-budget.ts";
 import { type AuthContext, json } from "../admission.ts";
@@ -7,10 +8,13 @@ import type {
   CatalogProvider,
   CatalogReference,
   CatalogTagSelection,
+  ContentPreferences,
+  DiscoverShelfId,
   FacetItem,
   Shelf,
   ShelfError,
   ShelfItems,
+  ShelfMorePreview,
   SourceError,
 } from "../../../../lib/contracts.ts";
 import {
@@ -20,9 +24,14 @@ import {
 } from "../../../../lib/contracts.ts";
 import {
   getContentPreferences,
+  listFollows,
   listFollowsByProvider,
 } from "../../../../server/storage.ts";
-import { AppError } from "../../../../server/http.ts";
+import {
+  cachedCatalogRail,
+  cachedFollowed,
+} from "../../../../server/discovery.ts";
+import { AppError, shelfError, sourceError } from "../../../../server/http.ts";
 import { listRecentlyAddedItems } from "../../../../server/jellyfin.ts";
 import {
   getCatalogDetail,
@@ -34,34 +43,56 @@ import {
 import {
   browseTitles,
   parseBrowseQuery,
-  searchVisibleCatalog,
   type BrowsePage,
+  searchVisibleCatalog,
 } from "../../../../server/browse.ts";
 import {
   tagMatches,
   isHiddenTitle,
 } from "../../../../server/catalog-visibility.ts";
 
-export function shelfError(err: unknown): ShelfError {
-  if (err instanceof AppError) return { code: err.code, message: err.message };
-  return { code: "internal", message: "Internal server error." };
+// One named entry per provider, first group wins: the partial-failure wire
+// shape browse pages and followedShelf already speak, and the UI keys error
+// rows by provider.
+function mergeErrors(...groups: SourceError[][]): SourceError[] {
+  const seen = new Set<string>();
+  return groups.flat().filter((error) => {
+    if (seen.has(error.provider)) return false;
+    seen.add(error.provider);
+    return true;
+  });
 }
 
-// The partial-source wire shape: the failed provider named on the error,
-// its code preserved verbatim.
-export function sourceError(
-  provider: "tpdb" | "stashdb",
-  err: unknown,
-): SourceError {
-  return { provider, ...shelfError(err) };
-}
-
-export const SHELF_ITEMS = 12;
+export const SHELF_ITEMS = 28;
+export const MORE_PREVIEWS = 4;
+export const FOLLOWED_PAGE = 12;
 export const SEARCH_PER_PAGE = 6;
 export const FOLLOW_SHELF_PERFORMERS = 5;
 
+/** The rail keeps the first SHELF_ITEMS candidates; the See More card
+ * previews the next MORE_PREVIEWS — omitted, never empty, when the
+ * source had nothing past the rail. */
+function railOf<T>(
+  items: T[],
+  preview: (item: T) => ShelfMorePreview,
+): { items: T[]; more?: ShelfMorePreview[] } {
+  const tail = items
+    .slice(SHELF_ITEMS, SHELF_ITEMS + MORE_PREVIEWS)
+    .map(preview);
+  return {
+    items: items.slice(0, SHELF_ITEMS),
+    ...(tail.length > 0 ? { more: tail } : {}),
+  };
+}
+
+const catalogPreview = (item: CatalogDetail): ShelfMorePreview => ({
+  name: item.title,
+  ...(item.imageUrl !== undefined ? { imageUrl: item.imageUrl } : {}),
+});
+
 // First page of each followed performer's title filmography, merged within
-// ONE provider and capped at SHELF_ITEMS. Partial failure is reported, not
+// ONE provider and capped at FOLLOW_SHELF_PERFORMERS * FOLLOWED_PAGE. Partial
+// failure is reported, not
 // dropped: the first failed page rides back as `failure` beside the
 // survivors, so the shelf can name the provider. Throwing is reserved for a
 // side with nothing to show — every page failed.
@@ -83,7 +114,7 @@ export async function followedTitles(
             kind: "movie",
             performer: follow.reference.id,
             page: 1,
-            perPage: SHELF_ITEMS,
+            perPage: FOLLOWED_PAGE,
           })
         : searchCatalog({
             provider: "stashdb",
@@ -92,7 +123,7 @@ export async function followedTitles(
             sort: "date",
             direction: "desc",
             page: 1,
-            perPage: SHELF_ITEMS,
+            perPage: FOLLOWED_PAGE,
           })
       ).then((page) => page.items),
     ),
@@ -115,7 +146,7 @@ export async function followedTitles(
   );
   if (items.length === 0 && firstFailure) throw firstFailure.reason;
   return {
-    items: items.slice(0, SHELF_ITEMS),
+    items: items.slice(0, FOLLOW_SHELF_PERFORMERS * FOLLOWED_PAGE),
     ...(firstFailure ? { failure: firstFailure.reason } : {}),
   };
 }
@@ -164,13 +195,7 @@ export async function followedShelf(
     } else errors.push(sourceError(provider, side.reason));
   });
   if (merged.length === 0 && errors.length === 0) return null;
-  const base = {
-    id: "followed-titles",
-    title: "From performers you follow",
-    source: "velvarr" as const,
-    kind: "catalog" as const,
-    browse: { view: "following", params: {} },
-  };
+  const base = FOLLOWED_SHELF_BASE;
   if (merged.length === 0) {
     // Every side the account actually follows failed, or a partial side's
     // survivors are all hidden: the error-only shape carries the collected
@@ -182,7 +207,7 @@ export async function followedShelf(
   }
   return {
     ...base,
-    items: dedupeTitles(merged).slice(0, SHELF_ITEMS),
+    ...railOf(dedupeTitles(merged), catalogPreview),
     ...(errors.length > 0 ? { errors } : {}),
   };
 }
@@ -205,10 +230,13 @@ export function dedupeTitles(items: CatalogDetail[]): CatalogDetail[] {
 
 export function shelfOf(
   base: Omit<Shelf, "items" | "error">,
-  result: PromiseSettledResult<ShelfItems>,
+  result: PromiseSettledResult<{
+    items: ShelfItems;
+    more?: ShelfMorePreview[];
+  }>,
 ): Shelf {
   return result.status === "fulfilled"
-    ? { ...base, items: result.value }
+    ? { ...base, ...result.value }
     : // An errored shelf carries no items at all: never an empty list that
       // could render as a quiet success.
       { ...base, error: shelfError(result.reason) };
@@ -242,9 +270,11 @@ export function browseShelf(
       };
     }
   }
+  const rail = railOf(page.items, catalogPreview);
   return {
     ...base,
-    items: page.items,
+    items: rail.items,
+    ...(rail.more ? { more: rail.more } : {}),
     ...(page.errors.length > 0 ? { errors: page.errors } : {}),
   };
 }
@@ -259,9 +289,9 @@ export function browseShelf(
 // render; a failed or absent read keeps the known name/reference as a
 // name-only tile — never an invented logo, and an enrich failure never sinks
 // the shelf.
-// ponytail: bounded recent/trending snapshot (SHELF_ITEMS unique ids, no
-// popularity invented); a full directory listing only if a browse surface
-// ever needs one.
+// ponytail: bounded recent/trending snapshot (SHELF_ITEMS + MORE_PREVIEWS
+// unique ids, no popularity invented); a full directory listing only if a
+// browse surface ever needs one.
 export function genreFacets(
   items: CatalogDetail[],
 ): Pick<FacetItem, "id" | "name" | "imageUrl">[] {
@@ -277,19 +307,22 @@ export function genreFacets(
       if (item.imageUrl !== undefined) art.get(tag.id)?.push(item.imageUrl);
     }
   }
-  return [...names].slice(0, SHELF_ITEMS).map(([id, name], i) => {
-    const carriers = art.get(id) ?? [];
-    const imageUrl =
-      carriers.length > 0 ? carriers[i % carriers.length] : undefined;
-    return { id, name, ...(imageUrl !== undefined ? { imageUrl } : {}) };
-  });
+  return [...names]
+    .slice(0, SHELF_ITEMS + MORE_PREVIEWS)
+    .map(([id, name], i) => {
+      const carriers = art.get(id) ?? [];
+      const imageUrl =
+        carriers.length > 0 ? carriers[i % carriers.length] : undefined;
+      return { id, name, ...(imageUrl !== undefined ? { imageUrl } : {}) };
+    });
 }
 
 export function studioFacets(
   provider: CatalogProvider,
   items: CatalogDetail[],
-  // The shelf caps; the directory passes Infinity and lists every studio.
-  cap: number = SHELF_ITEMS,
+  // The directory passes Infinity and lists every studio; the shelf
+  // enriches rail depth plus the preview tail.
+  cap: number = SHELF_ITEMS + MORE_PREVIEWS,
 ): Promise<CatalogDetail[]> {
   const known = new Map<
     string,
@@ -342,6 +375,7 @@ export function facetShelves(
 ): Promise<Shelf[]> {
   let error: ShelfError | undefined;
   let items: CatalogDetail[] = [];
+  let pageErrors: SourceError[] = [];
   if (newReleases.status === "rejected") {
     // shelfError keeps the upstream code (not configured vs outage); the
     // message names the shelf's own truth: no snapshot from either side.
@@ -352,6 +386,7 @@ export function facetShelves(
   } else {
     const page = newReleases.value;
     items = page.items;
+    pageErrors = page.errors;
     if (items.length === 0 && page.errors.length > 0) {
       const down = new Set(
         page.errors
@@ -393,20 +428,21 @@ export function facetShelves(
     }))
     .filter((source) => source.items.length > 0);
   return Promise.all([
-    facetShelf("studios", sources),
-    facetShelf("genres", sources),
+    facetShelf("studios", sources, pageErrors),
+    facetShelf("genres", sources, pageErrors),
   ]);
 }
 
 /** Cross-provider studio dedupe: a TPDB tile dies only when a StashDB tile
  * published that exact studio as its counterpart — never by name: two
  * same-named studios without a published link stay two tiles. Survivors get
- * their own counterparts resolved (settled). */
+ * their own counterparts resolved (settled); rejected lookups ride back as
+ * named errors beside the survivors. */
 async function dedupePublishedStudios(
   tiles: FacetItem[],
-): Promise<FacetItem[]> {
+): Promise<{ tiles: FacetItem[]; errors: SourceError[] }> {
   const stashTiles = tiles.filter((tile) => tile.provider === "stashdb");
-  await resolveLinked(stashTiles);
+  const pairingErrors = await resolveLinked(stashTiles);
   const publishedTpdb = new Set(
     stashTiles.flatMap((tile) =>
       tile.linked !== undefined ? [tile.linked.id.toLowerCase()] : [],
@@ -418,13 +454,19 @@ async function dedupePublishedStudios(
           tile.provider !== "tpdb" || !publishedTpdb.has(tile.id.toLowerCase()),
       )
     : tiles;
-  await resolveLinked(survivors);
-  return survivors;
+  const survivorErrors = await resolveLinked(survivors);
+  return {
+    tiles: survivors,
+    errors: mergeErrors(pairingErrors, survivorErrors),
+  };
 }
 
 export async function facetShelf(
   shelf: "studios" | "genres",
   sources: { provider: CatalogProvider; items: CatalogDetail[] }[],
+  // The browse page's own per-source failures: the dead side contributed no
+  // rows, so its outage must ride beside the survivor's tiles.
+  pageErrors: SourceError[] = [],
 ): Promise<Shelf> {
   const perSource = await Promise.all(
     sources.map(async ({ provider, items }) => ({
@@ -450,18 +492,21 @@ export async function facetShelf(
             })),
     })),
   );
-  // Alternate the providers' tiles so the cap leaves room for both sides.
+  // Alternate the providers' tiles so the rail leaves room for both sides.
   const candidates: FacetItem[] = [];
-  for (let i = 0; i < SHELF_ITEMS; i++) {
+  for (let i = 0; i < SHELF_ITEMS + MORE_PREVIEWS; i++) {
     for (const { tiles } of perSource) {
       const tile = tiles[i];
       if (tile !== undefined) candidates.push(tile);
     }
   }
-  const emitted = candidates.slice(0, SHELF_ITEMS);
+  const emitted = candidates.slice(0, SHELF_ITEMS + MORE_PREVIEWS);
   let items = emitted;
+  let linkedErrors: SourceError[] = [];
   if (shelf === "studios") {
-    items = await dedupePublishedStudios(emitted);
+    const deduped = await dedupePublishedStudios(emitted);
+    items = deduped.tiles;
+    linkedErrors = deduped.errors;
   } else {
     // Categories dedupe by exact normalized name: the first-seen tile stays
     // and the dropped side's id becomes its linked.
@@ -478,21 +523,41 @@ export async function facetShelf(
       }
     }
     // Counterparts for everything the local dedupe could not pair.
-    await resolveLinked(items);
+    linkedErrors = await resolveLinked(items);
   }
+  // Partial success stays named: a dead page side and rejected counterpart
+  // lookups both speak, deduped to the one-entry-per-provider shape.
+  const errors = mergeErrors(pageErrors, linkedErrors);
   return {
     id: shelf,
     title: shelf === "studios" ? "Studios" : "Genres",
     source: "velvarr",
     kind: "facets",
-    items,
+    ...railOf(items, facetPreview),
     browse: { view: "facets", params: { kind: shelf } },
+    ...(errors.length > 0 ? { errors } : {}),
+  };
+}
+
+/** A facet tile previews as the art it renders: a studio's brand mark over
+ * its poster, a genre's artwork. A deduped or unenriched tile may have
+ * neither — the preview then names the facet, never faking art. */
+function facetPreview(tile: FacetItem): ShelfMorePreview {
+  const art =
+    tile.facet === "studio" ? (tile.logoUrl ?? tile.imageUrl) : tile.imageUrl;
+  return {
+    name: tile.name,
+    ...(art !== undefined ? { imageUrl: art } : {}),
   };
 }
 
 // Resolves each tile's cross-provider counterpart, settled: a rejection or
-// an absent counterpart just leaves `linked` off the tile.
-export async function resolveLinked(tiles: FacetItem[]): Promise<void> {
+// an absent counterpart just leaves `linked` off the tile — and a rejection
+// is returned as the OTHER side's named outage, never read as absence
+// (tagCounterpart throws on upstream failure for exactly this).
+export async function resolveLinked(
+  tiles: FacetItem[],
+): Promise<SourceError[]> {
   const missing = tiles.filter((tile) => tile.linked === undefined);
   const settled = await Promise.allSettled(
     missing.map((tile) =>
@@ -505,9 +570,19 @@ export async function resolveLinked(tiles: FacetItem[]): Promise<void> {
         : tagCounterpart(tile.provider, tile.name),
     ),
   );
+  const errors: SourceError[] = [];
   settled.forEach((result, i) => {
     const tile = missing[i];
-    if (tile === undefined || result.status !== "fulfilled") return;
+    if (tile === undefined) return;
+    if (result.status === "rejected") {
+      errors.push(
+        sourceError(
+          tile.provider === "tpdb" ? "stashdb" : "tpdb",
+          result.reason,
+        ),
+      );
+      return;
+    }
     const ref = result.value;
     if (ref === undefined) return;
     if ("native" in ref) {
@@ -520,6 +595,7 @@ export async function resolveLinked(tiles: FacetItem[]): Promise<void> {
     }
     tile.linked = { provider: ref.provider, id: ref.id };
   });
+  return errors;
 }
 
 // The facet directory behind the discover shelf headline arrows. Genres:
@@ -530,6 +606,7 @@ export async function resolveLinked(tiles: FacetItem[]): Promise<void> {
 // same new-releases page the discover shelf reads, uncapped — the page
 // reports its own breadth and a failed side's error instead of claiming
 // "all studios ever".
+
 export async function discoveryFacets(
   request: Request,
   ctx: AuthContext,
@@ -544,7 +621,7 @@ export async function discoveryFacets(
   }
   const { hiddenTags } = getContentPreferences(ctx.account.id);
   if (kind === "genres") {
-    const providers: ("tpdb" | "stashdb")[] = ["tpdb", "stashdb"];
+    const providers: CatalogProvider[] = ["tpdb", "stashdb"];
     const settled = await Promise.allSettled(
       providers.map((p) => listCatalogTags(p)),
     );
@@ -603,22 +680,32 @@ export async function discoveryFacets(
       ),
     })),
   );
-  const tiles = await dedupePublishedStudios(perSource.flatMap((s) => s.tiles));
+  const { tiles, errors: linkedErrors } = await dedupePublishedStudios(
+    perSource.flatMap((s) => s.tiles),
+  );
   tiles.sort((a, b) => a.name.localeCompare(b.name));
-  return json({ kind, tiles, errors: page.errors });
+  return json({ kind, tiles, errors: mergeErrors(page.errors, linkedErrors) });
 }
 
-export async function discover(ctx: AuthContext): Promise<Response> {
-  const today = new Date().toISOString().slice(0, 10);
-  const preferences = getContentPreferences(ctx.account.id);
-  const hiddenTags = preferences.personalizeDiscover
-    ? preferences.hiddenTags
-    : [];
-  const include =
-    preferences.personalizeDiscover && preferences.applyIncludeTags
-      ? preferences.includeTags
-      : [];
-  const definitions = [
+// Discover wire split: GET /api/discover returns ordered STUBS only (id,
+// title, source, kind, description?, browse?) — no items, no errors, and no
+// upstream provider calls. GET /api/discover/shelf?id=… builds exactly the
+// one shelf discover() used to build for that id and returns
+// { shelf: Shelf | null }; null only for followed-titles with nothing to
+// show. Unknown or not-present ids fail with 404 unknown_shelf.
+type ShelfStub = Pick<Shelf, "id" | "title" | "source" | "kind"> &
+  Partial<Pick<Shelf, "description" | "browse">>;
+
+const FOLLOWED_SHELF_BASE: ShelfStub = {
+  id: "followed-titles",
+  title: "From performers you follow",
+  source: "velvarr",
+  kind: "catalog",
+  browse: { view: "following", params: {} },
+};
+
+function catalogDefinitions(today: string) {
+  return [
     {
       id: "new-releases",
       title: "New movies · TPDB",
@@ -683,122 +770,332 @@ export async function discover(ctx: AuthContext): Promise<Response> {
       },
     },
   ];
-  const settled = await Promise.allSettled(
-    definitions.map((definition) => {
-      const params = new URLSearchParams(
-        Object.entries(definition.params).filter(
-          (pair): pair is [string, string] => typeof pair[1] === "string",
-        ),
-      );
-      params.set("page", "1");
-      params.set("perPage", String(SHELF_ITEMS));
-      const sourceIncludes = scopeTagSelections(include, [definition.source]);
-      const sourceHidden = scopeTagSelections(hiddenTags, [definition.source]);
-      if (sourceIncludes.length)
-        params.set("include", JSON.stringify(sourceIncludes));
-      if (definition.id === "trending" && sourceIncludes.length === 0) {
-        return searchVisibleCatalog(
-          {
-            provider: "stashdb",
-            kind: "scene",
-            sort: "trending",
-            direction: "desc",
-            page: 1,
-            perPage: SHELF_ITEMS,
-            tagsExclude: sourceHidden
-              .flatMap((tag) => (tag.stashdb ? [tag.stashdb] : []))
-              .slice(0, TAG_FILTER_ID_CAP),
-          },
-          sourceHidden,
-          DISCOVER_SCAN_BUDGET,
-        ).then((page) => ({ ...page, errors: page.errors ?? [] }));
-      }
-      return browseTitles(
-        parseBrowseQuery(params),
-        sourceHidden,
-        [],
-        DISCOVER_SCAN_BUDGET,
-      );
-    }),
+}
+type CatalogDefinition = ReturnType<typeof catalogDefinitions>[number];
+function catalogParams(
+  definition: CatalogDefinition,
+  prefs: ContentPreferences,
+): Record<string, string> {
+  const params = Object.fromEntries(
+    Object.entries(definition.params).filter(
+      (pair): pair is [string, string] => typeof pair[1] === "string",
+    ),
   );
-  const [recentlyAdded, requests] = await Promise.allSettled([
-    listRecentlyAddedItems(ctx.config, ctx.token, ctx.account, SHELF_ITEMS),
-    Promise.resolve().then(() => listRequestItems(ctx).slice(0, SHELF_ITEMS)),
-  ]);
-  const shelves: Shelf[] = definitions.map((definition, index) => {
-    const params = Object.fromEntries(
-      Object.entries(definition.params).filter(
-        (pair): pair is [string, string] => typeof pair[1] === "string",
-      ),
+  const include =
+    prefs.personalizeDiscover && prefs.applyIncludeTags
+      ? scopeTagSelections(prefs.includeTags, [definition.source])
+      : [];
+  if (include.length) params.include = JSON.stringify(include);
+  params.preferredTags = "0";
+  return params;
+}
+function catalogResult(
+  definition: CatalogDefinition,
+  prefs: ContentPreferences,
+): Promise<PromiseSettledResult<BrowsePage>> {
+  const hidden = prefs.personalizeDiscover
+    ? scopeTagSelections(prefs.hiddenTags, [definition.source])
+    : [];
+  const params = new URLSearchParams(catalogParams(definition, prefs));
+  params.set("page", "1");
+  params.set("perPage", String(SHELF_ITEMS + MORE_PREVIEWS));
+  const build = () => {
+    if (definition.id === "trending" && !params.has("include")) {
+      return searchVisibleCatalog(
+        {
+          provider: "stashdb",
+          kind: "scene",
+          sort: "trending",
+          direction: "desc",
+          page: 1,
+          perPage: SHELF_ITEMS + MORE_PREVIEWS,
+          tagsExclude: hidden
+            .flatMap((tag) => (tag.stashdb ? [tag.stashdb] : []))
+            .slice(0, TAG_FILTER_ID_CAP),
+        },
+        hidden,
+        DISCOVER_SCAN_BUDGET,
+      ).then((page) => ({ ...page, errors: page.errors ?? [] }));
+    }
+    return browseTitles(
+      parseBrowseQuery(params),
+      hidden,
+      [],
+      DISCOVER_SCAN_BUDGET,
     );
-    const sourceIncludes = scopeTagSelections(include, [definition.source]);
-    if (sourceIncludes.length) params.include = JSON.stringify(sourceIncludes);
-    // The link carries this row’s effective preference snapshot explicitly.
-    params.preferredTags = "0";
-    return browseShelf(
+  };
+  return cachedCatalogRail(params.toString(), hidden, build).then(
+    (value) => ({ status: "fulfilled" as const, value }),
+    (reason) => ({ status: "rejected" as const, reason }),
+  );
+}
+export async function warmCatalogRails(today: string): Promise<void> {
+  const prefs: ContentPreferences = {
+    ...defaultPersonalSettings(),
+    hiddenTags: [],
+    discoverOrder: [],
+  };
+  const results = await Promise.all(
+    catalogDefinitions(today).map((definition) =>
+      catalogResult(definition, prefs),
+    ),
+  );
+  const outage = results.find(
+    (result) =>
+      result.status === "rejected" &&
+      !(
+        result.reason instanceof AppError &&
+        result.reason.code === "provider_not_configured"
+      ),
+  );
+  if (outage?.status === "rejected") throw outage.reason;
+}
+async function facetReleases(
+  prefs: ContentPreferences,
+  today: string,
+): Promise<PromiseSettledResult<BrowsePage>> {
+  const definitions = catalogDefinitions(today);
+  const rows = await Promise.all([
+    catalogResult(definitions[0]!, prefs),
+    catalogResult(definitions[1]!, prefs),
+  ]);
+  const values = rows.flatMap((row) =>
+    row.status === "fulfilled" ? [row.value] : [],
+  );
+  if (!values.length) return rows[0]!;
+  const errors = rows.flatMap((row, index) =>
+    row.status === "fulfilled"
+      ? row.value.errors
+      : [sourceError(index === 0 ? "tpdb" : "stashdb", row.reason)],
+  );
+  return {
+    status: "fulfilled",
+    value: { ...values[0]!, items: values.flatMap((row) => row.items), errors },
+  };
+}
+export async function discoverIndex(ctx: AuthContext): Promise<Response> {
+  const preferences = getContentPreferences(ctx.account.id);
+  return json({
+    shelves: await shelfStubs(ctx),
+    personalized: preferences.personalizeDiscover,
+    hiddenTagCount: preferences.hiddenTags.length,
+    preferredTagCount: preferences.includeTags.length,
+  });
+}
+// Composed form retained for server-side callers; HTTP clients load each shelf lazily.
+export async function discover(ctx: AuthContext): Promise<Response> {
+  const prefs = getContentPreferences(ctx.account.id);
+  const today = new Date().toISOString().slice(0, 10);
+  const shelves = await Promise.all(
+    (await shelfStubs(ctx)).map((stub) =>
+      buildShelf(stub.id as DiscoverShelfId, ctx, prefs, today),
+    ),
+  );
+  return json({
+    shelves: shelves.filter((shelf) => shelf !== null),
+    personalized: prefs.personalizeDiscover,
+    hiddenTagCount: prefs.hiddenTags.length,
+    preferredTagCount: prefs.includeTags.length,
+  });
+}
+function shelfBases(
+  today: string,
+  prefs: ContentPreferences,
+): Record<Exclude<DiscoverShelfId, "followed-titles">, ShelfStub> {
+  const fixed: Record<string, ShelfStub> = {
+    "new-releases": {
+      id: "new-releases",
+      title: "New releases",
+      description: "Newest TPDB movies and StashDB scenes",
+      source: "velvarr",
+      kind: "catalog",
+      browse: {
+        view: "titles",
+        params: {
+          type: "all",
+          sort: "recency",
+          direction: "desc",
+          date: today,
+          date_operation: "<=",
+        },
+      },
+    },
+    trending: {
+      id: "trending",
+      title: "Trending",
+      description: "Scene trends from StashDB",
+      source: "stashdb",
+      kind: "catalog",
+      browse: {
+        view: "titles",
+        params: { type: "scene", sort: "trending", direction: "desc" },
+      },
+    },
+    "jellyfin-recent": {
+      id: "jellyfin-recent",
+      title: "Recently added",
+      source: "jellyfin",
+      kind: "library",
+      browse: { view: "library", params: { sort: "dateAdded" } },
+    },
+    "velvarr-requests": {
+      id: "velvarr-requests",
+      title: "Recent requests",
+      source: "velvarr",
+      kind: "requests",
+      browse: { view: "requests", params: {} },
+    },
+    studios: {
+      id: "studios",
+      title: "Studios",
+      source: "velvarr",
+      kind: "facets",
+      browse: { view: "facets", params: { kind: "studios" } },
+    },
+    genres: {
+      id: "genres",
+      title: "Genres",
+      source: "velvarr",
+      kind: "facets",
+      browse: { view: "facets", params: { kind: "genres" } },
+    },
+  };
+  const catalog: Record<string, ShelfStub> = Object.fromEntries(
+    catalogDefinitions(today).map((definition) => [
+      definition.id,
       {
         id: definition.id,
         title: definition.title,
         source: definition.source,
         description: definition.description,
-        kind: "catalog",
-        browse: { view: "titles", params },
+        kind: "catalog" as const,
+        browse: {
+          view: "titles" as const,
+          params: catalogParams(definition, prefs),
+        },
       },
-      settled[index]!,
-    );
-  });
-  shelves.push(
-    shelfOf(
-      {
-        id: "jellyfin-recent",
-        title: "Recently added",
-        source: "jellyfin",
-        kind: "library",
-        browse: { view: "library", params: { sort: "dateAdded" } },
-      },
-      recentlyAdded,
-    ),
-    shelfOf(
-      {
-        id: "velvarr-requests",
-        title: "Recent requests",
-        source: "velvarr",
-        kind: "requests",
-        browse: { view: "requests", params: {} },
-      },
-      requests,
-    ),
-    ...(await facetShelves(
-      settled[0]!.status === "fulfilled" && settled[1]!.status === "fulfilled"
-        ? {
-            status: "fulfilled",
-            value: {
-              ...settled[0]!.value,
-              items: [...settled[0]!.value.items, ...settled[1]!.value.items],
-              errors: [
-                ...settled[0]!.value.errors,
-                ...settled[1]!.value.errors,
-              ],
-            },
-          }
-        : settled[0]!.status === "fulfilled"
-          ? settled[0]!
-          : settled[1]!,
-    )),
+    ]),
   );
-  const followed = await followedShelf(ctx.account.id, hiddenTags, include);
-  if (followed) shelves.push(followed);
+  return { ...fixed, ...catalog } as Record<
+    Exclude<DiscoverShelfId, "followed-titles">,
+    ShelfStub
+  >;
+}
+
+export async function shelfStubs(ctx: AuthContext): Promise<ShelfStub[]> {
+  const today = new Date().toISOString().slice(0, 10);
+  const prefs = getContentPreferences(ctx.account.id);
+  const { discoverOrder } = prefs;
+  const bases = shelfBases(today, prefs);
+  const stubs: ShelfStub[] = [
+    bases["new-releases"],
+    bases["new-scenes"],
+    bases["tmdb-new"],
+    bases.trending,
+    bases["tmdb-trending"],
+    bases["jellyfin-recent"],
+    bases["velvarr-requests"],
+    bases.studios,
+    bases.genres,
+    ...(listFollows(ctx.account.id).length > 0 ? [FOLLOWED_SHELF_BASE] : []),
+  ];
+  // Per-account order over the PRESENT shelves only: a shelf the account
+  // cannot fill (no follows) stays absent — never a fake rail, and the
+  // saved order itself is untouched. Array#sort is stable, so any id the
+  // saved order does not know (a shelf newer than this account's stored
+  // order) keeps its assembled position after the ranked ones.
   const rank = new Map<string, number>(
-    preferences.discoverOrder.map((id, index) => [id, index]),
+    discoverOrder.map((id, i) => [id, i] as const),
   );
-  shelves.sort(
+  stubs.sort(
     (a, b) => (rank.get(a.id) ?? rank.size) - (rank.get(b.id) ?? rank.size),
   );
+  return stubs;
+}
+
+export async function buildShelf(
+  id: DiscoverShelfId,
+  ctx: AuthContext,
+  prefs: ContentPreferences,
+  today: string,
+): Promise<Shelf | null> {
+  const hiddenTags = prefs.personalizeDiscover ? prefs.hiddenTags : [];
+  const includes =
+    prefs.personalizeDiscover && prefs.applyIncludeTags
+      ? prefs.includeTags
+      : [];
+  const definition = catalogDefinitions(today).find((row) => row.id === id);
+  if (definition)
+    return browseShelf(
+      shelfBases(today, prefs)[
+        id as Exclude<DiscoverShelfId, "followed-titles">
+      ],
+      await catalogResult(definition, prefs),
+    );
+  // followedShelf builds its own shelf from the shared base above; null
+  // means an empty filmography (the rail disappears, as the stub list's
+  // presence rule anticipated).
+  if (id === "followed-titles") {
+    return cachedFollowed(ctx.account.id, hiddenTags, includes);
+  }
+  const base = shelfBases(today, prefs)[id];
+  switch (id) {
+    case "jellyfin-recent":
+      return shelfOf(
+        base,
+        await Promise.allSettled([
+          listRecentlyAddedItems(
+            ctx.config,
+            ctx.token,
+            ctx.account,
+            SHELF_ITEMS + MORE_PREVIEWS,
+          ).then((items) =>
+            railOf(items, (it) => ({
+              name: it.name,
+              ...(it.image ? { imageUrl: it.image } : {}),
+            })),
+          ),
+        ]).then((r) => r[0]!),
+      );
+    case "velvarr-requests":
+      // storage is sync; deferred so its failures settle like the rest.
+      return shelfOf(
+        base,
+        await Promise.allSettled([
+          Promise.resolve().then(() =>
+            railOf(listRequestItems(ctx), (r) => ({ media: r.media })),
+          ),
+        ]).then((r) => r[0]!),
+      );
+    case "studios":
+    case "genres": {
+      // facetShelves yields the error-only shelves when both sides of the
+      // browse page failed, preserving the old shape. Each facet rebuilds
+      // studio enrichment from the provider detail cache; acceptable —
+      // cachedReleases joins concurrent builds.
+      const shelves = await facetShelves(await facetReleases(prefs, today));
+      return shelves.find((s) => s.id === id)!;
+    }
+  }
+  throw new AppError(404, "unknown_shelf", "Unknown discover shelf.");
+}
+
+export async function discoverShelf(
+  request: Request,
+  ctx: AuthContext,
+): Promise<Response> {
+  const id = new URL(request.url).searchParams.get("id");
+  const present = await shelfStubs(ctx);
+  // The stub list only ever carries registry ids, so presence proves the
+  // cast; Shelf.id is a plain string on the wire.
+  const stub = present.find((s) => s.id === id);
+  if (id === null || stub === undefined) {
+    throw new AppError(404, "unknown_shelf", "Unknown discover shelf.");
+  }
+  const prefs = getContentPreferences(ctx.account.id);
+  const today = new Date().toISOString().slice(0, 10);
   return json({
-    shelves,
-    personalized: preferences.personalizeDiscover,
-    hiddenTagCount: hiddenTags.length,
-    preferredTagCount: include.length,
+    shelf: await buildShelf(id as DiscoverShelfId, ctx, prefs, today),
   });
 }
 
@@ -810,7 +1107,13 @@ export const routes: RouteDef[] = [
     method: "GET",
     segments: ["discover"],
     auth: "session",
-    run: async (ctx) => discover(ctx),
+    run: async (ctx) => discoverIndex(ctx),
+  },
+  {
+    method: "GET",
+    segments: ["discover", "shelf"],
+    auth: "session",
+    run: async (ctx, request) => discoverShelf(request, ctx),
   },
   {
     method: "GET",

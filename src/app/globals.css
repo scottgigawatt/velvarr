@@ -1583,3 +1583,23 @@ body:has(.auth-page) {
 .facet-options > button {
   justify-content: flex-start;
 }
+
+/* Phone installability: coarse pointers get the 44px touch-target floor
+   (Apple HIG); desktop keeps its dense chrome. Checkboxes and radios stay
+   native — their row is the target. Last in the file so the floor wins
+   specificity ties with component rules like .btn; card quick actions and
+   filter rows carry their own coarse floors. */
+@media (pointer: coarse) {
+  button,
+  select,
+  summary,
+  input:not([type="checkbox"]):not([type="radio"]),
+  .btn {
+    min-height: 44px;
+  }
+  .icon-button,
+  .global-search .icon-button {
+    width: 44px;
+    height: 44px;
+  }
+}

@@ -1,3 +1,4 @@
+import { isJudgmentProvider, isOllamaModel } from "../lib/contracts.ts";
 import { isCatalogId } from "../lib/contracts.ts";
 import { whisparrConnections, whisparrTarget } from "./whisparr-targets.ts";
 import {
@@ -50,7 +51,7 @@ import {
 
 // Schema identity: application_id spells 'VLVR', user_version is the schema version.
 const APP_ID = 0x564c5652;
-const SCHEMA_VERSION = 13;
+const SCHEMA_VERSION = 15;
 // ponytail: fixed 7-day session TTL; make it an env knob only if an operator asks.
 const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const BUSY_TIMEOUT_MS = 5000;
@@ -193,6 +194,7 @@ type Statements = {
   completeSubmissionAccepted: StatementSync;
   completeSubmissionUncertain: StatementSync;
   completeSubmissionFailed: StatementSync;
+  completeSubmissionFailedPermanent: StatementSync;
   requeueBlocked: StatementSync;
   recordObservation: StatementSync;
   recordObservationError: StatementSync;
@@ -212,6 +214,11 @@ type Statements = {
   deletePerformerFollowsLinkedTo: StatementSync;
   getPreferences: StatementSync;
   updatePreferences: StatementSync;
+  getDiscoverCache: StatementSync;
+  putDiscoverCache: StatementSync;
+  pruneDiscoverCache: StatementSync;
+  capDiscoverCache: StatementSync;
+  clearDiscoverCache: StatementSync;
 };
 
 const MIGRATIONS: Record<number, string> = {
@@ -445,6 +452,60 @@ const MIGRATIONS: Record<number, string> = {
   13: `
     ALTER TABLE accounts ADD COLUMN personal_settings TEXT NOT NULL DEFAULT '{}'
       CHECK (json_valid(personal_settings));
+  `,
+  14: `
+    CREATE TABLE discover_cache (
+      key TEXT PRIMARY KEY,
+      payload TEXT NOT NULL,
+      fetched_at INTEGER NOT NULL
+    );
+  `,
+  15: `
+    -- Additive: SQLite cannot alter a CHECK constraint, so rebuild the table
+    -- with the terminal failed_permanent state admitted. Existing 'failed'
+    -- rows keep their state and recheck cadence; nothing is rewritten.
+    CREATE TABLE acquisitions_new (
+      id TEXT PRIMARY KEY,
+      instance_id TEXT NOT NULL,
+      provider TEXT NOT NULL CHECK (provider IN ('tpdb', 'stashdb', 'tmdb')),
+      kind TEXT NOT NULL CHECK (kind IN ('movie', 'scene')),
+      external_id TEXT NOT NULL,
+      state TEXT NOT NULL CHECK (
+        state IN (
+          'unsent', 'submitting', 'uncertain', 'monitoring',
+          'downloading', 'imported', 'failed', 'failed_permanent', 'blocked'
+        )
+      ),
+      claim_token TEXT,
+      attempt_token TEXT,
+      claimed_at INTEGER,
+      attempt_at INTEGER,
+      due_at INTEGER,
+      submitted_at INTEGER,
+      last_observed_at INTEGER,
+      last_error_at INTEGER,
+      last_error TEXT,
+      whisparr_id INTEGER,
+      whisparr_path TEXT,
+      whisparr_title TEXT,
+      whisparr_monitored INTEGER,
+      whisparr_progress INTEGER,
+      whisparr_timeleft TEXT,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
+    INSERT INTO acquisitions_new (id, instance_id, provider, kind, external_id, state, claim_token, attempt_token, claimed_at, attempt_at, due_at, submitted_at, last_observed_at, last_error_at, last_error, whisparr_id, whisparr_path, whisparr_title, whisparr_monitored, whisparr_progress, whisparr_timeleft, created_at, updated_at)
+      SELECT id, instance_id, provider, kind, external_id, state, claim_token,
+             attempt_token, claimed_at, attempt_at, due_at, submitted_at,
+             last_observed_at, last_error_at, last_error, whisparr_id,
+             whisparr_path, whisparr_title, whisparr_monitored,
+             whisparr_progress, whisparr_timeleft, created_at, updated_at
+      FROM acquisitions;
+    DROP TABLE acquisitions;
+    ALTER TABLE acquisitions_new RENAME TO acquisitions;
+    CREATE UNIQUE INDEX acquisitions_identity
+      ON acquisitions (instance_id, provider, kind, external_id);
+    CREATE INDEX acquisitions_due ON acquisitions (due_at);
   `,
 };
 
@@ -699,6 +760,11 @@ function S(): Statements {
       completeSubmissionFailed: d.prepare(
         "UPDATE acquisitions SET state = 'failed', attempt_token = NULL, due_at = ?, last_error = ?, last_error_at = ?, updated_at = ? WHERE id = ? AND claim_token = ? AND attempt_token = ?",
       ),
+      // Terminal: due_at stays NULL, so listDueAcquisitions never re-lists
+      // the row and observe() never costs another Whisparr read.
+      completeSubmissionFailedPermanent: d.prepare(
+        "UPDATE acquisitions SET state = 'failed_permanent', attempt_token = NULL, due_at = NULL, last_error = ?, last_error_at = ?, updated_at = ? WHERE id = ? AND claim_token = ? AND attempt_token = ?",
+      ),
       requeueBlocked: d.prepare(
         "UPDATE acquisitions SET state = 'unsent', due_at = ?, updated_at = ? WHERE instance_id = ? AND state = 'blocked' AND claim_token IS NULL",
       ),
@@ -717,9 +783,10 @@ function S(): Statements {
       ),
       recordAbsence: d.prepare(
         `UPDATE acquisitions SET
+           state = 'failed_permanent',
            last_error = CASE WHEN state = 'failed' THEN last_error ELSE ? END,
            last_error_at = CASE WHEN state = 'failed' THEN last_error_at ELSE ? END,
-           due_at = ?,
+           due_at = NULL,
            whisparr_id = NULL, whisparr_path = NULL, whisparr_title = NULL,
            whisparr_monitored = NULL,
            whisparr_progress = NULL, whisparr_timeleft = NULL, updated_at = ?
@@ -770,6 +837,19 @@ function S(): Statements {
       updatePreferences: d.prepare(
         "UPDATE accounts SET hidden_tags = ?, discover_order = ?, personal_settings = ? WHERE id = ?",
       ),
+      getDiscoverCache: d.prepare(
+        "SELECT payload, fetched_at FROM discover_cache WHERE key = ?",
+      ),
+      putDiscoverCache: d.prepare(
+        "INSERT OR REPLACE INTO discover_cache (key, payload, fetched_at) VALUES (?, ?, ?)",
+      ),
+      pruneDiscoverCache: d.prepare(
+        "DELETE FROM discover_cache WHERE fetched_at < ?",
+      ),
+      capDiscoverCache: d.prepare(
+        "DELETE FROM discover_cache WHERE key NOT IN (SELECT key FROM discover_cache ORDER BY fetched_at DESC, key DESC LIMIT ?)",
+      ),
+      clearDiscoverCache: d.prepare("DELETE FROM discover_cache"),
     };
   }
   return stmts;
@@ -1067,17 +1147,12 @@ function assertConfigShape(config: IntegrationConfig): void {
       !credentialOk(p.tpdbApiToken, 1024) ||
       !credentialOk(p.stashdbApiKey, 512) ||
       (p.judgmentProvider !== undefined &&
-        p.judgmentProvider !== "none" &&
-        p.judgmentProvider !== "typesafe" &&
-        p.judgmentProvider !== "ollama") ||
+        !isJudgmentProvider(p.judgmentProvider)) ||
       (p.ollamaUrl !== undefined &&
         (typeof p.ollamaUrl !== "string" ||
           !p.ollamaUrl ||
           p.ollamaUrl.length > 2048)) ||
-      (p.ollamaModel !== undefined &&
-        (typeof p.ollamaModel !== "string" ||
-          p.ollamaModel.length > 128 ||
-          !/^[A-Za-z0-9][A-Za-z0-9._:/-]*$/.test(p.ollamaModel)))
+      (p.ollamaModel !== undefined && !isOllamaModel(p.ollamaModel))
     ) {
       throw new AppError(
         400,
@@ -1893,6 +1968,42 @@ export function listFollows(accountId: string): PerformerFollow[] {
   return follows.filter(
     (f) => f.linked !== null || !counterparts.has(key(f.reference)),
   );
+}
+
+/** Seerr-style shared upstream cache for provider-derived discover shelves
+ * (src/server/discovery.ts owns keys and TTL; storage only stores rows). */
+export function getDiscoverCache(
+  key: string,
+): { payload: string; fetchedAt: number } | undefined {
+  const row = S().getDiscoverCache.get(key) as
+    { payload: string; fetched_at: number } | undefined;
+  return row === undefined
+    ? undefined
+    : { payload: row.payload, fetchedAt: row.fetched_at };
+}
+
+export function putDiscoverCache(
+  key: string,
+  payload: string,
+  fetchedAt: number,
+): void {
+  S().putDiscoverCache.run(key, payload, fetchedAt);
+}
+
+/** Age-prunes, then caps the table at the newest `maxRows` rows (default
+ * 500): age alone never bounds cardinality — every distinct hidden-tag set
+ * builds its own rows. Ties on fetched_at break by key, so the kept set is
+ * deterministic. Returns total deleted rows. */
+export function pruneDiscoverCache(maxAgeMs: number, maxRows = 500): number {
+  const aged = Number(
+    S().pruneDiscoverCache.run(Date.now() - maxAgeMs).changes,
+  );
+  const capped = Number(S().capDiscoverCache.run(maxRows).changes);
+  return aged + capped;
+}
+
+export function clearDiscoverCache(): void {
+  S().clearDiscoverCache.run();
 }
 
 export function listFollowsByProvider(
@@ -2725,6 +2836,16 @@ export function completeSubmission(
         attemptToken,
       );
       break;
+    case "failed_permanent":
+      res = S().completeSubmissionFailedPermanent.run(
+        error ?? "submission failed permanently",
+        now,
+        now,
+        id,
+        claimToken,
+        attemptToken,
+      );
+      break;
     default:
       throw new AppError(
         400,
@@ -2809,18 +2930,10 @@ export function recordAcquisitionObservation(
     if (!nonemptyString(observation.reason, 2000)) {
       throw new AppError(400, "invalid_observation", "observation is invalid");
     }
-    // Proven absence from a successful lookup: the recorded facts are now
-    // known false, so they are cleared; state and lastObservedAt (the last
-    // real observation) stay, keeping this distinct from an unknown check.
-    res = S().recordAbsence.run(
-      observation.reason,
-      now,
-      now + RECHECK_DELAY_MS,
-      now,
-      id,
-      claim,
-      claim,
-    );
+    // Proven absence from a successful lookup is terminal: the recorded
+    // facts are known false, so they are cleared; the row becomes
+    // failed_permanent and is never scheduled again.
+    res = S().recordAbsence.run(observation.reason, now, now, id, claim, claim);
   } else {
     if (!nonemptyString(observation.reason, 2000)) {
       throw new AppError(400, "invalid_observation", "observation is invalid");

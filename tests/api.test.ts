@@ -1,7 +1,11 @@
+import {
+  SHELF_ITEMS,
+  MORE_PREVIEWS,
+} from "../src/app/api/[...path]/routes/discover.ts";
 import { defaultPersonalSettings } from "../src/lib/personalization.ts";
 // API regression tests: privilege, CSRF, session, library denial, outage honesty.
 // Runs handlers directly against local fixture servers. No real network, no real providers.
-import { test, before, after } from "node:test";
+import { test, before, after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import {
   createServer,
@@ -16,12 +20,32 @@ import { rmTempDir } from "./setup.ts";
 import { Buffer } from "node:buffer";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { resetMetaCache } from "../src/server/providers.ts";
+import {
+  DISCOVER_CACHE_TTL_MS,
+  catalogRailCacheKey,
+} from "../src/server/discovery.ts";
+import {
+  clearDiscoverCache,
+  getDiscoverCache,
+  putDiscoverCache,
+} from "../src/server/storage.ts";
 import { resetSweepCache } from "../src/server/jellyfin.ts";
 import { resetUpdateCache } from "../src/server/update.ts";
 import { resetLoginBuckets } from "../src/server/security.ts";
+import { AppError } from "../src/server/http.ts";
 import { countPendingApprovals } from "../src/lib/approvals.ts";
 import type { RouteDef } from "../src/app/api/[...path]/admission.ts";
-import { resetSessionCache } from "../src/app/api/[...path]/admission.ts";
+import {
+  ARTWORK_BURST,
+  PRELOAD_BURST,
+  PRELOAD_REFILL_PER_MINUTE,
+  RATE_BUCKETS_CAP,
+  RATE_BURST,
+  RATE_REFILL_PER_MINUTE,
+  chargeRateBudget,
+  resetRateBuckets,
+  resetSessionCache,
+} from "../src/app/api/[...path]/admission.ts";
 import { routes as authRoutes } from "../src/app/api/[...path]/routes/auth.ts";
 import { routes as requestRoutes } from "../src/app/api/[...path]/routes/requests.ts";
 import { routes as followRoutes } from "../src/app/api/[...path]/routes/follows.ts";
@@ -115,6 +139,22 @@ const TPDB_MOVIE4 = "2a2b3c4d-0000-0000-0000-000000000004";
 // acquisition belong to that test alone, so no other case's observation
 // facts can leak in or out (recordObservation merges, never replaces).
 const TPDB_MOVIE_YEAR = "2a2b3c4d-0000-0000-0000-0000000000c2";
+// Dedicated to the availability verdicts test: its "available" and "denied"
+// reads need an acquisition the test approves itself, so the verdicts never
+// depend on a row another test wrote (recordObservation merges, never
+// replaces — a shared acquisition would leak facts across tests).
+const TPDB_MOVIE_AVAIL = "2a2b3c4d-0000-0000-0000-00000000000b";
+// Dedicated to the scan-lag test for the same reason: its monitoring,
+// imported and absent observations must land on its own acquisition.
+const TPDB_MOVIE_SCAN = "2a2b3c4d-0000-0000-0000-00000000000a";
+// Filed by the discover-order test as member2: the staff-view proof needs a
+// row from another account, and the admin user-rows test pins the owner's
+// count at a true zero before its own filings. Fresh id: never filed
+// elsewhere, so the filing cannot collide with an active intent.
+const TPDB_MOVIE_RAIL = "2a2b3c4d-0000-0000-0000-000000000016";
+// Filed by the discover rail test as member2, so its velvarr-requests shelf
+// has a row without reading the lifecycle test's rows.
+const TPDB_MOVIE10 = "2a2b3c4d-0000-0000-0000-000000000017";
 // Only used by the performer-filmography bulk test: TPDB_MOVIE3 already
 // carries approved intents from earlier tests, and an active-intent row
 // would collide with the bulk's new pending intent and show up in the
@@ -869,6 +909,10 @@ async function tpdbHandler(
     return json(res, 200, { data: tpdbMovieRow(TPDB_MOVIE_YEAR) });
   if (p === `/movies/${TPDB_MOVIE4}`)
     return json(res, 200, { data: tpdbMovieRow(TPDB_MOVIE4) });
+  if (p === `/movies/${TPDB_MOVIE_AVAIL}`)
+    return json(res, 200, { data: tpdbMovieRow(TPDB_MOVIE_AVAIL) });
+  if (p === `/movies/${TPDB_MOVIE_SCAN}`)
+    return json(res, 200, { data: tpdbMovieRow(TPDB_MOVIE_SCAN) });
   json(res, 404, {});
 }
 
@@ -887,7 +931,7 @@ interface InjectedSceneRow {
   urls: never[];
   images: never[];
   studio: { id: string; name: string };
-  tags: never[];
+  tags: { id: string; name: string }[];
   performers: never[];
 }
 
@@ -1005,18 +1049,36 @@ async function stashdbHandler(
             : null,
     });
   }
-  if (query.includes("searchTag")) {
-    // The counterpart lookup searches the full tag name; the suggestion
-    // path searches "Fixture". One same-normalized-name row (TAG_D, served
-    // only for the "Fixture Tag A" term) proves exact pairing; every other
-    // term answers only near-misses that must stay unlinked.
-    const vars = body.variables as { t?: unknown } | undefined;
-    const term = typeof vars?.t === "string" ? vars.t : "";
+  if (query.includes("queryTags")) {
+    // The complete listing the counterpart lookup reads for pairing (and
+    // the free-text expansion walk): TAG_D ("fixture-tag-a") is TAG_A's
+    // same-normalized-name twin; every other row is a near-miss that must
+    // stay unlinked.
     return json(res, 200, {
       data: {
-        searchTag: term.toLowerCase().includes("tag a")
-          ? [{ id: TAG_D, name: "fixture-tag-a" }]
-          : [{ id: TAG_B, name: "Fixture Stash Tag" }],
+        queryTags: {
+          count: 2,
+          tags: [
+            { id: TAG_D, name: "fixture-tag-a" },
+            { id: TAG_B, name: "Fixture Stash Tag" },
+          ],
+        },
+      },
+    });
+  }
+  if (query.includes("searchTag")) {
+    // listCatalogTags (the no-match suggestion path) inlines the empty
+    // term; the counterpart lookup left searchTag for the queryTags
+    // listing above. A cold picker search goes native with a real term
+    // and finds nothing here, so the judged-suggestion branch stays
+    // reachable.
+    const term = (body.variables as { t?: string } | undefined)?.t;
+    return json(res, 200, {
+      data: {
+        searchTag:
+          term === undefined || term === ""
+            ? [{ id: TAG_B, name: "Fixture Stash Tag" }]
+            : [],
       },
     });
   }
@@ -1164,6 +1226,76 @@ async function errorShape(
       typeof body.error.message === "string",
   );
   return body.error as { code: string; message: string };
+}
+
+/**
+ * Standalone boot for tests that must pass alone (--test-name-pattern):
+ * setup commit, account import, the standing grants, provider env and the
+ * Whisparr integration, in the same shapes the file-order tests create
+ * them. A no-op once the suite has initialized, so the full file runs
+ * unchanged.
+ */
+async function boot(): Promise<void> {
+  // Providers read credentials and base at call time; point them at the
+  // fixtures. Same values the catalog-search and studio-search tests arm.
+  process.env.TPDB_API_TOKEN = tpdbToken;
+  process.env.TPDB_BASE_URL = tpdbUrl;
+  process.env.STASHDB_API_KEY = stashdbKey;
+  process.env.STASHDB_BASE_URL = stashdbUrl;
+  const status = (await (await call("GET", "/api/status")).json()) as {
+    initialized: boolean;
+  };
+  if (status.initialized) return;
+  const owner = cookieOf(
+    await call("POST", "/api/setup", {
+      body: { ...inspectBody(), libraryIds: [MOVIES_LIB, SHOWS_LIB] },
+    }),
+  );
+  assert.match(owner, /^velvarr_session=/);
+  assert.equal(
+    (await call("POST", "/api/admin/users/import", { cookie: owner })).status,
+    200,
+  );
+  fx.grants.set(MEMBER_ID, [MOVIES_LIB]);
+  fx.grants.set(NOGRANT_ID, []);
+  const enables: [
+    string,
+    { enabled: boolean; role: string; libraryIds: string[] },
+  ][] = [
+    [MEMBER_ID, { enabled: true, role: "requester", libraryIds: [MOVIES_LIB] }],
+    [MEMBER2_ID, { enabled: true, role: "requester", libraryIds: [SHOWS_LIB] }],
+    [NOGRANT_ID, { enabled: true, role: "requester", libraryIds: [] }],
+  ];
+  for (const [id, body] of enables) {
+    assert.equal(
+      (
+        await call("PATCH", `/api/admin/users/${id}`, {
+          cookie: owner,
+          body,
+        })
+      ).status,
+      200,
+    );
+  }
+  // The standing Whisparr integration, with the pathMappings the
+  // availability path-correlation logic reads.
+  assert.equal(
+    (
+      await call("PATCH", "/api/admin/integrations", {
+        cookie: owner,
+        body: {
+          jellyfinUrl,
+          jellyfinExternalUrl: jellyfinUrl,
+          whisparrUrl,
+          whisparrApiKey: whisparrKey,
+          pathMappings: [
+            { whisparrPrefix: "/data/whisparr", jellyfinPrefix: "/media" },
+          ],
+        },
+      })
+    ).status,
+    200,
+  );
 }
 
 // --- tests ---
@@ -1500,6 +1632,73 @@ test("setup inspect validates secret, authenticates, returns real selection", as
   assert.equal(ok.headers.get("set-cookie"), null);
   assert.equal(JSON.stringify(body).includes("pass-owner"), false);
   assert.equal(JSON.stringify(body).includes(fx.adminKey), false);
+});
+
+test("setup secret guesses are bounded per source", async () => {
+  // The setup secret is the only credential on a not-yet-bootstrapped
+  // instance: without a charge before the comparison, every guess of
+  // VELVARR_SETUP_SECRET is free at network speed.
+  resetLoginBuckets();
+  const wrong = {
+    ...inspectBody(),
+    setupSecret: "wrong-secret-wrong-secret-wrong-secret!",
+  };
+  try {
+    for (let guess = 0; guess < 5; guess += 1) {
+      await errorShape(
+        await call("POST", "/api/setup/inspect", { body: { ...wrong } }),
+        403,
+      );
+    }
+    // Both secret-carrying routes share the per-source bucket: the sixth
+    // guess on either is refused 429 before the comparison runs.
+    await errorShape(
+      await call("POST", "/api/setup/inspect", { body: { ...wrong } }),
+      429,
+    );
+    const error = await errorShape(
+      await call("POST", "/api/setup", {
+        body: { ...wrong, libraryIds: [MOVIES_LIB] },
+      }),
+      429,
+    );
+    assert.equal(error.code, "too_many_attempts");
+  } finally {
+    resetLoginBuckets();
+  }
+});
+
+test("a correct setup secret works after the limiter window rolls over", async () => {
+  resetLoginBuckets();
+  const realNow = Date.now;
+  let now = realNow();
+  Date.now = () => now;
+  const wrong = {
+    ...inspectBody(),
+    setupSecret: "wrong-secret-wrong-secret-wrong-secret!",
+  };
+  try {
+    for (let guess = 0; guess < 5; guess += 1) {
+      await errorShape(
+        await call("POST", "/api/setup/inspect", { body: { ...wrong } }),
+        403,
+      );
+    }
+    now += 5 * 60_000 + 1; // the login limiter's fixed window length
+    const ok = await call("POST", "/api/setup/inspect", {
+      body: inspectBody(),
+    });
+    assert.equal(ok.status, 200);
+    // A passed check refunds its slot, so the owner's own traffic never
+    // burns the budget: the next correct call inside the same window works.
+    const again = await call("POST", "/api/setup/inspect", {
+      body: inspectBody(),
+    });
+    assert.equal(again.status, 200);
+  } finally {
+    Date.now = realNow;
+    resetLoginBuckets();
+  }
 });
 
 test("setup commit is atomic, one-time, and race cannot overwrite config", async () => {
@@ -1893,14 +2092,16 @@ test("library detail: catalog enrichment via whisparr path mappings", async (t) 
       itemType: "scene",
       statistics: { movieFileCount: 1, sizeOnDisk: 2_000_000_000 },
     };
-    // Changes become visible after the shared collection cache expires.
+    // Library detail now shares the list-enrichment collection cache: a read
+    // inside the 30 s TTL still returns the catalog the first read resolved,
+    // even though the fixture changed underneath.
     const cached = await call("GET", `/api/library/${ITEM_MOVIE}`, {
       cookie: owner,
     });
-    assert.deepEqual(
-      ((await cached.json()) as { catalog: unknown }).catalog,
-      resolvedBody.catalog,
-    );
+    const cachedBody = (await cached.json()) as {
+      catalog?: { provider: string; kind: string; id: string };
+    };
+    assert.deepEqual(cachedBody.catalog, resolvedBody.catalog);
     elapsed += 30_001;
     const scene = await call("GET", `/api/library/${ITEM_MOVIE}`, {
       cookie: owner,
@@ -1935,6 +2136,7 @@ test("library detail: catalog enrichment via whisparr path mappings", async (t) 
       itemType: "movie",
       statistics: { movieFileCount: 1, sizeOnDisk: 1 },
     });
+    // The duplicate must become visible: expire the shared collection cache.
     elapsed += 30_001;
     const ambiguous = await call("GET", `/api/library/${ITEM_MOVIE}`, {
       cookie: owner,
@@ -2766,6 +2968,158 @@ test("Ollama settings and model verification require admin admission and preserv
   assert.equal((await clear.json()).judgment.provider, "typesafe");
 });
 
+test("an invalid environment judgment provider degrades the integrations response", async () => {
+  const before = process.env.VELVARR_JUDGMENT_PROVIDER;
+  try {
+    process.env.VELVARR_JUDGMENT_PROVIDER = "Ollama";
+    const baseline = await call("GET", "/api/admin/integrations", {
+      cookie: owner,
+    });
+    assert.equal(baseline.status, 200, "the settings card must still load");
+    const shape = await baseline.json();
+    assert.equal(shape.judgment.provider, "typesafe");
+    assert.equal(shape.judgment.configured, false);
+    assert.match(shape.judgment.error, /invalid value "Ollama"/);
+    // A credential edit that leaves the provider unset still saves and
+    // returns the (degraded) shape instead of failing after the write.
+    const patched = await call("PATCH", "/api/admin/integrations", {
+      cookie: owner,
+      body: { typesafeApiKey: "key-while-env-invalid" },
+    });
+    assert.equal(patched.status, 200);
+    assert.match((await patched.json()).judgment.error, /invalid value/);
+  } finally {
+    if (before === undefined) delete process.env.VELVARR_JUDGMENT_PROVIDER;
+    else process.env.VELVARR_JUDGMENT_PROVIDER = before;
+  }
+});
+
+test("the integrations response never carries a raw environment Ollama URL", async () => {
+  const keys = ["OLLAMA_BASE_URL", "VELVARR_JUDGMENT_PROVIDER"] as const;
+  const before = keys.map((k) => process.env[k]);
+  try {
+    process.env.VELVARR_JUDGMENT_PROVIDER = "ollama";
+    process.env.OLLAMA_BASE_URL =
+      "http://user:password@127.0.0.1:11434/?token=s3cret";
+    const response = await call("GET", "/api/admin/integrations", {
+      cookie: owner,
+    });
+    assert.equal(response.status, 200);
+    const body = await response.json();
+    assert.equal(body.judgment.url, "", "a rejected URL reads as no URL");
+    assert.match(body.judgment.error, /valid integration base URL/);
+    const wire = JSON.stringify(body);
+    assert.equal(wire.includes("user:password"), false);
+    assert.equal(wire.includes("s3cret"), false);
+  } finally {
+    keys.forEach((k, i) => {
+      if (before[i] === undefined) delete process.env[k];
+      else process.env[k] = before[i];
+    });
+  }
+});
+
+test("browse tag suggestions keep the stored-key gate for TypeSafe", async () => {
+  // Local listener standing in for TypeSafe: counts decision calls, always
+  // fails them — the gate, not the answer, is under test.
+  const hits: string[] = [];
+  const listener: Server = createServer((req, res) => {
+    hits.push(req.url ?? "");
+    res.writeHead(404).end();
+  });
+  await new Promise<void>((resolve) =>
+    listener.listen(0, "127.0.0.1", resolve),
+  );
+  const port = (listener.address() as { port: number }).port;
+  const restored = {
+    key: process.env.TYPESAFE_API_KEY,
+    base: process.env.TYPESAFE_BASE_URL,
+    provider: process.env.VELVARR_JUDGMENT_PROVIDER,
+    ollamaBase: process.env.OLLAMA_BASE_URL,
+  };
+  try {
+    delete process.env.VELVARR_JUDGMENT_PROVIDER;
+    process.env.TYPESAFE_BASE_URL = `http://127.0.0.1:${port}`;
+    // Start clean: earlier tests in this file store credentials.
+    await call("PATCH", "/api/admin/integrations", {
+      cookie: owner,
+      body: { typesafeApiKey: "", judgmentProvider: "" },
+    });
+
+    // Env-only key: the search runs, but the cloud receives no search term.
+    process.env.TYPESAFE_API_KEY = "ts_env_only_key";
+    const envOnly = await call("GET", "/api/browse/tags?q=zznomatchy", {
+      cookie: member,
+    });
+    assert.equal(envOnly.status, 200, await envOnly.text());
+    assert.equal(hits.length, 0, "an env-only key sends no search terms");
+
+    // Stored key: the previous gate — the suggestion call is attempted.
+    const stored = await call("PATCH", "/api/admin/integrations", {
+      cookie: owner,
+      body: { typesafeApiKey: "ts_stored_gate_key" },
+    });
+    assert.equal(stored.status, 200);
+    const gated = await call("GET", "/api/browse/tags?q=zznomatchy", {
+      cookie: member,
+    });
+    assert.equal(gated.status, 200);
+    assert.equal(
+      hits.filter((u) => u.includes("/v1/systemone")).length,
+      1,
+      "a stored key restores the judged-suggestion path",
+    );
+
+    // Environment-selected Ollama: the environment alone never sends
+    // member search terms — not even with the stored TypeSafe key above,
+    // which belongs to a different backend.
+    if (restored.key === undefined) delete process.env.TYPESAFE_API_KEY;
+    else process.env.TYPESAFE_API_KEY = restored.key;
+    process.env.VELVARR_JUDGMENT_PROVIDER = "ollama";
+    process.env.OLLAMA_BASE_URL = `http://127.0.0.1:${port}`;
+    const envOllama = await call("GET", "/api/browse/tags?q=zznomatchy", {
+      cookie: member,
+    });
+    assert.equal(envOllama.status, 200, await envOllama.text());
+    assert.equal(
+      hits.filter((u) => u.includes("/v1/systemone")).length,
+      1,
+      "environment-only Ollama sends no search terms",
+    );
+
+    // Saved Ollama choice: the gate reopens for the backend the admin saved.
+    const saved = await call("PATCH", "/api/admin/integrations", {
+      cookie: owner,
+      body: { judgmentProvider: "ollama" },
+    });
+    assert.equal(saved.status, 200);
+    const savedOllama = await call("GET", "/api/browse/tags?q=zznomatchy", {
+      cookie: member,
+    });
+    assert.equal(savedOllama.status, 200);
+    assert.equal(
+      hits.filter((u) => u.includes("/v1/systemone")).length,
+      2,
+      "the saved Ollama choice restores the judged-suggestion path",
+    );
+  } finally {
+    if (restored.key === undefined) delete process.env.TYPESAFE_API_KEY;
+    else process.env.TYPESAFE_API_KEY = restored.key;
+    if (restored.base === undefined) delete process.env.TYPESAFE_BASE_URL;
+    else process.env.TYPESAFE_BASE_URL = restored.base;
+    if (restored.provider === undefined)
+      delete process.env.VELVARR_JUDGMENT_PROVIDER;
+    else process.env.VELVARR_JUDGMENT_PROVIDER = restored.provider;
+    if (restored.ollamaBase === undefined) delete process.env.OLLAMA_BASE_URL;
+    else process.env.OLLAMA_BASE_URL = restored.ollamaBase;
+    await call("PATCH", "/api/admin/integrations", {
+      cookie: owner,
+      body: { typesafeApiKey: "", judgmentProvider: "" },
+    });
+    listener.close();
+  }
+});
+
 test("catalog search with a rejected tpdb key is 502 upstream_auth, not a 401 sign-out", async () => {
   // The client signs out on any 401 (shared.tsx api()), so an expired
   // provider key reaching the wire as 401 signs every user out of catalog
@@ -2937,6 +3291,112 @@ test("catalog artwork proxy: provider-only, no credentials, cacheable with reval
   );
   assert.equal(logo.headers.get("content-disposition"), "attachment");
   assert.equal(logo.headers.get("x-content-type-options"), "nosniff");
+});
+
+test("catalog artwork proxy: query and non-image paths refused; misses charge, cached tiles stay free", async (t) => {
+  resetRateBuckets();
+  // Mock clock: no refill can land mid-test, so the boundary is exact.
+  t.mock.timers.enable({ apis: ["Date"] });
+
+  // A query string would vary the cache key while the fetch requests
+  // origin+pathname only, so ?n=1, ?n=2, ... would each refetch the same
+  // upstream path; stashdb.org is also the API host and /images/ its only
+  // artwork path. The gate refuses both before any fetch: the fixture call
+  // count below cannot move.
+  const callsBefore = tpdbFx.calls;
+  const varied = await call(
+    "GET",
+    `/api/catalog/image?url=${encodeURIComponent(
+      `${tpdbUrl}/fixture-artwork.png?n=1`,
+    )}`,
+    { cookie: member },
+  );
+  assert.equal(varied.status, 400);
+  assert.equal((await errorShape(varied, 400)).code, "invalid_artwork_url");
+  await errorShape(
+    await call(
+      "GET",
+      `/api/catalog/image?url=${encodeURIComponent(
+        "https://stashdb.org/graphql",
+      )}`,
+      { cookie: member },
+    ),
+    400,
+  );
+  await errorShape(
+    await call(
+      "GET",
+      `/api/catalog/image?url=${encodeURIComponent(
+        "https://stashdb.org/not-images/x.jpg",
+      )}`,
+      { cookie: member },
+    ),
+    400,
+  );
+  assert.equal(tpdbFx.calls, callsBefore, "refused URLs must not fetch");
+
+  // A fresh URL is an upstream miss and charges the account's artwork lane
+  // once; every same-URL repeat is a cache hit and stays free even after the
+  // lane is exhausted. A fresh path guarantees a miss: earlier tests
+  // already cached /fixture-artwork.png in the process-wide artwork cache.
+  const fresh = encodeURIComponent(`${tpdbUrl}/fixture-budget-miss.png`);
+  const first = await call("GET", `/api/catalog/image?url=${fresh}`, {
+    cookie: member,
+  });
+  assert.equal(first.status, 200);
+  assert.equal(tpdbFx.calls, callsBefore + 1, "the miss fetched upstream");
+  for (let i = 0; i < 5; i += 1) {
+    const hit = await call("GET", `/api/catalog/image?url=${fresh}`, {
+      cookie: member,
+    });
+    assert.equal(hit.status, 200, `cached request ${i + 1} must stay free`);
+  }
+
+  // Distinct URLs are upstream misses and spend the account's artwork lane,
+  // never the dispatch bucket the API routes share: past RATE_BURST misses
+  // a page's own API calls still pass (a cold discover or detail page must
+  // not 429 itself mid-load), and after ARTWORK_BURST misses the next miss
+  // answers 429 — a member session cannot loop this route into unbounded
+  // provider fetches. A fresh path guarantees a miss: earlier tests already
+  // cached /fixture-artwork.png in the process-wide artwork cache.
+  for (let i = 0; i < RATE_BURST + 5; i += 1) {
+    const miss = await call(
+      "GET",
+      `/api/catalog/image?url=${encodeURIComponent(
+        `${tpdbUrl}/budget-miss-${i}.png`,
+      )}`,
+      { cookie: member },
+    );
+    assert.equal(miss.status, 200, `miss ${i + 1} must pass`);
+  }
+  const apiDuring = await call("GET", "/api/me", { cookie: member });
+  assert.equal(apiDuring.status, 200, "artwork misses must not drain dispatch");
+  for (let i = RATE_BURST + 5; i < ARTWORK_BURST - 1; i += 1) {
+    const miss = await call(
+      "GET",
+      `/api/catalog/image?url=${encodeURIComponent(
+        `${tpdbUrl}/budget-miss-${i}.png`,
+      )}`,
+      { cookie: member },
+    );
+    assert.equal(miss.status, 200, `miss ${i + 2} must pass`);
+  }
+  const drained = await call(
+    "GET",
+    `/api/catalog/image?url=${encodeURIComponent(
+      `${tpdbUrl}/budget-miss-final.png`,
+    )}`,
+    { cookie: member },
+  );
+  assert.equal(drained.status, 429);
+  assert.equal((await errorShape(drained, 429)).code, "rate_limited");
+  // A drained artwork lane neither blocks a cache hit nor the dispatch lane.
+  const hit = await call("GET", `/api/catalog/image?url=${fresh}`, {
+    cookie: member,
+  });
+  assert.equal(hit.status, 200, "cached tiles stay free after the lane drains");
+  const apiAfter = await call("GET", "/api/me", { cookie: member });
+  assert.equal(apiAfter.status, 200, "dispatch survives a drained art lane");
 });
 
 test("requests: lifecycle, autoApprove, privacy, roles, origin", async () => {
@@ -3405,19 +3865,41 @@ test("requests: lifecycle, autoApprove, privacy, roles, origin", async () => {
 });
 
 test("availability: distinct verdicts under the caller's own token", async () => {
+  await boot();
+  const member = await loginAs("member");
+  const owner = await loginAs("owner");
+  const nogrants = await loginAs("nogrants");
   assert.equal(
     (await call("GET", `/api/availability/tpdb/movie/${TPDB_MOVIE}`)).status,
     401,
   );
 
-  // Worker-equivalent: persist observed Whisparr facts on the shared
+  // Approvals belong to this test: every verdict reads an acquisition the
+  // test filed and approved itself, on its own movie id where an
+  // observation would otherwise merge into another test's row.
+  const approve = async (id: string) => {
+    const req = await call("POST", "/api/requests", {
+      cookie: member,
+      body: { media: { provider: "tpdb", kind: "movie", id } },
+    });
+    assert.equal(req.status, 201, id);
+    const reqBody = (await req.json()) as { request: { id: string } };
+    await call("PATCH", `/api/requests/${reqBody.request.id}`, {
+      cookie: owner,
+      body: { decision: "approved" },
+    });
+    const acquired = getAcquisitionByReference({
+      provider: "tpdb",
+      kind: "movie",
+      id,
+    });
+    assert.ok(acquired, id);
+    return acquired;
+  };
+
+  // Worker-equivalent: persist observed Whisparr facts on the test's own
   // acquisition; the availability route must read them, never call Whisparr.
-  const acq = getAcquisitionByReference({
-    provider: "tpdb",
-    kind: "movie",
-    id: TPDB_MOVIE,
-  });
-  assert.ok(acq);
+  const acq = await approve(TPDB_MOVIE_AVAIL);
   recordAcquisitionObservation(acq.id, {
     state: "monitoring",
     item: {
@@ -3430,7 +3912,7 @@ test("availability: distinct verdicts under the caller's own token", async () =>
   // available: exact path correspondence, granted library, playable source.
   const available = await call(
     "GET",
-    `/api/availability/tpdb/movie/${TPDB_MOVIE}`,
+    `/api/availability/tpdb/movie/${TPDB_MOVIE_AVAIL}`,
     { cookie: member },
   );
   assert.equal(available.status, 200);
@@ -3443,11 +3925,10 @@ test("availability: distinct verdicts under the caller's own token", async () =>
 
   // denied: no granted libraries for this caller.
   fx.grants.set(NOGRANT_ID, []);
-  const noGrantCookie = nogrants; // shared session from the autoApprove test above.
   const denied = await call(
     "GET",
-    `/api/availability/tpdb/movie/${TPDB_MOVIE}`,
-    { cookie: noGrantCookie },
+    `/api/availability/tpdb/movie/${TPDB_MOVIE_AVAIL}`,
+    { cookie: nogrants },
   );
   assert.equal(
     ((await denied.json()) as { outcome: string }).outcome,
@@ -3455,23 +3936,7 @@ test("availability: distinct verdicts under the caller's own token", async () =>
   );
 
   // ambiguous: title-only similarity is never upgraded to a guess.
-  const acq3Req = await call("POST", "/api/requests", {
-    cookie: member,
-    body: { media: { provider: "tpdb", kind: "movie", id: TPDB_MOVIE3 } },
-  });
-  assert.equal(acq3Req.status, 201);
-  const acq3Id = ((await acq3Req.json()) as { request: { id: string } }).request
-    .id;
-  await call("PATCH", `/api/requests/${acq3Id}`, {
-    cookie: owner,
-    body: { decision: "approved" },
-  });
-  const acq3 = getAcquisitionByReference({
-    provider: "tpdb",
-    kind: "movie",
-    id: TPDB_MOVIE3,
-  });
-  assert.ok(acq3);
+  const acq3 = await approve(TPDB_MOVIE3);
   recordAcquisitionObservation(acq3.id, {
     state: "monitoring",
     item: { title: "Alpha Movie" },
@@ -3487,15 +3952,7 @@ test("availability: distinct verdicts under the caller's own token", async () =>
   );
 
   // missing: known identity, nothing on the media server.
-  const m4Req = await call("POST", "/api/requests", {
-    cookie: member,
-    body: { media: { provider: "tpdb", kind: "movie", id: TPDB_MOVIE4 } },
-  });
-  const m4Id = ((await m4Req.json()) as { request: { id: string } }).request.id;
-  await call("PATCH", `/api/requests/${m4Id}`, {
-    cookie: owner,
-    body: { decision: "approved" },
-  });
+  await approve(TPDB_MOVIE4);
   const missing = await call(
     "GET",
     `/api/availability/tpdb/movie/${TPDB_MOVIE4}`,
@@ -3744,6 +4201,12 @@ interface FixtureShelf {
   /** Per-source partial-failure evidence; coexists with items. */
   errors?: { provider: string; code: string; message: string }[];
   error?: { code: string; message: string };
+  /** See More previews: the next entries past the rail, not loaded. */
+  more?: {
+    name?: string;
+    imageUrl?: string;
+    media?: { provider: string; kind: string; id: string };
+  }[];
 }
 
 // Facet tiles: projected to the pinned wire fields for set comparison.
@@ -3781,9 +4244,26 @@ interface FixtureCategory {
   error?: { code: string };
 }
 
-async function shelvesOf(res: Response): Promise<FixtureShelf[]> {
+async function shelvesOf(
+  res: Response,
+  cookie: string,
+): Promise<FixtureShelf[]> {
   const body = (await res.json()) as { shelves: FixtureShelf[] };
-  return body.shelves;
+  // The list endpoint answers with stubs (ids only); each shelf body comes
+  // from its own fetch, in stub order. A null shelf (an empty followed
+  // filmography) renders no rail, so it is skipped.
+  const shelves: FixtureShelf[] = [];
+  for (const stub of body.shelves) {
+    const shelfRes = await call("GET", `/api/discover/shelf?id=${stub.id}`, {
+      cookie,
+    });
+    assert.equal(shelfRes.status, 200, stub.id);
+    const shelfBody = (await shelfRes.json()) as {
+      shelf: FixtureShelf | null;
+    };
+    if (shelfBody.shelf !== null) shelves.push(shelfBody.shelf);
+  }
+  return shelves;
 }
 
 async function searchOf(res: Response): Promise<{
@@ -3801,7 +4281,7 @@ test("discover: mixed new releases, honest trending, facets, grants, not-configu
 
   const ok = await call("GET", "/api/discover", { cookie: member });
   assert.equal(ok.status, 200);
-  const shelves = await shelvesOf(ok);
+  const shelves = await shelvesOf(ok, member);
   // Mixed new releases, trending, then library/requests, then the two
   // unified facet shelves. This account follows nobody, so no
   // followed-titles rail exists (proven below via /api/follows).
@@ -4003,35 +4483,74 @@ test("discover: mixed new releases, honest trending, facets, grants, not-configu
 
   // One source failing: the mixed rail keeps the survivor's titles beside a
   // visible per-source warning — a degraded page, never an error page and
-  // never a quiet success. First-contact: the earlier discover cached these
-  // shelves.
+  // never a quiet success. The outage holds for the whole phase (fail deep,
+  // like the both-sides phase below): a degraded page is no longer cached,
+  // so every shelf build re-runs it, and a counted failure would recover
+  // mid-phase.
+  clearDiscoverCache();
   resetMetaCache();
-  tpdbFx.fail = 1;
-  const outage = await call("GET", "/api/discover", { cookie: member });
-  assert.equal(outage.status, 200, "shelf failure must not fail the page");
-  const outById = new Map(
-    (await shelvesOf(outage)).map((shelf) => [shelf.id, shelf]),
-  );
-  const outNew = outById.get("new-releases");
-  assert.match(outNew?.error?.code ?? "", /unavailable/);
-  assert.equal(outNew?.items, undefined);
-  const survivingScenes = outById.get("new-scenes");
-  assert.equal(survivingScenes?.error, undefined);
-  assert.ok((survivingScenes?.items?.length ?? 0) > 0);
-  for (const item of survivingScenes?.items ?? [])
-    assert.equal(refOf(item)?.provider, "stashdb");
-  for (const id of ["trending", "jellyfin-recent", "velvarr-requests"]) {
-    const shelf = outById.get(id);
-    assert.equal(shelf?.error, undefined, id);
-    assert.ok((shelf?.items?.length ?? 0) > 0, id);
-  }
-  for (const id of ["studios", "genres"]) {
-    const shelf = outById.get(id);
-    assert.equal(shelf?.error, undefined, id);
-    // With the TPDB side down, every surviving tile is stash-side.
-    for (const tile of (shelf?.items ?? []) as FacetTile[]) {
-      assert.equal(tile.provider, "stashdb", `${id}:${tile.id}`);
+  tpdbFx.fail = 5;
+  try {
+    const outage = await call("GET", "/api/discover", { cookie: member });
+    assert.equal(outage.status, 200, "shelf failure must not fail the page");
+    const outById = new Map(
+      (await shelvesOf(outage, member)).map((shelf) => [shelf.id, shelf]),
+    );
+    const outNew = outById.get("new-releases");
+    assert.match(outNew?.error?.code ?? "", /unavailable/);
+    assert.equal(outNew?.items, undefined);
+    const survivingScenes = outById.get("new-scenes");
+    assert.equal(survivingScenes?.error, undefined);
+    assert.ok((survivingScenes?.items?.length ?? 0) > 0);
+    for (const item of survivingScenes?.items ?? [])
+      assert.equal(refOf(item)?.provider, "stashdb");
+    for (const id of ["trending", "jellyfin-recent", "velvarr-requests"]) {
+      const shelf = outById.get(id);
+      assert.equal(shelf?.error, undefined, id);
+      assert.ok((shelf?.items?.length ?? 0) > 0, id);
     }
+    for (const id of ["studios", "genres"]) {
+      const shelf = outById.get(id);
+      assert.equal(shelf?.error, undefined, id);
+      // With the TPDB side down, every surviving tile is stash-side.
+      for (const tile of (shelf?.items ?? []) as FacetTile[]) {
+        assert.equal(tile.provider, "stashdb", `${id}:${tile.id}`);
+      }
+    }
+  } finally {
+    tpdbFx.fail = 0;
+  }
+
+  // One source failing, mirrored: the StashDB side is down. The facet rails
+  // keep the TPDB tiles but must name the dead side — a half-filled rail is
+  // a degraded page, never a quiet success (the shelves used to drop the
+  // page's per-source errors here).
+  clearDiscoverCache();
+  resetMetaCache();
+  stashdbFx.fail = 9;
+  try {
+    for (const id of ["studios", "genres"]) {
+      const res = await call("GET", `/api/discover/shelf?id=${id}`, {
+        cookie: member,
+      });
+      assert.equal(res.status, 200, "shelf failure must not fail the page");
+      // Named boundary cast: the suite's json() convention (no validator).
+      const body = (await res.json()) as { shelf: FixtureShelf | null };
+      const shelf = body.shelf;
+      assert.equal(shelf?.error, undefined, `${id}: partial is not an error`);
+      assert.ok(
+        (shelf?.items?.length ?? 0) > 0,
+        `${id}: survivor side still renders`,
+      );
+      for (const tile of (shelf?.items ?? []) as FacetTile[]) {
+        assert.equal(tile.provider, "tpdb", `${id}:${tile.id}`);
+      }
+      assert.equal(shelf?.errors?.length, 1, `${id}: the dead side is named`);
+      assert.equal(shelf?.errors?.[0]?.provider, "stashdb");
+      assert.match(shelf?.errors?.[0]?.code ?? "", /unavailable/);
+    }
+  } finally {
+    stashdbFx.fail = 0;
   }
 
   // Both sources failing: the mixed rail collapses to an error shelf, the
@@ -4040,6 +4559,7 @@ test("discover: mixed new releases, honest trending, facets, grants, not-configu
   // that could read as a quiet success. Fail deep rather than counting
   // calls: a page is truly source-less only when every read on both sides
   // dies, however many each side legitimately issues.
+  clearDiscoverCache();
   resetMetaCache();
   tpdbFx.fail = 5;
   stashdbFx.fail = 5;
@@ -4047,7 +4567,7 @@ test("discover: mixed new releases, honest trending, facets, grants, not-configu
     const bothDown = await call("GET", "/api/discover", { cookie: member });
     assert.equal(bothDown.status, 200, "shelf failure must not fail the page");
     const bothById = new Map(
-      (await shelvesOf(bothDown)).map((shelf) => [shelf.id, shelf]),
+      (await shelvesOf(bothDown, member)).map((shelf) => [shelf.id, shelf]),
     );
     for (const id of ["new-releases", "trending", "studios", "genres"]) {
       const shelf = bothById.get(id);
@@ -4066,13 +4586,16 @@ test("discover: mixed new releases, honest trending, facets, grants, not-configu
   // tiles, never invented links and never an empty list that could read as
   // a quiet success.
   const key = process.env.STASHDB_API_KEY;
+  clearDiscoverCache();
   delete process.env.STASHDB_API_KEY;
   const unconfigured = await call("GET", "/api/discover", { cookie: member });
+  // The list is stubs only: the shelf bodies — and their provider reads —
+  // come from the per-shelf fetches, so the unconfigured window must stay
+  // open until those have run.
+  const unShelves = await shelvesOf(unconfigured, member);
   process.env.STASHDB_API_KEY = key;
   assert.equal(unconfigured.status, 200);
-  const unById = new Map(
-    (await shelvesOf(unconfigured)).map((shelf) => [shelf.id, shelf]),
-  );
+  const unById = new Map(unShelves.map((shelf) => [shelf.id, shelf]));
   const unTrending = unById.get("trending");
   assert.equal(unTrending?.error?.code, "provider_not_configured");
   assert.equal(unTrending?.items, undefined);
@@ -4104,6 +4627,280 @@ test("discover: mixed new releases, honest trending, facets, grants, not-configu
         assert.equal("linked" in tile, false, `${id}:${tile.id}`);
       }
     }
+  }
+});
+
+test("discover rails hold three pages and preview the next four past the cap", async () => {
+  // A pool past the rail cap: the rail keeps SHELF_ITEMS entries and the
+  // See More card previews exactly the next four — while shelves whose
+  // source has nothing past the rail omit `more` entirely (never an empty
+  // array pretending a preview exists). Both cache layers start cold: the
+  // injected pool must reach the shelves, not a cached candidate list.
+  clearDiscoverCache();
+  resetMetaCache();
+  const extraId = (prefix: string, n: number) =>
+    `${prefix}-0000-0000-0000-${String(n).padStart(12, "0")}`;
+  extraTpdbMovies = Array.from({ length: 34 }, (_, i) => ({
+    ...tpdbMovieRow(extraId("6e6f7071", 800 + i)),
+    site: {
+      name: `Fixture Movie Studio ${String(i).padStart(2, "0")}`,
+      uuid: extraId("6e6f7071", 850 + i),
+    },
+  }));
+  extraStashScenes = Array.from({ length: 34 }, (_, i) => ({
+    id: extraId("7f708182", 900 + i),
+    title: `Fixture Scene ${i}`,
+    date: "2024-05-06",
+    duration: 600,
+    urls: [],
+    images: [],
+    studio: {
+      id: extraId("7f708182", 950 + i),
+      name: `Fixture Studio ${String(i).padStart(2, "0")}`,
+    },
+    tags: [
+      {
+        id: extraId("7f708182", 970 + i),
+        name: `Fixture Genre ${String(i).padStart(2, "0")}`,
+      },
+    ],
+    performers: [],
+  }));
+  try {
+    const ok = await call("GET", "/api/discover", { cookie: member });
+    assert.equal(ok.status, 200);
+    const byId = new Map(
+      (await shelvesOf(ok, member)).map((shelf) => [shelf.id, shelf]),
+    );
+    for (const id of ["new-releases", "trending"]) {
+      const shelf = byId.get(id);
+      assert.equal(shelf?.error, undefined, id);
+      assert.equal(shelf?.items?.length, 28, `${id} fills the rail`);
+      const more = shelf?.more ?? [];
+      assert.equal(more.length, 4, `${id} previews the next four`);
+      for (const preview of more) {
+        assert.equal(typeof preview.name, "string", `${id} preview name`);
+        assert.equal(
+          preview.imageUrl === undefined ||
+            typeof preview.imageUrl === "string",
+          true,
+          `${id} preview art`,
+        );
+        assert.equal(preview.media, undefined, `${id} preview kind`);
+      }
+    }
+    // Sources without a tail stay silent: no `more` key at all. The facet
+    // rails see the same deep pool as every other rail (their tiles derive
+    // from the releases page), so they fill to the cap and carry previews
+    // too; the dedupes legitimately shrink the tail (the published
+    // studio pair collapses into one tile, TAG_A pairs its stash twin).
+    for (const id of ["studios", "genres"]) {
+      const shelf = byId.get(id);
+      assert.equal(shelf?.error, undefined, id);
+      assert.equal(shelf?.items?.length, 28, `${id} fills the rail`);
+      assert.ok((shelf?.more?.length ?? 0) >= 1, `${id} previews its tail`);
+      for (const preview of shelf?.more ?? []) {
+        assert.equal(typeof preview.name, "string", `${id} preview name`);
+      }
+    }
+    for (const id of ["jellyfin-recent", "velvarr-requests"]) {
+      assert.equal(
+        byId.get(id)?.more,
+        undefined,
+        `${id} has nothing past the rail`,
+      );
+    }
+  } finally {
+    extraTpdbMovies = [];
+    extraStashScenes = [];
+  }
+});
+
+test("discover stubs carry no items and follow the presence rules", async () => {
+  assert.equal((await call("GET", "/api/discover")).status, 401);
+  const res = await call("GET", "/api/discover", { cookie: member });
+  assert.equal(res.status, 200);
+  const body = (await res.json()) as { shelves: Record<string, unknown>[] };
+  for (const stub of body.shelves) {
+    assert.equal("items" in stub, false, String(stub.id));
+    assert.equal("errors" in stub, false, String(stub.id));
+    assert.equal("error" in stub, false, String(stub.id));
+  }
+  // Registry order; this account follows nobody, so no followed-titles
+  // stub exists.
+  assert.deepEqual(
+    body.shelves.map((stub) => stub.id),
+    [
+      "new-releases",
+      "new-scenes",
+      "tmdb-new",
+      "trending",
+      "tmdb-trending",
+      "jellyfin-recent",
+      "velvarr-requests",
+      "studios",
+      "genres",
+    ],
+  );
+});
+
+test("the shelf endpoint 404s unknown, missing, and not-present ids as unknown_shelf", async () => {
+  const nope = await call("GET", "/api/discover/shelf?id=nope", {
+    cookie: member,
+  });
+  assert.equal(nope.status, 404);
+  assert.equal((await errorShape(nope)).code, "unknown_shelf");
+  const missing = await call("GET", "/api/discover/shelf", { cookie: member });
+  assert.equal(missing.status, 404);
+  await errorShape(missing);
+  // No follows on this account: the followed rail is not present at all.
+  const unfollowed = await call(
+    "GET",
+    "/api/discover/shelf?id=followed-titles",
+    { cookie: member },
+  );
+  assert.equal(unfollowed.status, 404);
+  assert.equal((await errorShape(unfollowed)).code, "unknown_shelf");
+});
+
+test("the discovery cache serves fresh hits warm and rebuilds stale entries", async () => {
+  // Both layers must start cold: providers.ts's in-process metaCache sits
+  // UNDER the discover cache, and a warm metaCache entry would skip the
+  // upstream fixture entirely.
+  clearDiscoverCache();
+  resetMetaCache();
+  const before = tpdbFx.calls;
+  const first = await call("GET", "/api/discover/shelf?id=new-releases", {
+    cookie: member,
+  });
+  assert.equal(first.status, 200);
+  const afterFirst = tpdbFx.calls;
+  assert.ok(afterFirst > before, "a cold build fetches upstream");
+  const second = await call("GET", "/api/discover/shelf?id=new-releases", {
+    cookie: member,
+  });
+  assert.equal(second.status, 200);
+  assert.equal(tpdbFx.calls, afterFirst, "a fresh hit skips upstream");
+
+  // Age the entry past the TTL; the next read rebuilds. The key uses the
+  // documented fingerprint shape (hiddenTags + provider configured-ness).
+  const prefs = await call("GET", "/api/me/preferences", { cookie: member });
+  const prefsBody = (await prefs.json()) as { hiddenTags: unknown[] };
+  const firstShelf = (await first.json()) as {
+    shelf: { browse: { params: Record<string, string> } };
+  };
+  const params = new URLSearchParams(firstShelf.shelf.browse.params);
+  params.set("page", "1");
+  params.set("perPage", String(SHELF_ITEMS + MORE_PREVIEWS));
+  const cacheKey = catalogRailCacheKey(
+    params.toString(),
+    prefsBody.hiddenTags as import("../src/lib/contracts.ts").CatalogTagSelection[],
+  );
+  const entry = getDiscoverCache(cacheKey);
+  assert.ok(entry, "the shelf read populated the documented cache key");
+  putDiscoverCache(
+    cacheKey,
+    entry!.payload,
+    Date.now() - DISCOVER_CACHE_TTL_MS - 1000,
+  );
+  // The cold build re-warmed the metaCache; drop it again so the aged
+  // entry's rebuild genuinely reaches the upstream fixture.
+  resetMetaCache();
+  const third = await call("GET", "/api/discover/shelf?id=new-releases", {
+    cookie: member,
+  });
+  assert.equal(third.status, 200);
+  assert.ok(tpdbFx.calls > afterFirst, "a stale entry rebuilds upstream");
+  clearDiscoverCache();
+});
+
+test("a failed new-releases build is never cached: recovery serves without a clear", async () => {
+  // Both layers cold: the metaCache sits under the discover cache and a
+  // warm entry would skip the upstream fixture (see the TTL test above).
+  clearDiscoverCache();
+  resetMetaCache();
+  // Fail deep rather than counting calls: the whole build must reject, so
+  // every read on both sides dies (same discipline as the both-down test).
+  tpdbFx.fail = 5;
+  stashdbFx.fail = 5;
+  try {
+    const outage = await call("GET", "/api/discover/shelf?id=new-releases", {
+      cookie: member,
+    });
+    assert.equal(outage.status, 200);
+    const outageBody = (await outage.json()) as {
+      shelf: { error?: { code: string }; items?: unknown[] };
+    };
+    assert.equal(
+      outageBody.shelf.error?.code,
+      "upstream_unavailable",
+      "the outage renders as the shelf's own error",
+    );
+    assert.equal(outageBody.shelf.items, undefined);
+    // The failure must not be cached: once the fixture recovers, the very
+    // next read rebuilds — no clearDiscoverCache() in between.
+    tpdbFx.fail = 0;
+    stashdbFx.fail = 0;
+    const recovered = await call("GET", "/api/discover/shelf?id=new-releases", {
+      cookie: member,
+    });
+    assert.equal(recovered.status, 200);
+    const recoveredBody = (await recovered.json()) as {
+      shelf: { error?: unknown; items?: unknown[] };
+    };
+    assert.equal(recoveredBody.shelf.error, undefined);
+    assert.ok(
+      (recoveredBody.shelf.items?.length ?? 0) > 0,
+      "the recovered build serves items",
+    );
+  } finally {
+    tpdbFx.fail = 0;
+    stashdbFx.fail = 0;
+    clearDiscoverCache();
+  }
+});
+
+test("a followed rail whose filmography is fully hidden answers a null shelf", async () => {
+  const hidden = await call("PATCH", "/api/me/preferences", {
+    cookie: member,
+    body: { hiddenTags: [{ name: "Fixture Tag A", tpdb: TAG_A }] },
+  });
+  assert.equal(hidden.status, 200);
+  const follow = await call("POST", "/api/follows", {
+    cookie: member,
+    body: {
+      performer: {
+        provider: "tpdb",
+        kind: "performer",
+        id: TPDB_PERFORMER,
+      },
+      name: "Fixture Performer",
+    },
+  });
+  assert.equal(follow.status, 201);
+  try {
+    // Every title the rail could carry is hidden: the stub stays, the shelf
+    // itself is null.
+    clearDiscoverCache();
+    const res = await call("GET", "/api/discover/shelf?id=followed-titles", {
+      cookie: member,
+    });
+    assert.equal(res.status, 200);
+    const body = (await res.json()) as { shelf: unknown };
+    assert.equal(body.shelf, null);
+  } finally {
+    clearDiscoverCache();
+    const unfollowed = await call(
+      "DELETE",
+      `/api/follows/tpdb/${TPDB_PERFORMER}`,
+      { cookie: member },
+    );
+    assert.equal(unfollowed.status, 204);
+    const restored = await call("PATCH", "/api/me/preferences", {
+      cookie: member,
+      body: { hiddenTags: [] },
+    });
+    assert.equal(restored.status, 200);
   }
 });
 
@@ -5537,10 +6334,37 @@ test("the autoApprove grant approves bulk requests and attaches the shared acqui
 });
 
 test("discover appends ONE followed rail across providers and isolates a provider outage", async () => {
-  // member2 follows one TPDB and one StashDB performer (from the tests above).
+  await boot();
+  const member2 = await loginAs("member2");
+  // Own rows: the two follows this test reads are created (and removed at
+  // the end) here, and the velvarr-requests shelf carries a row the test
+  // files itself — nothing may depend on what earlier tests left behind.
+  for (const [provider, id] of [
+    ["tpdb", TPDB_PERFORMER],
+    ["stashdb", STASH_PERFORMER],
+  ] as const) {
+    // Delete first: a suite run and a standalone run start from the same
+    // state, so the creates below always file fresh 201s.
+    await call("DELETE", `/api/follows/${provider}/${id}`, { cookie: member2 });
+  }
+  for (const [provider, id, name] of [
+    ["tpdb", TPDB_PERFORMER, "Fixture Performer"],
+    ["stashdb", STASH_PERFORMER, "Fixture Stash Performer"],
+  ] as const) {
+    const created = await call("POST", "/api/follows", {
+      cookie: member2,
+      body: { performer: { provider, kind: "performer", id }, name },
+    });
+    assert.equal(created.status, 201);
+  }
+  const railReq = await call("POST", "/api/requests", {
+    cookie: member2,
+    body: { media: { provider: "tpdb", kind: "movie", id: TPDB_MOVIE10 } },
+  });
+  assert.equal(railReq.status, 201);
   const ok = await call("GET", "/api/discover", { cookie: member2 });
   assert.equal(ok.status, 200);
-  const shelves = await shelvesOf(ok);
+  const shelves = await shelvesOf(ok, member2);
   assert.deepEqual(
     shelves.map((shelf) => shelf.id),
     [
@@ -5587,10 +6411,11 @@ test("discover appends ONE followed rail across providers and isolates a provide
   // no longer lands on the intended calls; these two paths pin the isolation
   // contract while facet counterpart reads ride unaffected paths.
   tpdbFx.failPaths = ["/movies", `/performers/${TPDB_PERFORMER}/movies`];
+  clearDiscoverCache();
   try {
     const outage = await call("GET", "/api/discover", { cookie: member2 });
     assert.equal(outage.status, 200, "shelf failure must not fail the page");
-    const outShelves = await shelvesOf(outage);
+    const outShelves = await shelvesOf(outage, member2);
     const byId = new Map(outShelves.map((shelf) => [shelf.id, shelf]));
     // Both mixed rails keep their surviving StashDB titles beside a
     // tpdb-tagged warning, with no shelf-level error.
@@ -5650,10 +6475,11 @@ test("followed rail names the provider when one performer's filmography fails", 
   }
   resetMetaCache();
   tpdbFx.failPaths = [`/performers/${TPDB_PERFORMER}/movies`];
+  clearDiscoverCache();
   try {
     const page = await call("GET", "/api/discover", { cookie: member2 });
     assert.equal(page.status, 200, "shelf failure must not fail the page");
-    const shelf = (await shelvesOf(page)).find(
+    const shelf = (await shelvesOf(page, member2)).find(
       (s) => s.id === "followed-titles",
     );
     assert.ok(shelf, "rail exists");
@@ -5677,12 +6503,13 @@ test("followed rail names the provider when one performer's filmography fails", 
     });
     assert.equal(hidden.status, 200);
     try {
+      clearDiscoverCache();
       resetMetaCache();
       const hiddenPage = await call("GET", "/api/discover", {
         cookie: member2,
       });
       assert.equal(hiddenPage.status, 200);
-      const hiddenShelf = (await shelvesOf(hiddenPage)).find(
+      const hiddenShelf = (await shelvesOf(hiddenPage, member2)).find(
         (s) => s.id === "followed-titles",
       );
       assert.ok(hiddenShelf, "the error-only rail still renders");
@@ -5702,10 +6529,11 @@ test("followed rail names the provider when one performer's filmography fails", 
   }
 
   // All pages answer: no warning at all.
+  clearDiscoverCache();
   resetMetaCache();
   const allOk = await call("GET", "/api/discover", { cookie: member2 });
   assert.equal(allOk.status, 200);
-  const okShelf = (await shelvesOf(allOk)).find(
+  const okShelf = (await shelvesOf(allOk, member2)).find(
     (s) => s.id === "followed-titles",
   );
   assert.equal(okShelf?.error, undefined);
@@ -5875,7 +6703,10 @@ test("global search: a full first page reports hasMore, not the page length", as
 
 // --- M3: studioMode — accepted only for StashDB scene + studio filter ---
 test("studioMode: withChildren reaches provider; every other combo is a 400 before upstream", async () => {
-  // StashDB env points at the fixture (set by the studio-search test above).
+  // StashDB env points at the fixture (boot arms it; nothing here may
+  // depend on the studio-search test having run).
+  await boot();
+  const member = await loginAs("member");
   const ok = await call(
     "GET",
     `/api/catalog/search?provider=stashdb&kind=scene&studio=${STASH_STUDIO}&studioMode=withChildren`,
@@ -5940,6 +6771,11 @@ function tagKeys(query: string): string[] {
 
 // --- M4: scan lag (hazard 9) — awaiting_scan is distinct from missing ---
 test("scan lag: imported-but-unscanned is awaiting_scan; outage and denial stay truthful", async () => {
+  await boot();
+  const member = await loginAs("member");
+  const owner = await loginAs("owner");
+  const nogrants = await loginAs("nogrants");
+
   // An identity that was never acquired stays missing.
   const never = await call(
     "GET",
@@ -5948,12 +6784,23 @@ test("scan lag: imported-but-unscanned is awaiting_scan; outage and denial stay 
   );
   assert.equal((await outcomeOf(never)).outcome, "missing");
 
-  // Worker-equivalent: persist observed Whisparr facts on the shared
-  // acquisition for TPDB_MOVIE4 (approved earlier, never observed).
+  // This test's own acquisition: filed and approved here, on a movie id no
+  // other test touches, so the observations below (which merge into the
+  // row) are this test's alone.
+  const req = await call("POST", "/api/requests", {
+    cookie: member,
+    body: { media: { provider: "tpdb", kind: "movie", id: TPDB_MOVIE_SCAN } },
+  });
+  assert.equal(req.status, 201);
+  const reqBody = (await req.json()) as { request: { id: string } };
+  await call("PATCH", `/api/requests/${reqBody.request.id}`, {
+    cookie: owner,
+    body: { decision: "approved" },
+  });
   const acq = getAcquisitionByReference({
     provider: "tpdb",
     kind: "movie",
-    id: TPDB_MOVIE4,
+    id: TPDB_MOVIE_SCAN,
   });
   assert.ok(acq);
   const observation = {
@@ -5969,7 +6816,7 @@ test("scan lag: imported-but-unscanned is awaiting_scan; outage and denial stay 
   recordAcquisitionObservation(acq.id, observation);
   const monitoring = await call(
     "GET",
-    `/api/availability/tpdb/movie/${TPDB_MOVIE4}`,
+    `/api/availability/tpdb/movie/${TPDB_MOVIE_SCAN}`,
     { cookie: member },
   );
   assert.equal((await outcomeOf(monitoring)).outcome, "missing");
@@ -5978,7 +6825,7 @@ test("scan lag: imported-but-unscanned is awaiting_scan; outage and denial stay 
   recordAcquisitionObservation(acq.id, { ...observation, state: "imported" });
   const lagging = await call(
     "GET",
-    `/api/availability/tpdb/movie/${TPDB_MOVIE4}`,
+    `/api/availability/tpdb/movie/${TPDB_MOVIE_SCAN}`,
     { cookie: member },
   );
   const lagBody = await outcomeOf(lagging);
@@ -5988,9 +6835,13 @@ test("scan lag: imported-but-unscanned is awaiting_scan; outage and denial stay 
   // Catalog detail surfaces THIS test's own record: imported with honest
   // freshness labeling. TPDB_MOVIE's monitoring state belongs to another
   // test and must not leak in here.
-  const detail = await call("GET", `/api/catalog/tpdb/movie/${TPDB_MOVIE4}`, {
-    cookie: member,
-  });
+  const detail = await call(
+    "GET",
+    `/api/catalog/tpdb/movie/${TPDB_MOVIE_SCAN}`,
+    {
+      cookie: member,
+    },
+  );
   const detailBody = (await detail.json()) as AcquisitionDetailBody;
   assert.equal(detailBody.acquisition?.state, "imported");
   assert.equal(detailBody.acquisition?.observationStale, false);
@@ -6001,7 +6852,7 @@ test("scan lag: imported-but-unscanned is awaiting_scan; outage and denial stay 
   fx.fail.items = 1;
   const outage = await call(
     "GET",
-    `/api/availability/tpdb/movie/${TPDB_MOVIE4}`,
+    `/api/availability/tpdb/movie/${TPDB_MOVIE_SCAN}`,
     { cookie: member },
   );
   assert.equal((await outcomeOf(outage)).outcome, "unavailable");
@@ -6009,7 +6860,7 @@ test("scan lag: imported-but-unscanned is awaiting_scan; outage and denial stay 
   // A library-denied caller stays denied even while the item is imported.
   const denied = await call(
     "GET",
-    `/api/availability/tpdb/movie/${TPDB_MOVIE4}`,
+    `/api/availability/tpdb/movie/${TPDB_MOVIE_SCAN}`,
     { cookie: nogrants },
   );
   assert.equal((await outcomeOf(denied)).outcome, "denied");
@@ -6021,7 +6872,7 @@ test("scan lag: imported-but-unscanned is awaiting_scan; outage and denial stay 
   });
   const gone = await call(
     "GET",
-    `/api/availability/tpdb/movie/${TPDB_MOVIE4}`,
+    `/api/availability/tpdb/movie/${TPDB_MOVIE_SCAN}`,
     { cookie: member },
   );
   assert.equal((await outcomeOf(gone)).outcome, "missing");
@@ -6850,6 +7701,26 @@ test("content preferences are session-only, self-owned, and atomic on malformed 
 });
 
 test("discover honors a personal shelf order; contents, errors, and other accounts stay untouched", async () => {
+  await boot();
+  const owner = await loginAs("owner");
+  const member2 = await loginAs("member2");
+  // The staff-view proof needs a pending row from another account: file it
+  // here as member2, on this test's own movie id (the admin user-rows test
+  // pins the owner's own count at a true zero before its filings).
+  const filed = await call("POST", "/api/requests", {
+    cookie: member2,
+    body: { media: { provider: "tpdb", kind: "movie", id: TPDB_MOVIE_RAIL } },
+  });
+  assert.equal(filed.status, 201);
+  // The staff door needs a moderator: promote member here (the same grant
+  // the promotion suite sets) and re-login — a role change revokes sessions
+  // by design — so the shared session stays live for the tests below.
+  const promoted = await call("PATCH", `/api/admin/users/${MEMBER_ID}`, {
+    cookie: owner,
+    body: { enabled: true, role: "moderator", libraryIds: [MOVIES_LIB] },
+  });
+  assert.equal(promoted.status, 200);
+  member = await loginAs("member");
   try {
     // Member2's untouched view, snapshotted before member's mutations: the
     // followed rail is conditional (present only with follows), so the
@@ -6859,7 +7730,7 @@ test("discover honors a personal shelf order; contents, errors, and other accoun
       cookie: member2,
     });
     assert.equal(otherBefore.status, 200);
-    const otherShelvesBefore = (await shelvesOf(otherBefore)).map(
+    const otherShelvesBefore = (await shelvesOf(otherBefore, member2)).map(
       (shelf) => shelf.id,
     );
     const otherPrefsBefore = await call("GET", "/api/me/preferences", {
@@ -6895,7 +7766,7 @@ test("discover honors a personal shelf order; contents, errors, and other accoun
     // only — no fake followed-titles shelf appears, and hiddenTags stays.
     const page = await call("GET", "/api/discover", { cookie: member });
     assert.equal(page.status, 200);
-    const shelves = await shelvesOf(page);
+    const shelves = await shelvesOf(page, member);
     assert.deepEqual(
       shelves.map((shelf) => shelf.id),
       custom.filter((id) => id !== "followed-titles"),
@@ -6903,9 +7774,9 @@ test("discover honors a personal shelf order; contents, errors, and other accoun
 
     // Reordering never rewrites contents: the mixed rail stays velvarr-
     // sourced and the requests rail keeps the caller's role-correct view.
-    // Member is a moderator at this point (promoted in an earlier suite),
-    // so staff visibility shows the whole request history — owner filings
-    // included — not just this account's own.
+    // Member was promoted to moderator above in this test, so staff
+    // visibility shows rows from other accounts — member2's filing above —
+    // not just this account's own.
     const byId = Object.fromEntries(shelves.map((s) => [s.id, s])) as Record<
       string,
       FixtureShelf
@@ -6913,8 +7784,8 @@ test("discover honors a personal shelf order; contents, errors, and other accoun
     assert.equal(byId["new-releases"]?.source, "tpdb");
     const staffView = byId["velvarr-requests"]?.items ?? [];
     assert.ok(
-      staffView.some((record) => record.accountId === OWNER_ID),
-      "moderator rail carries the shared request history",
+      staffView.some((record) => record.accountId === MEMBER2_ID),
+      "moderator rail carries other accounts' filings",
     );
 
     // Another account keeps its own view: member's reorder leaks nothing —
@@ -6923,7 +7794,7 @@ test("discover honors a personal shelf order; contents, errors, and other accoun
     const other = await call("GET", "/api/discover", { cookie: member2 });
     assert.equal(other.status, 200);
     assert.deepEqual(
-      (await shelvesOf(other)).map((shelf) => shelf.id),
+      (await shelvesOf(other, member2)).map((shelf) => shelf.id),
       otherShelvesBefore,
     );
     const otherPrefs = await call("GET", "/api/me/preferences", {
@@ -6948,7 +7819,7 @@ test("discover honors a personal shelf order; contents, errors, and other accoun
     try {
       const withRail = await call("GET", "/api/discover", { cookie: member });
       assert.deepEqual(
-        (await shelvesOf(withRail)).map((shelf) => shelf.id),
+        (await shelvesOf(withRail, member)).map((shelf) => shelf.id),
         custom,
       );
     } finally {
@@ -6997,7 +7868,7 @@ test("discover honors a personal shelf order; contents, errors, and other accoun
     // not hidden-tag filtered, so the active tags cannot shift it either).
     const moved = await call("GET", "/api/discover", { cookie: member });
     assert.equal(moved.status, 200);
-    const movedShelves = await shelvesOf(moved);
+    const movedShelves = await shelvesOf(moved, member);
     assert.deepEqual(
       movedShelves.map((shelf) => shelf.id),
       reorder.filter((id) => id !== "followed-titles"),
@@ -7033,12 +7904,13 @@ test("discover honors a personal shelf order; contents, errors, and other accoun
     // An errored shelf keeps its chosen placement: trending leads even with
     // its only source unconfigured, and the failure rides the shelf itself.
     const key = process.env.STASHDB_API_KEY;
+    clearDiscoverCache();
     delete process.env.STASHDB_API_KEY;
     try {
       resetMetaCache();
       const outage = await call("GET", "/api/discover", { cookie: member });
       assert.equal(outage.status, 200);
-      const outShelves = await shelvesOf(outage);
+      const outShelves = await shelvesOf(outage, member);
       assert.equal(outShelves[0]?.id, "trending");
       assert.equal(outShelves[0]?.error?.code, "provider_not_configured");
       assert.equal(outShelves[0]?.items, undefined);
@@ -7141,6 +8013,18 @@ test("browse is the unified visible-catalog surface and counts the caller's hidd
         "every picker label carries a provider-native reference",
       );
     }
+
+    // Term length: the same 200-character cap the sibling member searches
+    // apply (catalog q, library search), before any provider or AI call.
+    const longTerm = await call(
+      "GET",
+      `/api/browse/tags?q=${"a".repeat(201)}`,
+      { cookie: member },
+    );
+    assert.equal(longTerm.status, 400);
+    const longShape = await errorShape(longTerm);
+    assert.equal(longShape.code, "invalid_query");
+    assert.equal(longShape.message, "Invalid q.");
   } finally {
     const restored = await call("PATCH", "/api/me/preferences", {
       cookie: member,
@@ -7377,7 +8261,7 @@ test("hidden tags filter discover, global search, and filmography — never enti
     // vanishes entirely: every title it could carry is hidden.
     const page = await call("GET", "/api/discover", { cookie: member });
     assert.equal(page.status, 200);
-    const shelves = await shelvesOf(page);
+    const shelves = await shelvesOf(page, member);
     const byId = new Map(shelves.map((shelf) => [shelf.id, shelf]));
     for (const item of byId.get("new-releases")?.items ?? []) {
       assert.notEqual(refOf(item)?.id, TPDB_MOVIE);
@@ -7456,6 +8340,7 @@ test("hidden tags filter discover, global search, and filmography — never enti
       "the hidden-tag filter is personal, never global",
     );
   } finally {
+    clearDiscoverCache();
     const unfollowed = await call(
       "DELETE",
       `/api/follows/tpdb/${TPDB_PERFORMER}`,
@@ -7483,13 +8368,14 @@ test("hidden tag families: a whole-word label hides longer-tagged titles on ever
   assert.equal(saved.status, 200);
   try {
     resetMetaCache();
+    clearDiscoverCache();
 
     // Discover: every TPDB movie leaves the mixed rail — under exact-only
     // matching the "Fixture Tag C" row would survive — and the StashDB
     // side still renders.
     const discover = await call("GET", "/api/discover", { cookie: member });
     assert.equal(discover.status, 200);
-    const shelves = await shelvesOf(discover);
+    const shelves = await shelvesOf(discover, member);
     const releaseRefs = shelves
       .filter((shelf) => ["new-releases", "new-scenes"].includes(shelf.id))
       .flatMap((shelf) => shelf.items ?? [])
@@ -7540,7 +8426,7 @@ test("hidden tag families: a whole-word label hides longer-tagged titles on ever
     });
     assert.equal(otherDiscover.status, 200);
     const otherRefs = (
-      (await shelvesOf(otherDiscover)).find(
+      (await shelvesOf(otherDiscover, member2)).find(
         (shelf) => shelf.id === "new-releases",
       )?.items ?? []
     ).map(refOf);
@@ -7973,4 +8859,334 @@ test("audit line encodes a hostile X-Forwarded-For value", async () => {
     !line.includes("ip=10.0.0.5 account="),
     "a forwarded value must not add raw fields to the line",
   );
+});
+
+// --- per-account rate budget (charged in dispatch, admission.ts) ---
+
+beforeEach(() => {
+  resetRateBuckets();
+});
+
+test("rate budget: a same-account flood of provider reads trips 429 rate_limited", async (t) => {
+  // Fake clock: the boundary is exact because no refill can land mid-flood.
+  // The shelf read is a dispatch-lane route that reads the providers — the
+  // audited lane. Card preloads (catalog detail, availability) moved to
+  // their own lane and have their own test below.
+  t.mock.timers.enable({ apis: ["Date"] });
+  const path = "/api/discover/shelf?id=new-releases";
+  for (let i = 0; i < RATE_BURST; i++) {
+    const res = await call("GET", path, { cookie: member });
+    assert.equal(res.status, 200, `burst request ${i + 1} must pass`);
+  }
+  const flooded = await call("GET", path, { cookie: member });
+  const error = await errorShape(flooded, 429);
+  assert.equal(error.code, "rate_limited");
+  // The budget is per account: the member's drained bucket never blocks
+  // another account's provider reads.
+  const other = await call("GET", path, { cookie: owner });
+  assert.equal(other.status, 200);
+});
+
+test("rate budget: the bucket refills with elapsed time, not only on restart", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"] });
+  const path = "/api/discover/shelf?id=new-releases";
+  for (let i = 0; i <= RATE_BURST; i++) {
+    await call("GET", path, { cookie: member2 });
+  }
+  // Half a refill window grants exactly RATE_REFILL_PER_MINUTE / 2 tokens;
+  // the next request after them must find the bucket empty again.
+  t.mock.timers.tick(30_000);
+  for (let i = 0; i < RATE_REFILL_PER_MINUTE / 2; i++) {
+    const res = await call("GET", path, { cookie: member2 });
+    assert.equal(res.status, 200, `refilled request ${i + 1} must pass`);
+  }
+  const drained = await call("GET", path, { cookie: member2 });
+  await errorShape(drained, 429);
+});
+
+test("rate budget: artwork never charges the bucket; local reads still do", async (t) => {
+  // One discover page load fires a poster or avatar request per tile —
+  // dozens of artwork bytes that never touch the shared provider APIs.
+  // They must not spend the bucket, or a few F5s answer 429 rate_limited.
+  // Every other session request still charges the one shared bucket: the
+  // flood and refill tests above pin the audited boundary on provider
+  // reads, this one pins it on local reads too.
+  t.mock.timers.enable({ apis: ["Date"] });
+  for (let i = 0; i <= RATE_BURST; i += 1) {
+    const art = await call("GET", `/api/images/${ITEM_MOVIE}`, {
+      cookie: member,
+    });
+    assert.equal(art.status, 200, `artwork request ${i + 1} must pass`);
+  }
+  const first = await call("GET", "/api/me", { cookie: member });
+  assert.equal(first.status, 200);
+  for (let i = 1; i < RATE_BURST; i += 1) {
+    const res = await call("GET", "/api/me", { cookie: member });
+    assert.equal(res.status, 200, `charged request ${i + 1} must pass`);
+  }
+  const floodedLocal = await call("GET", "/api/me", { cookie: member });
+  const localError = await errorShape(floodedLocal, 429);
+  assert.equal(localError.code, "rate_limited");
+  // The bucket is per account and spans dispatch routes: the drained local
+  // read refuses the discover stubs too, at the same boundary. Card
+  // preloads and artwork live on their own lanes and stay usable (their
+  // tests pin that direction).
+  const across = await call("GET", "/api/discover", { cookie: member });
+  await errorShape(across, 429);
+});
+
+test("rate budget: the FIFO cap evicts only refilled buckets, never a drained one", (t) => {
+  // Frozen clock: no refill can land mid-flood, so every live bucket holds
+  // exactly RATE_BURST - 1 and the drained one holds 0. The map is
+  // module-global and the fixture store has three accounts, so the 256-id
+  // flood calls chargeRateBudget directly with synthetic ids.
+  t.mock.timers.enable({ apis: ["Date"] });
+  const throwsRateLimited = (error: unknown) =>
+    error instanceof AppError &&
+    error.status === 429 &&
+    error.code === "rate_limited";
+  for (let i = 0; i < RATE_BURST; i++) chargeRateBudget("victim");
+  assert.throws(() => chargeRateBudget("victim"), throwsRateLimited);
+  // Fill the map to its cap: the victim's drained bucket plus 255 live ones.
+  for (let i = 0; i < 255; i++) chargeRateBudget(`live-${i}`);
+  // The 257th account finds no refilled bucket to evict and is refused
+  // instead of stealing the victim's slot.
+  assert.throws(() => chargeRateBudget("newcomer"), throwsRateLimited);
+  // The victim's drained bucket survived the flood: it still refuses with
+  // 429 instead of coming back as a fresh RATE_BURST.
+  assert.throws(() => chargeRateBudget("victim"), throwsRateLimited);
+});
+
+test("rate budget: the cap refuses a new key while every slot holds a live preload bucket", (t) => {
+  // Frozen clock: no refill can land, so each preload bucket holds exactly
+  // PRELOAD_BURST - 100 — live on its own lane and far from evictable.
+  // The v0.39.0 scan compared refilled tokens against the dispatch burst
+  // instead of the candidate's own lane: it called a preload bucket at
+  // 500/600 tokens "full" against RATE_BURST = 60, evicted it and handed
+  // the newcomer a fresh PRELOAD_BURST — the dispatch-only fill of the
+  // test above could not see that. This pins the cross-lane comparison.
+  t.mock.timers.enable({ apis: ["Date"] });
+  for (let i = 0; i < RATE_BUCKETS_CAP; i++) {
+    for (let j = 0; j < 100; j++) {
+      chargeRateBudget(`preload-${i}`, "preload");
+    }
+  }
+  // Every slot is live on the preload lane, so the next allocation finds
+  // nothing refilled to evict and is refused instead of stealing a slot.
+  assert.throws(
+    () => chargeRateBudget("newcomer"),
+    (error: unknown) =>
+      error instanceof AppError &&
+      error.status === 429 &&
+      error.code === "rate_limited",
+  );
+  // The refusal consumed nothing: preload-0 keeps its slot and budget, so
+  // its 101st charge passes instead of coming back as a fresh burst.
+  chargeRateBudget("preload-0", "preload");
+});
+
+test("rate budget: the cap hands an idled slot to a new key instead of refusing", (t) => {
+  // Inverse of the two refusals above: a scan that never evicts would lock
+  // every new account out once RATE_BUCKETS_CAP ids have been seen. Frozen
+  // clock: 255 slots stay live at PRELOAD_BURST - 100 while preload-0
+  // idles a full refill window and refills to PRELOAD_BURST — the scan's
+  // only evictable slot.
+  t.mock.timers.enable({ apis: ["Date"] });
+  for (let i = 0; i < RATE_BUCKETS_CAP; i++) {
+    for (let j = 0; j < 100; j++) {
+      chargeRateBudget(`preload-${i}`, "preload");
+    }
+  }
+  t.mock.timers.tick(60_000);
+  // The newcomer takes the idled slot: no 429, and a working dispatch
+  // budget came with it — exactly RATE_BURST charges, then the refusal.
+  chargeRateBudget("newcomer");
+  for (let i = 0; i < RATE_BURST - 1; i++) {
+    chargeRateBudget("newcomer");
+  }
+  assert.throws(
+    () => chargeRateBudget("newcomer"),
+    (error: unknown) =>
+      error instanceof AppError &&
+      error.status === 429 &&
+      error.code === "rate_limited",
+  );
+});
+
+test("rate budget: the artwork lane is bounded on its own and never touches dispatch", (t) => {
+  // Frozen clock: no refill can land, so every boundary is exact. The
+  // artwork lane exists so a cold page's tile flood cannot drain (or be
+  // starved by) the dispatch bucket that meters the provider APIs — and it
+  // still bounds enumeration of the artwork proxy at its own burst.
+  t.mock.timers.enable({ apis: ["Date"] });
+  const throwsRateLimited = (error: unknown) =>
+    error instanceof AppError &&
+    error.status === 429 &&
+    error.code === "rate_limited";
+  for (let i = 0; i < ARTWORK_BURST; i++) {
+    chargeRateBudget("surfer", "artwork");
+  }
+  assert.throws(() => chargeRateBudget("surfer", "artwork"), throwsRateLimited);
+  // The drained artwork lane leaves the same account's dispatch budget full.
+  chargeRateBudget("surfer");
+  // And a drained dispatch bucket leaves the artwork lane untouched.
+  for (let i = 0; i < RATE_BURST; i++) chargeRateBudget("drained");
+  assert.throws(() => chargeRateBudget("drained"), throwsRateLimited);
+  chargeRateBudget("drained", "artwork");
+});
+
+test("rate budget: the preload lane refills on its own clock and never touches dispatch", (t) => {
+  // The preload lane carries every card's detail and availability call, so
+  // its refill — not just its burst — is user-visible: after one big page
+  // drains it, later pages keep working at the lane's own pace while
+  // dispatch keeps its full audited budget.
+  t.mock.timers.enable({ apis: ["Date"] });
+  const throwsRateLimited = (error: unknown) =>
+    error instanceof AppError &&
+    error.status === 429 &&
+    error.code === "rate_limited";
+  for (let i = 0; i < PRELOAD_BURST; i++) {
+    chargeRateBudget("surfer", "preload");
+  }
+  assert.throws(() => chargeRateBudget("surfer", "preload"), throwsRateLimited);
+  // Dispatch never felt the flood.
+  chargeRateBudget("surfer");
+  // Half a refill window grants exactly PRELOAD_REFILL_PER_MINUTE / 2
+  // preload tokens; the next request after them finds the lane empty again.
+  t.mock.timers.tick(30_000);
+  for (let i = 0; i < PRELOAD_REFILL_PER_MINUTE / 2; i++) {
+    chargeRateBudget("surfer", "preload");
+  }
+  assert.throws(() => chargeRateBudget("surfer", "preload"), throwsRateLimited);
+  // And a drained dispatch bucket leaves the preload lane untouched.
+  for (let i = 0; i < RATE_BURST; i++) chargeRateBudget("drained");
+  assert.throws(() => chargeRateBudget("drained"), throwsRateLimited);
+  chargeRateBudget("drained", "preload");
+});
+
+test("rate budget: card preloads charge the preload lane, never dispatch", async (t) => {
+  // Every RequestableCard fires /api/catalog/:p/:k/:id and
+  // /api/availability/:p/:k/:id for its own reference after page load, so a
+  // discover page sends hundreds of both. They must pass far past the
+  // dispatch burst with the dispatch lane intact, and still answer 429 at
+  // their own boundary so a member session cannot loop distinct ids
+  // through either route for unbounded provider reads.
+  t.mock.timers.enable({ apis: ["Date"] });
+  const detailPath = `/api/catalog/tpdb/movie/${TPDB_MOVIE}`;
+  const availPath = `/api/availability/tpdb/movie/${TPDB_MOVIE}`;
+  for (let i = 0; i < RATE_BURST + 5; i++) {
+    const detail = await call("GET", detailPath, { cookie: member });
+    assert.equal(detail.status, 200, `detail ${i + 1} must pass`);
+    const avail = await call("GET", availPath, { cookie: member });
+    assert.equal(avail.status, 200, `availability ${i + 1} must pass`);
+  }
+  const apiDuring = await call("GET", "/api/me", { cookie: member });
+  assert.equal(apiDuring.status, 200, "preloads must not drain dispatch");
+  // i counts charges: the pairs phase spent (RATE_BURST + 5) * 2, and the
+  // loop fills the lane to exactly PRELOAD_BURST before the probe.
+  for (let i = (RATE_BURST + 5) * 2; i < PRELOAD_BURST; i++) {
+    const detail = await call("GET", detailPath, { cookie: member });
+    assert.equal(detail.status, 200, `detail ${i + 1} must pass`);
+  }
+  const drained = await call("GET", detailPath, { cookie: member });
+  assert.equal((await errorShape(drained, 429)).code, "rate_limited");
+  // A drained preload lane leaves the dispatch lane working.
+  const apiAfter = await call("GET", "/api/me", { cookie: member });
+  assert.equal(apiAfter.status, 200);
+});
+
+test("rate budget: performer and studio detail stay on the dispatch lane", async (t) => {
+  // The catalog detail route also serves performer and studio detail, and
+  // no card preloads those. One performer detail can fan out to a
+  // counterpart search plus up to ten reads, so it must be bounded by the
+  // audited dispatch budget (RATE_BURST, 30/min), not by the preload
+  // lane's page-sized 600 burst / 120 per minute.
+  t.mock.timers.enable({ apis: ["Date"] });
+  // One studio call spends a dispatch token beside the performer flood:
+  // both non-media kinds charge dispatch, so together they drain the
+  // bucket to exactly RATE_BURST before the boundary probe.
+  const studio = await call("GET", `/api/catalog/tpdb/studio/${TPDB_STUDIO}`, {
+    cookie: member,
+  });
+  assert.equal(studio.status, 200, "studio detail 1 must pass");
+  for (let i = 0; i < RATE_BURST - 1; i++) {
+    const detail = await call(
+      "GET",
+      `/api/catalog/tpdb/performer/${TPDB_PERFORMER3}`,
+      { cookie: member },
+    );
+    assert.equal(detail.status, 200, `performer detail ${i + 1} must pass`);
+  }
+  const drained = await call(
+    "GET",
+    `/api/catalog/tpdb/performer/${TPDB_PERFORMER3}`,
+    { cookie: member },
+  );
+  assert.equal((await errorShape(drained, 429)).code, "rate_limited");
+  // Dispatch is empty now, so RATE_BURST + 5 media details passing here
+  // proves movie detail still charges the preload lane, not dispatch.
+  for (let i = 0; i < RATE_BURST + 5; i++) {
+    const detail = await call("GET", `/api/catalog/tpdb/movie/${TPDB_MOVIE}`, {
+      cookie: member,
+    });
+    assert.equal(detail.status, 200, `movie detail ${i + 1} must pass`);
+  }
+});
+
+test("rate budget: a cold discover and detail page load answers without 429", async (t) => {
+  // The traffic a cold browser session sends, at page scale: the shell
+  // stubs, the scrolled rails' shelf reads, then every tile's card
+  // preloads (detail + availability) and artwork bytes — then a movie
+  // detail with a rail of 32 related cards. Fixture references repeat
+  // across tiles on purpose and stay movie-only: the lanes charge per
+  // call, not per id, so repetition exercises the same arithmetic as 160
+  // distinct tiles.
+  t.mock.timers.enable({ apis: ["Date"] });
+  const tiles = [
+    `tpdb/movie/${TPDB_MOVIE}`,
+    `tpdb/movie/${TPDB_MOVIE4}`,
+    `tpdb/movie/${TPDB_MOVIE_YEAR}`,
+  ];
+  const status = async (path: string, label: string) => {
+    const res = await call("GET", path, { cookie: member });
+    assert.equal(res.status, 200, label);
+  };
+  await status("/api/discover", "shell stubs");
+  for (const id of ["new-releases", "trending", "studios", "genres"]) {
+    await status(`/api/discover/shelf?id=${id}`, `shelf ${id}`);
+  }
+  for (let i = 0; i < 128; i++) {
+    const p = tiles[i % tiles.length]!;
+    await status(`/api/catalog/${p}`, `tile ${i + 1} detail`);
+    await status(`/api/availability/${p}`, `tile ${i + 1} availability`);
+    await status(
+      `/api/catalog/image?url=${encodeURIComponent(
+        `${tpdbUrl}/page-art-${i % 6}.png`,
+      )}`,
+      `tile ${i + 1} artwork`,
+    );
+  }
+  // Open one movie: its rail payload plus 32 related cards, each with the
+  // same preload pair and artwork bytes.
+  await status(
+    `/api/catalog/tpdb/movie/${TPDB_MOVIE}/related?rank=jev`,
+    "related rail payload",
+  );
+  for (let i = 0; i < 32; i++) {
+    const p = tiles[i % tiles.length]!;
+    await status(`/api/catalog/${p}`, `related card ${i + 1} detail`);
+    await status(
+      `/api/availability/${p}`,
+      `related card ${i + 1} availability`,
+    );
+    await status(
+      `/api/catalog/image?url=${encodeURIComponent(
+        `${tpdbUrl}/page-art-${(i + 3) % 6}.png`,
+      )}`,
+      `related card ${i + 1} artwork`,
+    );
+  }
+  // No lane tripped: dispatch, preloads and artwork all finished — the
+  // page-load 429 storm the card reports stays gone.
+  await status("/api/me", "dispatch survives the whole session");
 });

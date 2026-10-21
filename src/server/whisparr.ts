@@ -437,7 +437,8 @@ function compactMovieList(dtos: MovieResourceDto[]): MovieResourceDto[] {
 
 // Keyed by Whisparr base URL. Entries hold the in-flight promise: the
 // prefetch that overlaps the Jellyfin read and the enrichment that follows
-// it share one fetch instead of two.
+// it share one fetch instead of two. A hit also needs the same API key, so
+// changed credentials never reuse another key's collection.
 const movieListCache = new Map<
   string,
   {
@@ -462,6 +463,9 @@ async function cachedMovieList(
     return hit.dtos;
   }
   const at = Date.now();
+  // Cache only the fields path correspondence reads (identityOf and
+  // matchesByPaths: itemType, path, foreignId, tmdbId, tpdbId, stashId) —
+  // not artwork or other bulky metadata.
   const dtos = requestJson<unknown>(
     whisparr.url,
     "/api/v3/movie",

@@ -18,6 +18,10 @@ import type {
   WhisparrPathMapping,
 } from "../../../../lib/contracts.ts";
 import {
+  isJudgmentProvider,
+  isOllamaModel,
+} from "../../../../lib/contracts.ts";
+import {
   countRequestsByAccount,
   getConfig,
   getAccount,
@@ -191,9 +195,7 @@ export function nextProviderCredentials(
   if (
     judgmentProvider !== undefined &&
     judgmentProvider !== "" &&
-    judgmentProvider !== "none" &&
-    judgmentProvider !== "typesafe" &&
-    judgmentProvider !== "ollama"
+    !isJudgmentProvider(judgmentProvider)
   ) {
     throw new AppError(
       400,
@@ -201,7 +203,7 @@ export function nextProviderCredentials(
       "Judgment provider must be none, typesafe, or ollama.",
     );
   }
-  if (ollamaModel && !/^[A-Za-z0-9][A-Za-z0-9._:/-]*$/.test(ollamaModel)) {
+  if (ollamaModel && !isOllamaModel(ollamaModel)) {
     throw new AppError(400, "invalid_field", "Invalid Ollama model name.");
   }
   if (
@@ -738,6 +740,7 @@ export const routes: RouteDef[] = [
     method: "GET",
     segments: ["admin", "users", ":id", "avatar"],
     auth: "admin",
+    exemptFromBudget: true,
     run: async (ctx, _request, p) => userAvatar(ctx, p.id!),
   },
   {

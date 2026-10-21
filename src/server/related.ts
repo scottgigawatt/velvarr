@@ -85,7 +85,6 @@ export async function relatedTitles(
   hiddenTags: CatalogTagSelection[],
   options: {
     rank?: "tags" | "jev";
-    typesafeApiKey?: string;
     providers?: IntegrationConfig["providers"];
   } = {},
 ): Promise<RelatedTitles> {
@@ -285,7 +284,7 @@ export async function relatedTitles(
     const reranked = await rankRelatedTitles(
       descriptor(source),
       descriptors,
-      options.providers ?? options.typesafeApiKey,
+      options.providers,
     );
     if (reranked !== null) {
       const back = new Map(descriptors.map((d, i) => [d, shortlist[i]!]));
@@ -298,9 +297,7 @@ export async function relatedTitles(
     items,
     ranking,
     canRank,
-    canRefine:
-      shortlist.length > 1 &&
-      judgmentConfigured(options.providers ?? options.typesafeApiKey),
+    canRefine: shortlist.length > 1 && judgmentConfigured(options.providers),
     errors,
   };
 }

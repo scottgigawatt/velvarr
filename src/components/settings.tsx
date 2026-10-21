@@ -474,6 +474,7 @@ function JudgmentCard() {
           model: string;
           configured: boolean;
           stored: boolean;
+          error?: string;
         };
       }>("/api/admin/integrations");
       setKeyConfigured(providers.typesafe.configured);
@@ -484,6 +485,7 @@ function JudgmentCard() {
       setModel(judgment.model);
       setConfigured(judgment.configured);
       setStored(judgment.stored);
+      if (judgment.error) setMessage(judgment.error);
       setReady(true);
     } catch (error) {
       if (error instanceof ApiError && error.status === 403) setForbidden(true);
@@ -658,7 +660,11 @@ function JudgmentCard() {
           <div className="flex flex-wrap gap-2">
             <button
               className="btn btn-accent"
-              disabled={!ready || pending || !url.trim() || !model.trim()}
+              disabled={
+                !ready ||
+                pending ||
+                (provider === "ollama" && (!url.trim() || !model.trim()))
+              }
               onClick={() => void save()}
             >
               Save settings

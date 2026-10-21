@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import type { IntegrationConfig, JudgmentProvider } from "../lib/contracts.ts";
+import { isJudgmentProvider, isOllamaModel } from "../lib/contracts.ts";
 import { AppError, validateBaseUrl } from "./http.ts";
 import { choice, noul, score, TypeSafeClient } from "@typesafe-ai/sdk";
 
@@ -15,6 +16,8 @@ const SAME_WORK_P = 0.7;
  * state fixes both performer errors of the blind prompt (0.44 FN -> 0.90,
  * 0.90 FP -> 0.12) while sequels and word-sharing distractors stay below
  * 0.2; the studio-prefix variant needs the 0.7 gate (0.73). */
+// Prompt copy is pinned by the calibration evals noted above, not by unit tests.
+// Stryker disable all
 const SAME_WORK_INSTRUCTIONS =
   "Do these two catalog records name the same work — the same movie or scene, " +
   "possibly under different punctuation, an alternate subtitle, or a transliterated spelling? " +
@@ -23,6 +26,7 @@ const SAME_WORK_INSTRUCTIONS =
   "title contains a DIFFERENT performer's name is a different work. A studio, network, or " +
   "site name prefixed before the title does not make it a different work. Answer no for " +
   "remakes, sequels, different works, or unrelated titles.";
+// Stryker restore all
 
 export type WorkIdentity = {
   title: string;
@@ -31,53 +35,94 @@ export type WorkIdentity = {
   year?: number;
 };
 
-type JudgmentOptions = IntegrationConfig["providers"] | string;
+type JudgmentOptions = IntegrationConfig["providers"];
 
-function providerOptions(options?: JudgmentOptions) {
-  return typeof options === "string" ? { typesafeApiKey: options } : options;
-}
-
-/** Effective, non-secret settings for the administrator UI and each caller. */
+/** Effective, non-secret settings for the administrator UI and each caller.
+ * Never throws: an invalid operator environment degrades to disabled
+ * judgment features plus an `error` the admin card can show, so the
+ * settings read and every PATCH response keep working. */
 export function judgmentConfiguration(options?: JudgmentOptions): {
   provider: JudgmentProvider;
+  /** Validated outbound URL — userinfo, query, and fragments stripped; ""
+   * when validation failed (see `error`). */
   url: string;
   model: string;
   configured: boolean;
   stored: boolean;
+  /** Degradation reason; absent when the effective settings are valid. */
+  error?: string;
 } {
-  const stored = providerOptions(options);
-  const provider =
+  const stored = options;
+  const providerRaw =
     (stored?.judgmentProvider ??
       process.env.VELVARR_JUDGMENT_PROVIDER?.trim()) ||
     "typesafe";
-  if (provider !== "none" && provider !== "typesafe" && provider !== "ollama") {
-    throw new AppError(
-      400,
-      "invalid_config",
-      "Judgment provider must be none, typesafe, or ollama.",
+  const provider = isJudgmentProvider(providerRaw) ? providerRaw : "typesafe";
+  const errors: string[] = [];
+  if (provider !== providerRaw) {
+    errors.push(
+      `VELVARR_JUDGMENT_PROVIDER has an invalid value ${JSON.stringify(providerRaw)}; judgment features stay disabled until it is "typesafe" or "ollama".`,
     );
   }
-  const url =
-    (stored?.ollamaUrl ?? process.env.OLLAMA_BASE_URL?.trim()) ||
-    "http://localhost:11434";
-  const model =
-    (stored?.ollamaModel ?? process.env.OLLAMA_MODEL?.trim()) || "nimble";
+  const rawUrl =
+    (stored?.ollamaUrl ?? process.env.OLLAMA_BASE_URL?.trim()) || "";
+  let url = "";
+  if (rawUrl === "") {
+    url = validateBaseUrl("http://localhost:11434");
+  } else {
+    try {
+      url = validateBaseUrl(rawUrl);
+    } catch (err) {
+      errors.push(
+        err instanceof AppError
+          ? err.message
+          : "The Ollama URL is not a valid integration base URL.",
+      );
+    }
+  }
+  const rawModel =
+    stored?.ollamaModel ?? process.env.OLLAMA_MODEL?.trim() ?? "";
+  let model = "nimble";
+  if (rawModel !== "") {
+    if (isOllamaModel(rawModel)) {
+      model = rawModel;
+    } else {
+      errors.push(
+        `The Ollama model name ${JSON.stringify(rawModel)} is invalid; falling back to ${model}.`,
+      );
+    }
+  }
+  const keyPresent = Boolean(
+    stored?.typesafeApiKey?.trim() || process.env.TYPESAFE_API_KEY?.trim(),
+  );
+  const valid = errors.length === 0;
   return {
     provider,
     url,
     model,
     configured:
-      provider === "ollama" ||
-      (provider === "typesafe" &&
-        Boolean(
-          stored?.typesafeApiKey?.trim() ||
-          process.env.TYPESAFE_API_KEY?.trim(),
-        )),
+      valid && provider !== "none" && (provider === "ollama" || keyPresent),
     stored:
       stored?.judgmentProvider !== undefined ||
       stored?.ollamaUrl !== undefined ||
       stored?.ollamaModel !== undefined,
+    ...(errors.length > 0 ? { error: errors.join(" ") } : {}),
   };
+}
+
+/** Whether tag suggestions may run for the effective judgment backend.
+ * Suggestions carry the member's search term and provider tag lists, so
+ * they need a backend an administrator saved in Settings: a stored TypeSafe
+ * key for TypeSafe, the stored Ollama choice for Ollama. Environment-only
+ * settings keep title review and related-title ranking but never send
+ * member search terms — a stored key for one backend must not open the
+ * gate for another backend the environment selected. */
+export function tagSuggestionsAllowed(options?: JudgmentOptions): boolean {
+  const settings = judgmentConfiguration(options);
+  if (!settings.configured) return false;
+  if (settings.provider === "ollama")
+    return options?.judgmentProvider === "ollama";
+  return Boolean(options?.typesafeApiKey?.trim());
 }
 
 let cached: { identity: string; client: TypeSafeClient } | null = null;
@@ -85,15 +130,12 @@ let cached: { identity: string; client: TypeSafeClient } | null = null;
 /** Both servers speak System One; provider selection never falls back to cloud. */
 function judgmentBackend(options?: JudgmentOptions) {
   const settings = judgmentConfiguration(options);
-  if (!settings.configured) return null;
+  if (!settings.configured || settings.error !== undefined) return null;
   const local = settings.provider === "ollama";
   const key = local
     ? "ollama"
-    : providerOptions(options)?.typesafeApiKey?.trim() ||
-      process.env.TYPESAFE_API_KEY!.trim();
-  const url = local
-    ? validateBaseUrl(settings.url)
-    : process.env.TYPESAFE_BASE_URL?.trim();
+    : options?.typesafeApiKey?.trim() || process.env.TYPESAFE_API_KEY!.trim();
+  const url = local ? settings.url : process.env.TYPESAFE_BASE_URL?.trim();
   const model = local
     ? settings.model
     : process.env.TYPESAFE_DEFAULT_MODEL?.trim();
@@ -131,31 +173,45 @@ function judgmentBackend(options?: JudgmentOptions) {
 
 /** Capability checks degrade to disabled when an operator supplied invalid settings. */
 export function judgmentConfigured(options?: JudgmentOptions): boolean {
-  try {
-    return judgmentBackend(options) !== null;
-  } catch {
-    return false;
-  }
+  return judgmentBackend(options) !== null;
 }
 
 /** Probe the configured model with one bounded decision, without catalog data. */
 export async function checkJudgmentConnection(options?: JudgmentOptions) {
   const settings = judgmentConfiguration(options);
+  if (settings.error !== undefined)
+    return {
+      provider: settings.provider,
+      connected: false,
+      error: settings.error,
+    };
   if (!settings.configured)
     return {
       provider: settings.provider,
       connected: false,
-      error:
-        settings.provider === "none"
-          ? "AI-assisted matching is disabled."
-          : "No TypeSafe API key is configured.",
+      error: "No TypeSafe API key is configured.",
     };
   try {
     const backend = judgmentBackend(options)!;
-    await backend.client.systemOne({
+    const res = await backend.client.systemOne({
       state: "The service is running.",
       questions: { ready: noul("Does the state say the service is running?") },
     });
+    const answer: unknown = res.answers.ready;
+    const ready =
+      answer !== null && typeof answer === "object" && "noul" in answer
+        ? answer.noul
+        : undefined;
+    if (typeof ready !== "number" || !Number.isFinite(ready)) {
+      return {
+        provider: settings.provider,
+        connected: false,
+        error:
+          settings.provider === "ollama"
+            ? "Ollama did not return a well-formed decision. Check its URL, model, and support for /v1/systemone (Ollama 0.35 or later)."
+            : "TypeSafe did not return a well-formed decision. Check its API key and connection.",
+      };
+    }
     return { provider: settings.provider, connected: true };
   } catch {
     return {
@@ -217,10 +273,16 @@ export async function sameWork(
       {
         state: { requested: a, candidate: b },
         questions: {
-          sameWork: noul(SAME_WORK_INSTRUCTIONS, {
-            true: "Both records name the same work.",
-            false: "These are different works.",
-          }),
+          sameWork: noul(
+            SAME_WORK_INSTRUCTIONS,
+            // Stryker disable all -- the answer labels never reach the wire
+            // payload (a noul question serializes type and instructions only).
+            {
+              true: "Both records name the same work.",
+              false: "These are different works.",
+            },
+            // Stryker restore all
+          ),
         },
       },
       // One attempt: local inference retains its 30 s allowance; cloud

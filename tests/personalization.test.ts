@@ -2,6 +2,8 @@ import { DISCOVER_SCAN_BUDGET } from "../src/server/catalog-budget.ts";
 import { browseTitles, parseBrowseQuery } from "../src/server/browse.ts";
 import {
   discover,
+  SHELF_ITEMS,
+  MORE_PREVIEWS,
   facetShelves,
 } from "../src/app/api/[...path]/routes/discover.ts";
 import { judgmentConfiguration, sameWork } from "../src/server/judgment.ts";
@@ -124,6 +126,33 @@ test("personal settings defaults and every invalid presentation boundary are exp
   ])
     assert.throws(() => parsePersonalSettings(patch));
 });
+test("the existing fork schema-13 upgrade preserves TMDB requests, settings, and sessions", () => {
+  const ctx = fresh();
+  const preferences = storage.saveContentPreferences(owner.id, {
+    includeTags: [{ name: "Preferred", tmdb: "77" }],
+    appearance: { mode: "light", preset: "ocean", accent: "#5b9eff" },
+  });
+  const request = storage.createRequest(owner.id, {
+    provider: "tmdb",
+    kind: "movie",
+    id: "42",
+  });
+  storage.closeStorage();
+  const db = new DatabaseSync(
+    join(process.env.VELVARR_DATA_DIR!, "velvarr.sqlite"),
+  );
+  db.exec("DROP TABLE discover_cache; PRAGMA user_version=13;");
+  db.close();
+  storage.initializeStorage();
+  assert.deepEqual(storage.getContentPreferences(owner.id), preferences);
+  assert.equal(
+    storage.getRequest(request.id, ctx.account).media.provider,
+    "tmdb",
+  );
+  assert.equal(storage.getSession(ctx.rawSessionToken)?.account.id, owner.id);
+  storage.putDiscoverCache("merge-upgrade", "[]", Date.now());
+  assert.equal(storage.getDiscoverCache("merge-upgrade")?.payload, "[]");
+});
 test("a real schema-12 upgrade preserves history and personal settings stay isolated and atomic", () => {
   const ctx = fresh();
   storage.importAccounts([
@@ -149,7 +178,7 @@ test("a real schema-12 upgrade preserves history and personal settings stay isol
     join(process.env.VELVARR_DATA_DIR!, "velvarr.sqlite"),
   );
   db.exec(
-    "ALTER TABLE accounts DROP COLUMN personal_settings; PRAGMA user_version=12;",
+    "ALTER TABLE accounts DROP COLUMN personal_settings; DROP TABLE discover_cache; PRAGMA user_version=12;",
   );
   db.close();
   storage.initializeStorage();
@@ -642,7 +671,10 @@ test("Discover applies its small budget to every provider row and retains honest
       const url = new URL(req.url ?? "/", "http://fixture");
       if (url.pathname === "/movies") {
         counts.tpdb++;
-        assert.equal(url.searchParams.get("per_page"), "12");
+        assert.equal(
+          url.searchParams.get("per_page"),
+          String(SHELF_ITEMS + MORE_PREVIEWS),
+        );
         return sendJson(res, 200, {
           data: [
             {

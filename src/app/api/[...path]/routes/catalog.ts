@@ -1,7 +1,7 @@
 import { scopeBrowseTags } from "../../../../lib/browse-url.ts";
 import { searchTmdbFacets } from "../../../../server/tmdb.ts";
 import { tmdbGet } from "../../../../server/providers.ts";
-import { shelfError } from "./discover.ts";
+import { shelfError } from "../../../../server/http.ts";
 import { parseTagSelections } from "../../../../server/storage.ts";
 import {
   queryInt,
@@ -32,7 +32,12 @@ import {
   listRequests,
   upsertCatalogRecord,
 } from "../../../../server/storage.ts";
-import { type AuthContext, type RouteDef, json } from "../admission.ts";
+import {
+  chargeRateBudget,
+  type AuthContext,
+  type RouteDef,
+  json,
+} from "../admission.ts";
 import { AppError } from "../../../../server/http.ts";
 import { imageResponse } from "./library.ts";
 import {
@@ -761,7 +766,10 @@ export async function catalogDetail(
 // revalidation or another device skips the upstream fetch. No Velvarr or
 // provider credentials ever reach the image host (fetchProviderArtwork sends
 // none).
-export async function catalogImage(request: Request): Promise<Response> {
+export async function catalogImage(
+  ctx: AuthContext,
+  request: Request,
+): Promise<Response> {
   const target = new URL(request.url).searchParams.get("url");
   if (target === null || target === "") {
     throw new AppError(400, "invalid_query", "url is required.");
@@ -774,7 +782,15 @@ export async function catalogImage(request: Request): Promise<Response> {
       `Rejected artwork URL: ${check.reason}.`,
     );
   }
-  const { bytes, contentType } = await fetchProviderArtwork(target);
+  const { bytes, contentType } = await fetchProviderArtwork(target, {
+    // exemptFromBudget only skips the dispatch charge, so a page of cached
+    // tiles stays free; every upstream cache miss charges the account's
+    // artwork lane here, keeping provider fetches bounded without letting a
+    // cold page's tile flood drain the dispatch budget that meters the
+    // rate-limited provider APIs (v0.39.0 shared one bucket and a cold
+    // discover or detail page 429'd itself mid-load).
+    onMiss: () => chargeRateBudget(ctx.account.id, "artwork"),
+  });
   const response = imageResponse({ bytes, contentType }, request, 604800);
   if (response.status === 304) return response;
   // Provider logos include SVG, which is active content. Nothing here is
@@ -820,10 +836,18 @@ export const routes: RouteDef[] = [
     run: async (ctx, request) => catalogSearch(request, ctx),
   },
   {
+    // Artwork proxy: a page load fires one request per tile and the bytes
+    // are cached in server memory for a day and revalidated client-side, so
+    // the dispatch charge is skipped — charging every tile locked a member
+    // out after a few F5s. The exemption covers the cached-tile flood only:
+    // the handler charges the account's artwork lane on an upstream cache
+    // miss (fetchProviderArtwork's onMiss), so the route still cannot drive
+    // unbounded provider fetches (v0.39.0 shipped it fully exempt).
     method: "GET",
     segments: ["catalog", "image"],
     auth: "session",
-    run: async (_ctx, request) => catalogImage(request),
+    exemptFromBudget: true,
+    run: async (ctx, request) => catalogImage(ctx, request),
   },
   {
     method: "GET",
@@ -840,9 +864,19 @@ export const routes: RouteDef[] = [
       performerTagsRoute(ctx, p.provider!, p.kind!, p.id!),
   },
   {
+    // Card preload: every RequestableCard (one per rail tile, per related
+    // item, per browse card) fires this route and /api/availability for its
+    // own reference after page load, so a cold discover or detail page
+    // sends hundreds. They charge the preload lane instead of dispatch —
+    // the meta cache bounds the upstream cost, the lane bounds the rate.
+    // Media kinds only: this pattern also serves performer and studio
+    // detail (no card preloads those, and a performer detail fans out to a
+    // counterpart search plus up to ten reads), and route.ts keeps those
+    // on the audited dispatch lane.
     method: "GET",
     segments: ["catalog", ":provider", ":kind", ":id"],
     auth: "session",
+    lane: "preload",
     run: async (ctx, _request, p) =>
       catalogDetail(ctx, p.provider!, p.kind!, p.id!),
   },

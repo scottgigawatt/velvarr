@@ -70,6 +70,23 @@ export function mergeTagCounts(
   );
 }
 
+/** The loaded row proving a typed term is a real tag on BOTH providers: one
+ * merged row (searchBrowseTags groups by normalized label) carrying both
+ * provider UUIDs. The tag picker commits it instead of the label-only free
+ * text, so the selection travels as exact native ids. */
+export function exactBothProviderTag(
+  rows: CatalogTagSelection[],
+  term: string,
+): CatalogTagSelection | undefined {
+  const label = normalizeFacetName(term);
+  return rows.find(
+    (r) =>
+      r.tpdb !== undefined &&
+      r.stashdb !== undefined &&
+      normalizeFacetName(r.name) === label,
+  );
+}
+
 /** Where a performer-page tag chip's browse jump must land. With a linked
  * performer on the other provider, the jump is a union: both of her ids
  * ride (primary `id` plus `counterpart`) and browse lands on All — her TPDB
@@ -443,6 +460,17 @@ export interface FacetItem {
   linked?: { provider: CatalogProvider; id: string };
 }
 
+/** One See More card preview: the next entry past the rail's items, NOT
+ * loaded as a card. Catalog/library/facet sources carry name and art
+ * directly; request sources carry only the reference, which the client
+ * resolves through its catalog summary cache. Absent fields stay absent —
+ * never faked. */
+export type ShelfMorePreview = {
+  name?: string;
+  imageUrl?: string;
+  media?: MediaReference;
+};
+
 /** One Discover rail: one wire shape for the discover response, the discover
  * view and every shelf builder. An errored shelf carries `error` and NO
  * `items` key. */
@@ -457,6 +485,9 @@ export interface Shelf {
   items?: CatalogDetail[] | LibraryItem[] | RequestListItem[] | FacetItem[];
   /** Per-source partial-failure evidence; items may coexist with it. */
   errors?: SourceError[];
+  /** Pics of the next entries past `items` (≤4) for the rail's See More
+   * card. Absent when the source had nothing past the rail. */
+  more?: ShelfMorePreview[];
   error?: ShelfError;
 }
 
@@ -483,6 +514,7 @@ export type AcquisitionState =
   | "downloading"
   | "imported"
   | "failed"
+  | "failed_permanent"
   | "blocked";
 
 /** Shared durable work for one resolved identity on one logical Whisparr
@@ -535,7 +567,8 @@ export type AcquisitionProgress = {
   timeleft: string | null;
 };
 
-export type AttemptOutcome = "accepted" | "failed" | "uncertain";
+export type AttemptOutcome =
+  "accepted" | "failed" | "failed_permanent" | "uncertain";
 
 /** Result of one external acquisition check: a real observed state, a proven
  * absence from a successful check (authoritative — recorded item facts are
@@ -604,6 +637,21 @@ export function isCatalogId(provider: CatalogProvider, id: string): boolean {
 }
 
 export type JudgmentProvider = "none" | "typesafe" | "ollama";
+/** One shared guard for the provider value in storage, the admin PATCH, and
+ * the effective configuration (AGENTS.md §5: fix the shared root). */
+export function isJudgmentProvider(value: unknown): value is JudgmentProvider {
+  return value === "none" || value === "typesafe" || value === "ollama";
+}
+
+/** Ollama model names reach request URLs only; the allowlist keeps storage
+ * and the admin PATCH honest about what the backend will accept. */
+export function isOllamaModel(value: unknown): boolean {
+  return (
+    typeof value === "string" &&
+    value.length <= 128 &&
+    /^[A-Za-z0-9][A-Za-z0-9._:/-]*$/.test(value)
+  );
+}
 
 export type IntegrationConfig = {
   /** Administrator policy; absent values retain the environment fallback. */

@@ -11,6 +11,7 @@
 
 import { useEffect, useRef, useState, type KeyboardEvent } from "react";
 import {
+  exactBothProviderTag,
   normalizeFacetName,
   tagSelectionKey,
   type BrowseTagsResponse,
@@ -84,7 +85,9 @@ export function TagPicker({
    * native id cap, through the local substring re-check otherwise —
    * while excludes and hidden tags always match locally: the chip
    * carries no provider id, so it can never travel as an exact native
-   * tag. */
+   * tag. When the settled search shows the term is a real tag both
+   * providers publish, committing it selects that tag instead.
+   */
   allowFreeText?: boolean;
   provider?: "tmdb" | "tpdb" | "stashdb";
 }) {
@@ -97,15 +100,19 @@ export function TagPicker({
   const t = term.trim();
   // The debounce commits the term; the route only ever sees settled input.
   const [committed, setCommitted] = useState<string | null>(null);
+  // A just-committed free-text chip awaiting proof that the term is a real
+  // both-provider tag (VELV-46): the term exactly as committed.
+  const awaitingFree = useRef<string | null>(null);
   useEffect(() => {
     if (t.length < 2) {
-      setCommitted(null); // the route 400s under two characters
+      // While a promotion is awaited the query must stay alive: the
+      // answer reaches the hook only while `committed` holds the term.
+      if (awaitingFree.current === null) setCommitted(null);
       return;
     }
     const timer = setTimeout(() => setCommitted(t), 400);
     return () => clearTimeout(timer);
   }, [t]);
-  useEffect(() => setActive(0), [committed]);
 
   const capped = selected.length >= TAG_CAP;
   // useApiGet owns the stale-response guard: only the latest query's
@@ -116,6 +123,27 @@ export function TagPicker({
       : `/api/browse/tags?q=${encodeURIComponent(committed)}${effectiveProvider ? "&provider=" + effectiveProvider : ""}`,
     [committed, effectiveProvider],
   );
+
+  // The awaited answer landed: when it carries a tag both providers
+  // publish under the term's normalized name, the just-added free-text
+  // chip becomes that real tag; otherwise it stays free text. The query
+  // is released either way (the debounce skip above ends with this).
+  useEffect(() => {
+    const term = awaitingFree.current;
+    if (term === null || loading) return;
+    awaitingFree.current = null;
+    const both =
+      error === null && data !== null
+        ? exactBothProviderTag(data.tags, term)
+        : undefined;
+    if (both === undefined) return;
+    const label = normalizeFacetName(term);
+    onChange(
+      selected.map((s) =>
+        isFreeText(s) && normalizeFacetName(s.name) === label ? both : s,
+      ),
+    );
+  }, [data, error, loading]);
 
   const picked = new Set(selected.map(tagSelectionKey));
   const take = (rows: CatalogTagSelection[] | undefined) =>
@@ -140,19 +168,31 @@ export function TagPicker({
     !picked.has(tagSelectionKey({ name: t }))
       ? { name: t }
       : null;
-  // Exact real-tag matches go above the pinned free-text row: the default
-  // active row is index 0, so Enter must land on the actual tag when the
-  // typed term carries a real tag's name. The free-text offer itself stays
-  // in the list (efd5cfb) — only its lead position is conditional.
+  // The free-text offer leads at all times, results loaded or not: the user
+  // reads the list top-down and must find the option first even once real
+  // matches arrive (efd5cfb's pin; 5c5d7d2 briefly let exact matches take
+  // the top, which reads as the option disappearing on arrival). Exact
+  // real-tag matches follow the offer: the route answers in provider order,
+  // so they must be lifted past the other rows for the active row below to
+  // name one.
   const nTerm = normalizeFacetName(t);
   const choices =
     freeText === null
       ? options
       : [
-          ...options.filter((o) => normalizeFacetName(o.name) === nTerm),
           freeText,
+          ...options.filter((o) => normalizeFacetName(o.name) === nTerm),
           ...options.filter((o) => normalizeFacetName(o.name) !== nTerm),
         ];
+  // Enter still lands on a real tag that exactly names the term (5c5d7d2's
+  // point): the default active row starts on that match — the row right
+  // after the pinned offer — and on the offer itself otherwise. While the
+  // search is in flight the list holds only the offer, so the row falls
+  // back to it.
+  const exactLead =
+    freeText !== null &&
+    options.some((o) => normalizeFacetName(o.name) === nTerm);
+  useEffect(() => setActive(exactLead ? 1 : 0), [committed, exactLead]);
   // Typing shrinks the list until the debounced search settles; a stored
   // index must never point past the rendered options.
   const activeIdx =
@@ -162,7 +202,21 @@ export function TagPicker({
 
   function pick(tag: CatalogTagSelection) {
     if (disabled || capped || picked.has(tagSelectionKey(tag))) return;
-    onChange([...selected, tag]);
+    // A free-text commit that names a tag both providers publish is that
+    // real tag instead (VELV-46): exact native ids on both sides beat a
+    // label-only selection. When the rows are not settled yet, the chip
+    // goes in as free text and the search fires now; the settled answer
+    // promotes it in the effect above. ponytail: only the latest
+    // free-text pick is promoted — rapid consecutive free-text picks
+    // keep the earlier chips free text.
+    const swap = isFreeText(tag)
+      ? exactBothProviderTag(options, tag.name)
+      : undefined;
+    if (isFreeText(tag) && swap === undefined) {
+      awaitingFree.current = tag.name;
+      setCommitted(t);
+    }
+    onChange([...selected, swap ?? tag]);
     setTerm("");
     setOpen(false);
     inputRef.current?.focus();

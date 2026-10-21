@@ -24,6 +24,7 @@ import {
   identityLinkKey,
 } from "../src/server/identity-links.ts";
 import {
+  expandCatalogTagTerm,
   fetchProviderArtwork,
   getCatalogDetail,
   getProviderStatus,
@@ -36,6 +37,7 @@ import {
   searchCatalogTags,
   studioCounterpart,
   tagCounterpart,
+  warmCatalogTagListing,
 } from "../src/server/providers.ts";
 import type {
   CatalogSearchQuery,
@@ -634,6 +636,113 @@ test("tpdb pagination continuation follows pages until the provider stops offeri
     assert.equal(page2.hasMore, false); // no next link on the last page
     assert.equal(page2.items[0]?.reference.id, MOVIE_ID);
     assert.equal(queryParams(fixture, 1).get("page"), "2");
+  } finally {
+    await fixture.close();
+    restore();
+  }
+});
+
+test("tpdb paging continues when a whole page fails the row mapper", async () => {
+  const restore = setEnv({ TPDB_API_TOKEN: TPDB_TOKEN });
+  const fixture = await startFixture((req, res) => {
+    const params = queryOf(req.url ?? "");
+    const page = Number(params.get("page") ?? "1");
+    sendJson(res, 200, {
+      data:
+        page === 1
+          ? [{ id: "not-a-uuid", title: "Unmappable row" }]
+          : [
+              {
+                id: MOVIE_ID,
+                title: "Movie on page 2",
+                posters: {},
+                background: {},
+                performers: [],
+                tags: [],
+                scenes: [],
+                movies: [],
+              },
+            ],
+      links: {
+        next: page === 1 ? `${fixture.origin}/movies?page=2&per_page=1` : null,
+      },
+      meta: { current_page: page, per_page: 1, total: 2, last_page: 2 },
+    });
+  });
+  try {
+    process.env.TPDB_BASE_URL = fixture.origin;
+    const page1 = await searchCatalog({
+      provider: "tpdb",
+      kind: "movie",
+      perPage: 1,
+    });
+    assert.equal(page1.items.length, 0);
+    // Raw rows + a provider next link: an empty mapped list must not end
+    // browse, later pages can hold valid rows.
+    assert.equal(page1.hasMore, true);
+
+    const page2 = await searchCatalog({
+      provider: "tpdb",
+      kind: "movie",
+      page: 2,
+      perPage: 1,
+    });
+    assert.equal(page2.items.length, 1);
+    assert.equal(page2.items[0]?.reference.id, MOVIE_ID);
+  } finally {
+    await fixture.close();
+    restore();
+  }
+});
+
+test("stashdb paging continues when a whole page fails the row mapper", async () => {
+  const restore = setEnv({ STASHDB_API_KEY: STASH_TOKEN });
+  let calls = 0;
+  const fixture = await startFixture((_req, res) => {
+    calls += 1;
+    sendJson(res, 200, {
+      data: {
+        queryScenes:
+          calls === 1
+            ? {
+                count: 2,
+                scenes: [{ id: "not-a-uuid", title: "Unmappable row" }],
+              }
+            : {
+                count: 2,
+                scenes: [
+                  {
+                    id: STASH_SCENE_ID,
+                    title: "Scene on page 2",
+                    tags: [],
+                    performers: [],
+                    urls: [],
+                  },
+                ],
+              },
+      },
+    });
+  });
+  try {
+    process.env.STASHDB_BASE_URL = fixture.origin;
+    const page1 = await searchCatalog({
+      provider: "stashdb",
+      kind: "scene",
+      perPage: 1,
+    });
+    assert.equal(page1.items.length, 0);
+    // The count is real and attests a second page: an unmappable page must
+    // not end browse.
+    assert.equal(page1.hasMore, true);
+
+    const page2 = await searchCatalog({
+      provider: "stashdb",
+      kind: "scene",
+      page: 2,
+      perPage: 1,
+    });
+    assert.equal(page2.items.length, 1);
+    assert.equal(page2.items[0]?.reference.id, STASH_SCENE_ID);
   } finally {
     await fixture.close();
     restore();
@@ -1273,6 +1382,26 @@ test("artwork URL gate: https + provider hosts only, derived from live records",
     false,
   );
   assert.equal(isProviderImageUrl("not a url").ok, false);
+  // stashdb.org is also the StashDB API host and /images/ its only artwork
+  // path; a query string would multiply cache keys past the fetch (VELV-23).
+  assert.deepEqual(isProviderImageUrl("https://stashdb.org/graphql"), {
+    ok: false,
+    reason: "stashdb.org artwork must be under /images/",
+  });
+  assert.equal(
+    isProviderImageUrl("https://stashdb.org/not-images/x.jpg").ok,
+    false,
+  );
+  assert.deepEqual(isProviderImageUrl("https://cdn.theporndb.net/x.jpg?n=1"), {
+    ok: false,
+    reason: "artwork URLs must not carry a query string",
+  });
+  assert.equal(
+    isProviderImageUrl(
+      "https://stashdb.org/images/d695a097-3cf5-41c6-bf00-be5c7bc185b8?n=2",
+    ).ok,
+    false,
+  );
   // A DNS name beginning "127." is an attacker-controlled hostname, not the
   // loopback literal (architecture review v0.34.0). isLoopbackHost matches
   // only literal 127.0.0.0/8 IPv4, "localhost" and "::1" — otherwise the
@@ -2025,21 +2154,21 @@ test("tagCounterpart pairs only exact normalized names and rejects on upstream f
   const restore = setEnv({ STASHDB_API_KEY: STASH_TOKEN });
   let fail = false;
   const stashFixture = await startFixture((_req, res, body) => {
-    const parsed = JSON.parse(body) as {
-      query: string;
-      variables?: { t?: string };
-    };
-    assert.ok(parsed.query.includes("searchTag"));
+    const parsed = JSON.parse(body) as { query?: string };
+    assert.ok(parsed.query?.includes("queryTags"));
     if (fail) return sendJson(res, 500, {});
-    // The term search answers near-misses too; pairing filters to exact
+    // The complete listing answers every read; pairing filters to exact
     // normalized equality, so "All Sex" matches "all-sex" while "Anal"
     // matches neither "Anal Creampie" nor anything else here.
     sendJson(res, 200, {
       data: {
-        searchTag: [
-          { id: STASH_TAG_ID, name: "Anal Creampie" },
-          { id: STASH_CROSS_ID, name: "all-sex" },
-        ],
+        queryTags: {
+          count: 2,
+          tags: [
+            { id: STASH_TAG_ID, name: "Anal Creampie" },
+            { id: STASH_CROSS_ID, name: "all-sex" },
+          ],
+        },
       },
     });
   });
@@ -2059,6 +2188,9 @@ test("tagCounterpart pairs only exact normalized names and rejects on upstream f
     assert.equal(await tagCounterpart("tpdb", "Anal"), undefined);
 
     fail = true;
+    // Cold cache: the memo would otherwise answer the next read and the
+    // scripted outage would never be reached.
+    resetMetaCache();
     // Deliberate contract flip (fix(browse)): a failed lookup now throws so
     // callers record the outage instead of reading it as absence; absence
     // stays "a successful search with no exact normalized match".
@@ -2075,21 +2207,21 @@ test("tagCounterpart pairs only exact normalized names and rejects on upstream f
   const restore2 = setEnv({ TPDB_API_TOKEN: TPDB_TOKEN });
   const tpdbFixture = await startFixture((req, res) => {
     const params = queryOf(req.url ?? "");
-    assert.equal(params.get("per_page"), "50");
-    // The search honours its term: "all-sex" holds a uuid-less row beside
-    // the UUID row (the UUID stays the preferred native counterpart);
-    // "legacy" holds a uuid-less row only — deliberate contract flip
-    // (fix(browse)): the label exists, so the reference reports
-    // native:false with no id; undefined would claim an absence the
-    // provider never showed.
-    const rows =
-      params.get("q") === "all-sex"
-        ? [
-            { id: 305, name: "All Sex" },
-            { id: 70, uuid: TPDB_TAG_A, name: "All Sex" },
-          ]
-        : [{ id: 305, name: "Legacy" }];
-    sendJson(res, 200, { data: rows });
+    assert.equal(params.get("page"), "1");
+    // The term-less listing holds every row: "all-sex" carries a uuid-less
+    // row beside the UUID row (the UUID stays the preferred native
+    // counterpart); "legacy" holds a uuid-less row only — deliberate
+    // contract flip (fix(browse)): the label exists, so the reference
+    // reports native:false with no id; undefined would claim an absence
+    // the provider never showed.
+    sendJson(res, 200, {
+      data: [
+        { id: 70, uuid: TPDB_TAG_A, name: "All Sex" },
+        { id: 306, name: "All Sex" },
+        { id: 305, name: "Legacy" },
+      ],
+      links: { next: null },
+    });
   });
   try {
     process.env.TPDB_BASE_URL = tpdbFixture.origin;
@@ -2105,6 +2237,67 @@ test("tagCounterpart pairs only exact normalized names and rejects on upstream f
   } finally {
     await tpdbFixture.close();
     restore2();
+  }
+});
+
+test("tagCounterpart falls back to the native search when the listing walk was capped", async () => {
+  // A capped or contradicted walk reports complete:false: its rows cannot
+  // prove absence, because the label may sit below the walk cap. The
+  // provider's native exact-term search does not depend on the walk, so it
+  // must decide pairing in that case (regression: d0c1a42 read the capped
+  // listing as an honest absence and dropped the whole browse side).
+  const restore = setEnv({ TPDB_API_TOKEN: TPDB_TOKEN });
+  const seenQs: string[] = [];
+  const tpdbFixture = await startFixture((req, res) => {
+    const params = queryOf(req.url ?? "");
+    const q = params.get("q");
+    if (q !== null) {
+      // The native relevance search reaches below the walk cap: the exact
+      // label lives only here, never in the listing's rows.
+      seenQs.push(q);
+      sendJson(res, 200, {
+        data:
+          q === "Deep Anal"
+            ? [{ id: 71, uuid: TPDB_TAG_A, name: "Deep Anal" }]
+            : [],
+        links: { next: null },
+      });
+      return;
+    }
+    // Term-less listing: page 1 holds only an unrelated row and keeps a
+    // next link; the next page is rows-less beside a next link — the walk's
+    // own end signal contradicts the empty page, so complete comes back
+    // false (catalogTagListing's rows-less-page rule).
+    if (params.get("page") === "1") {
+      sendJson(res, 200, {
+        data: [{ id: 80, uuid: STASH_TAG_ID, name: "Unrelated" }],
+        links: { next: "https://tpdb.example/tags?page=2" },
+      });
+      return;
+    }
+    sendJson(res, 200, {
+      data: [],
+      links: { next: "https://tpdb.example/tags?page=3" },
+    });
+  });
+  try {
+    process.env.TPDB_BASE_URL = tpdbFixture.origin;
+    // The capped listing lacks the label; the native search still pairs it.
+    assert.deepEqual(await tagCounterpart("stashdb", "Deep Anal"), {
+      provider: "tpdb",
+      id: TPDB_TAG_A,
+      native: true,
+    });
+    // The fallback is the native search, not a re-read of the capped rows:
+    // exactly one q read, with the caller's term.
+    assert.deepEqual(seenQs, ["Deep Anal"]);
+    // Absence after the fallback is honest: the native search ran and came
+    // back without the label.
+    assert.equal(await tagCounterpart("stashdb", "Missing Label"), undefined);
+    assert.deepEqual(seenQs, ["Deep Anal", "Missing Label"]);
+  } finally {
+    await tpdbFixture.close();
+    restore();
   }
 });
 
@@ -2418,25 +2611,53 @@ test("stashdb studio search and findStudio map studios; absence stays authoritat
 
 // --- tag lookup: provider-native ids only ---
 
-test("tag lookup returns provider-native ids without cross-provider mapping", async () => {
+test("tag lookup serves the cached listing, keeps provider-native ids, and falls back to the native search for empty folds", async () => {
   const restore = setEnv({ TPDB_API_TOKEN: TPDB_TOKEN });
+  let nativeReads = 0;
   const tpdbFixture = await startFixture((req, res) => {
     const params = queryOf(req.url ?? "");
-    assert.equal(params.get("q"), "anal");
-    assert.equal(params.get("per_page"), "50");
+    // Only a term whose fold is empty (no Latin letters or digits) still
+    // reaches the native search; every other term reads the term-less
+    // listing the picker's search is served from.
+    if (params.has("q")) {
+      nativeReads += 1;
+      assert.equal(params.get("q"), "日本");
+      sendJson(res, 200, {
+        data: [{ id: 73, uuid: TPDB_TAG_B, name: "日本語タグ" }],
+      });
+      return;
+    }
+    assert.equal(params.get("per_page"), "100");
     sendJson(res, 200, {
-      data: [{ id: 70, uuid: TPDB_TAG_A, name: "Anal" }],
+      data: [
+        { id: 70, uuid: TPDB_TAG_A, name: "Anal" },
+        {
+          id: 74,
+          uuid: "0a4b7c1e-5f2d-4e8a-9b3c-6d1e2f4a5b6c",
+          name: "Unanalyzed",
+        },
+      ],
+      links: { next: null },
     });
   });
   let tpdbTags: { id: string; name: string }[];
   try {
     process.env.TPDB_BASE_URL = tpdbFixture.origin;
+    // Warm the listing first: the folded-substring answer is served from
+    // it, while a cold memo goes straight to the native search.
+    await warmCatalogTagListing("tpdb");
     tpdbTags = await searchCatalogTags("tpdb", "anal");
-    assert.deepEqual(tpdbTags, [{ id: TPDB_TAG_A, name: "Anal" }]);
+    assert.deepEqual(tpdbTags, [
+      { id: TPDB_TAG_A, name: "Anal" },
+      { id: "0a4b7c1e-5f2d-4e8a-9b3c-6d1e2f4a5b6c", name: "Unanalyzed" },
+    ]);
     await assert.rejects(searchCatalogTags("tpdb", "   "), (err: unknown) => {
       assertProviderError(err, 400, "invalid_search");
       return true;
     });
+    const jp = await searchCatalogTags("tpdb", "日本");
+    assert.deepEqual(jp, [{ id: TPDB_TAG_B, name: "日本語タグ" }]);
+    assert.equal(nativeReads, 1);
   } finally {
     await tpdbFixture.close();
     restore();
@@ -2444,19 +2665,26 @@ test("tag lookup returns provider-native ids without cross-provider mapping", as
 
   const restore2 = setEnv({ STASHDB_API_KEY: STASH_TOKEN });
   const stashFixture = await startFixture((_req, res, body) => {
-    const parsed = JSON.parse(body) as { variables: { t?: string } };
-    assert.equal(parsed.variables?.t, "anal");
+    const parsed = JSON.parse(body) as { query?: string };
+    assert.ok(parsed.query?.includes("queryTags"));
     sendJson(res, 200, {
       data: {
-        searchTag: [
-          { id: STASH_TAG_ID, name: "Anal Creampie" },
-          { id: "not-a-uuid", name: "Broken" }, // non-UUID dropped
-        ],
+        queryTags: {
+          count: 2,
+          tags: [
+            { id: STASH_TAG_ID, name: "Anal Creampie" },
+            { id: "not-a-uuid", name: "Broken" }, // non-UUID dropped
+          ],
+        },
       },
     });
   });
   try {
     process.env.STASHDB_BASE_URL = stashFixture.origin;
+    // The fixture answers only the queryTags listing; warm it so the
+    // search below is served from the memo, never from a native read the
+    // fixture would refuse.
+    await warmCatalogTagListing("stashdb");
     const stashTags = await searchCatalogTags("stashdb", "anal");
     assert.deepEqual(stashTags, [{ id: STASH_TAG_ID, name: "Anal Creampie" }]);
     // provider-native ids are kept verbatim, never mapped across providers
@@ -2464,6 +2692,201 @@ test("tag lookup returns provider-native ids without cross-provider mapping", as
   } finally {
     await stashFixture.close();
     restore2();
+  }
+});
+
+// The listing is provider-ordered (StashDB name ascending), so a common
+// term can fill the whole cap with substring hits ("Anal Sex", "Group Sex")
+// before the exact name ("Sex") ever appears. Ranking must run before the
+// cap: exact folded match, then prefix, then the remaining substrings.
+test("tag lookup ranks the exact name first even when substring hits fill the cap", async () => {
+  const restore = setEnv({ STASHDB_API_KEY: STASH_TOKEN });
+  const SEX_ID = "c0c00000-0000-4000-8000-000000000001";
+  const WORK_ID = "c0c00000-0000-4000-8000-000000000002";
+  const tags = [
+    ...Array.from({ length: 60 }, (_, i) => ({
+      id: `c0c00000-0000-4000-8000-${String(i + 10).padStart(12, "0")}`,
+      name: `Row ${String(i).padStart(2, "0")} sex`,
+    })),
+    { id: SEX_ID, name: "Sex" },
+    { id: WORK_ID, name: "Sex Work" },
+  ];
+  const fixture = await startFixture((_req, res, body) => {
+    const parsed = JSON.parse(body) as { query?: string };
+    assert.ok(parsed.query?.includes("queryTags"));
+    sendJson(res, 200, { data: { queryTags: { count: tags.length, tags } } });
+  });
+  try {
+    process.env.STASHDB_BASE_URL = fixture.origin;
+    // The cold keystroke answers natively; the ranked listing rule runs
+    // once the background warm has landed, so join it first.
+    await warmCatalogTagListing("stashdb");
+    const found = await searchCatalogTags("stashdb", "sex");
+    assert.deepEqual(found[0], { id: SEX_ID, name: "Sex" });
+    assert.deepEqual(found[1], { id: WORK_ID, name: "Sex Work" });
+    assert.equal(found[2]?.name, "Row 00 sex");
+    assert.equal(found.length, 50);
+  } finally {
+    await fixture.close();
+    restore();
+  }
+});
+
+// --- the two listing windows: suggestions month-long, expansion one hour ---
+
+test("the picker serves a month-old listing while expansion re-walks past its one-hour window", async () => {
+  const restore = setEnv({ TPDB_API_TOKEN: TPDB_TOKEN });
+  const TAG_A = "1b7c3e9a-2d4f-4c6b-8a0e-5f1d2c3b4a5c";
+  const TAG_B = "2c8d4f0b-3e5a-4d7c-9b1f-6a2e3d4c5b6d";
+  let walks = 0;
+  let rows: { id: number; uuid?: string; name: string }[] = [
+    { id: 11, uuid: TAG_A, name: "Alpha" },
+  ];
+  const fixture = await startFixture((req, res) => {
+    const url = new URL(req.url ?? "/", "http://fixture.test");
+    if (url.pathname === "/tags") {
+      if (url.searchParams.has("page")) walks += 1;
+      return sendJson(res, 200, { data: rows, links: { next: null } });
+    }
+    sendJson(res, 404, {});
+  });
+  const realNow = Date.now;
+  try {
+    process.env.TPDB_BASE_URL = fixture.origin;
+    // Cold memo: the keystroke answers from the native relevance search
+    // without waiting for the walk; the walk runs in the background and
+    // serves the folded-substring listing from the next keystroke on.
+    assert.deepEqual(await searchCatalogTags("tpdb", "alpha"), [
+      { id: TAG_A, name: "Alpha" },
+    ]);
+    // The background warm may finish before the native read does (fast
+    // fixture), so the walk count is pinned only once the warm is joined.
+    await warmCatalogTagListing("tpdb");
+    assert.equal(walks, 1); // the background warm was the one listing walk
+    // Two hours in: the expansion-grade window has expired, so the
+    // expansion re-walks the listing — while the picker keeps serving the
+    // memo without a read.
+    Date.now = () => realNow() + 2 * 60 * 60_000;
+    const expanded = await expandCatalogTagTerm("tpdb", "alpha");
+    assert.deepEqual(expanded.ids, [TAG_A]);
+    assert.equal(walks, 2);
+    assert.deepEqual(await searchCatalogTags("tpdb", "alpha"), [
+      { id: TAG_A, name: "Alpha" },
+    ]);
+    assert.equal(walks, 2);
+    // Thirty-one days in: even the suggestion window has expired, so the
+    // keystroke answers natively again and the background re-warm brings
+    // the renamed vocabulary to the searches after it — never a stale
+    // union.
+    rows = [{ id: 12, uuid: TAG_B, name: "Beta" }];
+    Date.now = () => realNow() + 31 * 24 * 60 * 60_000;
+    assert.deepEqual(await searchCatalogTags("tpdb", "beta"), [
+      { id: TAG_B, name: "Beta" },
+    ]);
+    await warmCatalogTagListing("tpdb");
+    assert.equal(walks, 3); // the re-warm is the only new listing walk
+    assert.deepEqual(await searchCatalogTags("tpdb", "alpha"), []);
+  } finally {
+    Date.now = realNow;
+    await fixture.close();
+    restore();
+  }
+});
+
+test("a picker miss on a listing past the completeness window falls back to the native search", async () => {
+  const restore = setEnv({ TPDB_API_TOKEN: TPDB_TOKEN });
+  const TAG_A = "5e0b7c3e-9a2d-4f16-b8a4-1d5f2e3c4b5a";
+  const TAG_B = "6f1c8d4f-0b3e-4a27-c9b5-2e6a3f4d5c6b";
+  let walks = 0;
+  let nativeReads = 0;
+  const fixture = await startFixture((req, res) => {
+    const url = new URL(req.url ?? "/", "http://fixture.test");
+    if (url.pathname === "/tags") {
+      if (url.searchParams.has("page")) {
+        walks += 1;
+        return sendJson(res, 200, {
+          data: [{ id: 11, uuid: TAG_A, name: "Alpha" }],
+          links: { next: null },
+        });
+      }
+      // The native relevance search sees the tag the provider published
+      // after the memoized walk was taken.
+      nativeReads += 1;
+      return sendJson(res, 200, {
+        data: [{ id: 12, uuid: TAG_B, name: "Nova" }],
+        links: { next: null },
+      });
+    }
+    sendJson(res, 404, {});
+  });
+  const realNow = Date.now;
+  try {
+    process.env.TPDB_BASE_URL = fixture.origin;
+    // The cold keystroke answers natively while the walk warms the memo
+    // in the background; the walk count is pinned once the warm is joined.
+    assert.deepEqual(await searchCatalogTags("tpdb", "alpha"), [
+      { id: TAG_B, name: "Nova" },
+    ]);
+    await warmCatalogTagListing("tpdb");
+    assert.equal(walks, 1);
+    assert.equal(nativeReads, 1);
+    // Two hours in: the memo is past the completeness window but well
+    // inside the suggestion window. A miss must not claim absence over the
+    // month-old copy — the native search answers, and no walk is paid.
+    Date.now = () => realNow() + 2 * 60 * 60_000;
+    assert.deepEqual(await searchCatalogTags("tpdb", "nova"), [
+      { id: TAG_B, name: "Nova" },
+    ]);
+    assert.equal(walks, 1);
+    assert.equal(nativeReads, 2);
+    // Thirty-one days in: even the suggestion window has expired, so the
+    // keystroke answers natively again and the background re-warm brings
+    // the fresh listing in. The warmed walk's miss then stays honest — no
+    // native read pays for an absence the fresh walk proves.
+    Date.now = () => realNow() + 31 * 24 * 60 * 60_000;
+    assert.deepEqual(await searchCatalogTags("tpdb", "nova"), [
+      { id: TAG_B, name: "Nova" },
+    ]);
+    assert.equal(nativeReads, 3);
+    await warmCatalogTagListing("tpdb");
+    assert.equal(walks, 2);
+    assert.deepEqual(await searchCatalogTags("tpdb", "nova"), []);
+    assert.equal(nativeReads, 3);
+  } finally {
+    Date.now = realNow;
+    await fixture.close();
+    restore();
+  }
+});
+
+test("a cold tag search answers from the native search while the listing walk warms in the background", async () => {
+  const restore = setEnv({ TPDB_API_TOKEN: TPDB_TOKEN });
+  const NATIVE_ID = "3d9e501c-4f6a-4e8b-9c2d-7a3b5c6d8e9f";
+  const LISTING_ID = "4e0f612d-5a7b-4f9c-8d3e-8b4c2d3a5b6c";
+  const fixture = await startFixture((req, res) => {
+    const url = new URL(req.url ?? "/", "http://fixture.test");
+    if (url.pathname !== "/tags") return sendJson(res, 404, {});
+    // Distinct rows per endpoint: an answer built from the listing walk
+    // would name the listing row, so the native answer proves the search
+    // never waited on the walk.
+    const rows = url.searchParams.has("page")
+      ? [{ id: 21, uuid: LISTING_ID, name: "Alpha Listing" }]
+      : [{ id: 22, uuid: NATIVE_ID, name: "Alpha Native" }];
+    return sendJson(res, 200, { data: rows, links: { next: null } });
+  });
+  try {
+    process.env.TPDB_BASE_URL = fixture.origin;
+    const cold = await searchCatalogTags("tpdb", "alpha");
+    assert.deepEqual(cold, [{ id: NATIVE_ID, name: "Alpha Native" }]);
+    // The background warm landed: the same term now reads the folded
+    // substring rule off the complete listing.
+    await warmCatalogTagListing("tpdb");
+    assert.deepEqual(await searchCatalogTags("tpdb", "alpha"), [
+      { id: LISTING_ID, name: "Alpha Listing" },
+    ]);
+  } finally {
+    await fixture.close();
+    restore();
   }
 });
 
@@ -2625,7 +3048,7 @@ test("studio and tag filters select provider matches, including TPDB cold UUID b
   }
 });
 
-test("a tag picked from a search response browses without a /tags scan", async () => {
+test("a tag picked from the cached listing browses without another /tags scan", async () => {
   const restore = setEnv({ TPDB_API_TOKEN: TPDB_TOKEN });
   let tagScans = 0;
   const fixture = await startFixture((req, res) => {
@@ -2634,6 +3057,7 @@ test("a tag picked from a search response browses without a /tags scan", async (
       if (url.searchParams.has("page")) tagScans++;
       return sendJson(res, 200, {
         data: [{ id: 194, uuid: TPDB_TAG_B, name: "Rare Tag" }],
+        links: { next: null },
       });
     }
     if (url.pathname === "/movies") {
@@ -2649,9 +3073,14 @@ test("a tag picked from a search response browses without a /tags scan", async (
   try {
     process.env.TPDB_BASE_URL = fixture.origin;
     const found = await searchCatalogTags("tpdb", "rare");
+    // A cold search answers natively — the fixture serves the same row for
+    // the q read — and costs no listing walk.
     assert.deepEqual(found, [{ id: TPDB_TAG_B, name: "Rare Tag" }]);
-    // The numeric key must come from the rows above; a cold scan would page
-    // /tags?page=N until the id is known.
+    await warmCatalogTagListing("tpdb");
+    // The background warm was the one listing walk (tagScans is paged
+    // reads only); both reads teach the numeric filter key: browsing with
+    // the picked tag pages no further /tags reads.
+    assert.equal(tagScans, 1);
     const page = await searchCatalog({
       provider: "tpdb",
       kind: "movie",
@@ -2661,7 +3090,7 @@ test("a tag picked from a search response browses without a /tags scan", async (
       page.items.map((item) => item.reference.id),
       [MOVIE_ID],
     );
-    assert.equal(tagScans, 0);
+    assert.equal(tagScans, 1);
   } finally {
     await fixture.close();
     restore();
