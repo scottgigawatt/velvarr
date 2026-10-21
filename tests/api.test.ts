@@ -1,3 +1,4 @@
+import { defaultPersonalSettings } from "../src/lib/personalization.ts";
 // API regression tests: privilege, CSRF, session, library denial, outage honesty.
 // Runs handlers directly against local fixture servers. No real network, no real providers.
 import { test, before, after } from "node:test";
@@ -1716,6 +1717,7 @@ test("request and body validation bounds", async () => {
     "start=-1",
     `search=${"x".repeat(201)}`,
     "start=100001",
+    "sort=bogus",
   ]) {
     const res = await call("GET", `/api/library?${query}`, { cookie: member });
     await errorShape(res);
@@ -3741,7 +3743,7 @@ interface FixtureShelf {
   }[];
   /** Per-source partial-failure evidence; coexists with items. */
   errors?: { provider: string; code: string; message: string }[];
-  error?: { code: string };
+  error?: { code: string; message: string };
 }
 
 // Facet tiles: projected to the pinned wire fields for set comparison.
@@ -3807,7 +3809,10 @@ test("discover: mixed new releases, honest trending, facets, grants, not-configu
     shelves.map((shelf) => shelf.id),
     [
       "new-releases",
+      "new-scenes",
+      "tmdb-new",
       "trending",
+      "tmdb-trending",
       "jellyfin-recent",
       "velvarr-requests",
       "studios",
@@ -3829,13 +3834,18 @@ test("discover: mixed new releases, honest trending, facets, grants, not-configu
 
   // Every shelf carries items; none fails silently.
   for (const shelf of shelves) {
+    if (shelf.source === "tmdb") {
+      assert.equal(shelf.error?.code, "provider_not_configured");
+      assert.equal(shelf.items, undefined);
+      continue;
+    }
     assert.equal(shelf.error, undefined, shelf.id);
     assert.ok((shelf.items?.length ?? 0) > 0, `${shelf.id} carries items`);
   }
 
   // New releases is genuinely mixed: TPDB movies and StashDB scenes in one
   // velvarr-sourced rail. Membership, not merge order, is the contract.
-  assert.equal(newReleases?.source, "velvarr");
+  assert.equal(newReleases?.source, "tpdb");
   const releaseRefs = (newReleases?.items ?? []).map(refOf);
   assert.ok(
     releaseRefs.some(
@@ -3844,9 +3854,9 @@ test("discover: mixed new releases, honest trending, facets, grants, not-configu
     "new releases carries a TPDB movie",
   );
   assert.ok(
-    releaseRefs.some(
-      (ref) => ref?.provider === "stashdb" && ref?.kind === "scene",
-    ),
+    (byId.get("new-scenes")?.items ?? [])
+      .map(refOf)
+      .some((ref) => ref?.provider === "stashdb" && ref?.kind === "scene"),
     "new releases carries a StashDB scene",
   );
 
@@ -3854,7 +3864,7 @@ test("discover: mixed new releases, honest trending, facets, grants, not-configu
   // the release-date bound, so clicking through shows the same set.
   assert.deepEqual(newReleases?.browse?.view, "titles");
   const browseParams = newReleases?.browse?.params ?? {};
-  assert.equal(browseParams.type, "all");
+  assert.equal(browseParams.type, "movie");
   assert.equal(browseParams.sort, "recency");
   assert.equal(browseParams.direction, "desc");
   assert.equal(browseParams.date_operation, "<=");
@@ -3863,10 +3873,15 @@ test("discover: mixed new releases, honest trending, facets, grants, not-configu
   // Trending is honestly a StashDB-only signal: labeled as such, described
   // as such, and its browse link goes to the unified scene browse.
   assert.equal(trending?.source, "stashdb");
-  assert.equal(trending?.description, "Scene trends from StashDB");
+  assert.equal(trending?.description, "StashDB's scene trending signal.");
   assert.deepEqual(trending?.browse, {
     view: "titles",
-    params: { type: "scene", sort: "trending", direction: "desc" },
+    params: {
+      type: "scene",
+      sort: "trending",
+      direction: "desc",
+      preferredTags: "0",
+    },
   });
   assert.deepEqual(trending?.items?.[0]?.reference, {
     provider: "stashdb",
@@ -3973,6 +3988,12 @@ test("discover: mixed new releases, honest trending, facets, grants, not-configu
     ITEM_MOVIE,
   ]);
   assert.equal(JSON.stringify(library).includes(ITEM_SHOW), false);
+  // The shelf's arrow lands on the library view pre-sorted by date added —
+  // the same ordering the shelf itself shows.
+  assert.deepEqual(library?.browse, {
+    view: "library",
+    params: { sort: "dateAdded" },
+  });
 
   // Requests shelf: storage role-filters; member (requester) sees own only.
   assert.ok((requests?.items?.length ?? 0) > 0);
@@ -3992,14 +4013,13 @@ test("discover: mixed new releases, honest trending, facets, grants, not-configu
     (await shelvesOf(outage)).map((shelf) => [shelf.id, shelf]),
   );
   const outNew = outById.get("new-releases");
-  assert.equal(outNew?.error, undefined, "partial failure is not an error");
-  assert.ok((outNew?.items?.length ?? 0) > 0, "survivor side still renders");
-  for (const item of outNew?.items ?? []) {
-    assert.equal(refOf(item)?.provider, "stashdb", "survivor side only");
-  }
-  assert.equal(outNew?.errors?.length, 1);
-  assert.equal(outNew?.errors?.[0]?.provider, "tpdb");
-  assert.match(outNew?.errors?.[0]?.code ?? "", /unavailable/);
+  assert.match(outNew?.error?.code ?? "", /unavailable/);
+  assert.equal(outNew?.items, undefined);
+  const survivingScenes = outById.get("new-scenes");
+  assert.equal(survivingScenes?.error, undefined);
+  assert.ok((survivingScenes?.items?.length ?? 0) > 0);
+  for (const item of survivingScenes?.items ?? [])
+    assert.equal(refOf(item)?.provider, "stashdb");
   for (const id of ["trending", "jellyfin-recent", "velvarr-requests"]) {
     const shelf = outById.get(id);
     assert.equal(shelf?.error, undefined, id);
@@ -4062,9 +4082,11 @@ test("discover: mixed new releases, honest trending, facets, grants, not-configu
   for (const item of unNew?.items ?? []) {
     assert.equal(refOf(item)?.provider, "tpdb");
   }
-  assert.equal(unNew?.errors?.length, 1);
-  assert.equal(unNew?.errors?.[0]?.provider, "stashdb");
-  assert.equal(unNew?.errors?.[0]?.code, "provider_not_configured");
+  assert.equal(unNew?.errors?.length, undefined);
+  assert.equal(
+    unById.get("new-scenes")?.error?.code,
+    "provider_not_configured",
+  );
   for (const id of [
     "jellyfin-recent",
     "velvarr-requests",
@@ -5523,7 +5545,10 @@ test("discover appends ONE followed rail across providers and isolates a provide
     shelves.map((shelf) => shelf.id),
     [
       "new-releases",
+      "new-scenes",
+      "tmdb-new",
       "trending",
+      "tmdb-trending",
       "jellyfin-recent",
       "velvarr-requests",
       "studios",
@@ -5569,7 +5594,9 @@ test("discover appends ONE followed rail across providers and isolates a provide
     const byId = new Map(outShelves.map((shelf) => [shelf.id, shelf]));
     // Both mixed rails keep their surviving StashDB titles beside a
     // tpdb-tagged warning, with no shelf-level error.
-    for (const id of ["new-releases", "followed-titles"]) {
+    assert.match(byId.get("new-releases")?.error?.code ?? "", /unavailable/);
+    assert.ok((byId.get("new-scenes")?.items?.length ?? 0) > 0);
+    for (const id of ["followed-titles"]) {
       const shelf = byId.get(id);
       assert.equal(shelf?.error, undefined, id);
       assert.ok((shelf?.items?.length ?? 0) > 0, id);
@@ -5640,6 +5667,36 @@ test("followed rail names the provider when one performer's filmography fails", 
       (shelf.items ?? []).map((item) => refOf(item)?.id),
       [TPDB_MOVIE6],
     );
+
+    // The survivor's only title carries a hidden tag: nothing visible
+    // remains and no side rejected outright, yet the rail must still name
+    // the failing provider — never a generic internal error.
+    const hidden = await call("PATCH", "/api/me/preferences", {
+      cookie: member2,
+      body: { hiddenTags: [{ name: "Fixture Tag A", tpdb: TAG_A }] },
+    });
+    assert.equal(hidden.status, 200);
+    try {
+      resetMetaCache();
+      const hiddenPage = await call("GET", "/api/discover", {
+        cookie: member2,
+      });
+      assert.equal(hiddenPage.status, 200);
+      const hiddenShelf = (await shelvesOf(hiddenPage)).find(
+        (s) => s.id === "followed-titles",
+      );
+      assert.ok(hiddenShelf, "the error-only rail still renders");
+      assert.equal(hiddenShelf.items, undefined);
+      assert.equal(hiddenShelf.errors, undefined);
+      assert.match(hiddenShelf.error?.code ?? "", /unavailable/);
+      assert.match(hiddenShelf.error?.message ?? "", /TPDB/);
+    } finally {
+      const restored = await call("PATCH", "/api/me/preferences", {
+        cookie: member2,
+        body: { hiddenTags: [] },
+      });
+      assert.equal(restored.status, 200);
+    }
   } finally {
     tpdbFx.failPaths = [];
   }
@@ -6073,6 +6130,96 @@ test("availability: cached sweep serves repeated calls; removed title reads miss
   assert.ok(fx.sweepHits > recheckBefore, "cached miss was re-checked live");
 
   // Restore the fixture for later tests.
+  removeProbe();
+  resetSweepCache();
+});
+
+test("a Whisparr URL change keeps imported titles available", async () => {
+  resetSweepCache();
+  const probeId = "2a2b3c4d-0000-0000-0000-0000000000c4";
+  const probeItem = "4".repeat(32);
+
+  const req = await call("POST", "/api/requests", {
+    cookie: member,
+    body: { media: { provider: "tpdb", kind: "movie", id: probeId } },
+  });
+  assert.equal(req.status, 201);
+  const created = (await req.json()) as { request: { id: string } };
+  const reqId = created.request.id;
+  await call("PATCH", `/api/requests/${reqId}`, {
+    cookie: owner,
+    body: { decision: "approved" },
+  });
+  const acq = getAcquisitionByReference({
+    provider: "tpdb",
+    kind: "movie",
+    id: probeId,
+  });
+  assert.ok(acq);
+  recordAcquisitionObservation(acq.id, {
+    state: "imported",
+    item: { whisparrId: 502, path: `/data/whisparr/${probeItem}.mkv` },
+  });
+  fx.items.push({
+    Id: probeItem,
+    Name: "URL Move Probe Movie",
+    libraryId: MOVIES_LIB,
+  });
+  const removeProbe = () => {
+    const at = fx.items.findIndex((item) => item.Id === probeItem);
+    if (at !== -1) fx.items.splice(at, 1);
+  };
+
+  const before = await call("GET", `/api/availability/tpdb/movie/${probeId}`, {
+    cookie: member,
+  });
+  assert.equal((await outcomeOf(before)).outcome, "available");
+
+  // The settings card re-sends delivery and pathMappings on every save: the
+  // route preserves only what the body carries. Mirror that contract here.
+  const shape = (await (
+    await call("GET", "/api/admin/integrations", { cookie: owner })
+  ).json()) as {
+    whisparr: { delivery: unknown; pathMappings: unknown };
+  };
+  const whisparrFields = {
+    delivery: shape.whisparr.delivery,
+    pathMappings: shape.whisparr.pathMappings,
+  };
+
+  // The same-origin URL move rotates the Whisparr identity; the imported
+  // row's observed facts must ride along, or the title reads awaiting_scan.
+  const move = await call("PATCH", "/api/admin/integrations", {
+    cookie: owner,
+    body: {
+      jellyfinUrl,
+      jellyfinExternalUrl: jellyfinUrl,
+      whisparrUrl: `${whisparrUrl}/wh`,
+      ...whisparrFields,
+    },
+  });
+  assert.equal(move.status, 200);
+  resetSweepCache();
+  const after = await call("GET", `/api/availability/tpdb/movie/${probeId}`, {
+    cookie: member,
+  });
+  assert.equal(
+    (await outcomeOf(after)).outcome,
+    "available",
+    "an imported title stays available across a URL change",
+  );
+
+  // Restore the working config and the fixture for later tests.
+  const restore = await call("PATCH", "/api/admin/integrations", {
+    cookie: owner,
+    body: {
+      jellyfinUrl,
+      jellyfinExternalUrl: jellyfinUrl,
+      whisparrUrl,
+      ...whisparrFields,
+    },
+  });
+  assert.equal(restore.status, 200);
   removeProbe();
   resetSweepCache();
 });
@@ -6577,7 +6724,10 @@ interface RelatedBody {
 // DISCOVER_SHELVES in contracts.ts.
 const DEFAULT_ORDER = [
   "new-releases",
+  "new-scenes",
+  "tmdb-new",
   "trending",
+  "tmdb-trending",
   "jellyfin-recent",
   "velvarr-requests",
   "studios",
@@ -6609,6 +6759,7 @@ test("content preferences are session-only, self-owned, and atomic on malformed 
   assert.equal(saved.status, 200);
   const savedBody = (await saved.json()) as PreferencesBody;
   assert.deepEqual(savedBody, {
+    ...defaultPersonalSettings(),
     hiddenTags: hidden,
     discoverOrder: DEFAULT_ORDER,
   });
@@ -6632,6 +6783,7 @@ test("content preferences are session-only, self-owned, and atomic on malformed 
   });
   const afterSmuggleBody = (await afterSmuggle.json()) as PreferencesBody;
   assert.deepEqual(afterSmuggleBody, {
+    ...defaultPersonalSettings(),
     hiddenTags: hidden,
     discoverOrder: DEFAULT_ORDER,
   });
@@ -6652,7 +6804,7 @@ test("content preferences are session-only, self-owned, and atomic on malformed 
     {
       hiddenTags: Array.from({ length: 26 }, (_, i) => ({
         name: `Tag ${i}`,
-        tpdb: TAG_A,
+        tpdb: `00000000-0000-4000-8000-${String(i).padStart(12, "0")}`,
       })),
     },
     { hiddenTags: [], extra: true },
@@ -6667,11 +6819,12 @@ test("content preferences are session-only, self-owned, and atomic on malformed 
   });
   const afterMalformedBody = (await afterMalformed.json()) as PreferencesBody;
   assert.deepEqual(afterMalformedBody, {
+    ...defaultPersonalSettings(),
     hiddenTags: hidden,
     discoverOrder: DEFAULT_ORDER,
   });
 
-  // Both provider references on one tag is the normal cross-provider pick.
+  // Existing selections carrying both native references keep both explicit scopes.
   const both = await call("PATCH", "/api/me/preferences", {
     cookie: member,
     body: {
@@ -6726,6 +6879,9 @@ test("discover honors a personal shelf order; contents, errors, and other accoun
       "studios",
       "trending",
       "new-releases",
+      "new-scenes",
+      "tmdb-new",
+      "tmdb-trending",
     ];
     const saved = await call("PATCH", "/api/me/preferences", {
       cookie: member,
@@ -6754,7 +6910,7 @@ test("discover honors a personal shelf order; contents, errors, and other accoun
       string,
       FixtureShelf
     >;
-    assert.equal(byId["new-releases"]?.source, "velvarr");
+    assert.equal(byId["new-releases"]?.source, "tpdb");
     const staffView = byId["velvarr-requests"]?.items ?? [];
     assert.ok(
       staffView.some((record) => record.accountId === OWNER_ID),
@@ -6823,6 +6979,9 @@ test("discover honors a personal shelf order; contents, errors, and other accoun
       "studios",
       "genres",
       "followed-titles",
+      "new-scenes",
+      "tmdb-new",
+      "tmdb-trending",
     ];
     const orderSave = await call("PATCH", "/api/me/preferences", {
       cookie: member,
@@ -6865,7 +7024,11 @@ test("discover honors a personal shelf order; contents, errors, and other accoun
     }
     const intact = await call("GET", "/api/me/preferences", { cookie: member });
     const intactBody = (await intact.json()) as PreferencesBody;
-    assert.deepEqual(intactBody, { hiddenTags: tags, discoverOrder: reorder });
+    assert.deepEqual(intactBody, {
+      ...defaultPersonalSettings(),
+      hiddenTags: tags,
+      discoverOrder: reorder,
+    });
 
     // An errored shelf keeps its chosen placement: trending leads even with
     // its only source unconfigured, and the failure rides the shelf itself.
@@ -6891,11 +7054,12 @@ test("discover honors a personal shelf order; contents, errors, and other accoun
     // tests after this point see the untouched state.
     const reset = await call("PATCH", "/api/me/preferences", {
       cookie: member,
-      body: { hiddenTags: [], discoverOrder: [] },
+      body: { ...defaultPersonalSettings(), hiddenTags: [], discoverOrder: [] },
     });
     assert.equal(reset.status, 200);
     const resetBody = (await reset.json()) as PreferencesBody;
     assert.deepEqual(resetBody, {
+      ...defaultPersonalSettings(),
       hiddenTags: [],
       discoverOrder: DEFAULT_ORDER,
     });
@@ -7326,9 +7490,10 @@ test("hidden tag families: a whole-word label hides longer-tagged titles on ever
     const discover = await call("GET", "/api/discover", { cookie: member });
     assert.equal(discover.status, 200);
     const shelves = await shelvesOf(discover);
-    const releaseRefs = (
-      shelves.find((shelf) => shelf.id === "new-releases")?.items ?? []
-    ).map(refOf);
+    const releaseRefs = shelves
+      .filter((shelf) => ["new-releases", "new-scenes"].includes(shelf.id))
+      .flatMap((shelf) => shelf.items ?? [])
+      .map(refOf);
     assert.ok(
       releaseRefs.every(
         (ref) => !(ref?.provider === "tpdb" && ref?.kind === "movie"),
@@ -7761,7 +7926,12 @@ test("failed sign-in attempts leave an audit line with the reported client ip", 
   }
   const line = lines.find((entry) => entry.includes("failed sign-in attempt"));
   assert.ok(line, "a credential rejection must leave an audit line");
-  assert.ok(line.includes("ip=203.0.113.7"), "first forwarded hop wins");
+  // The ip moved to the account field's encoding: JSON.stringify keeps a
+  // proxy-appended or client-forged value on one line and inside one field.
+  assert.ok(
+    line.includes(`ip=${JSON.stringify("203.0.113.7")}`),
+    "first forwarded hop wins, JSON-encoded",
+  );
   assert.ok(
     line.includes(`account=${JSON.stringify("member")}`),
     "the attempted name is logged injection-safe",
@@ -7769,5 +7939,38 @@ test("failed sign-in attempts leave an audit line with the reported client ip", 
   assert.ok(
     !line.includes("pass-guess-9"),
     "the password stays out of the log",
+  );
+});
+
+test("audit line encodes a hostile X-Forwarded-For value", async () => {
+  // CWE-117: appending proxies (nginx $proxy_add_x_forwarded_for) keep the
+  // client's value first, so a raw ip field let
+  // `X-Forwarded-For: 10.0.0.5 account="owner"` forge fields into the line.
+  // The ip is JSON-encoded exactly like the account field.
+  resetLoginBuckets();
+  const lines: string[] = [];
+  const originalWarn = console.warn;
+  console.warn = (line?: unknown) => {
+    lines.push(String(line));
+  };
+  const forwarded = '10.0.0.5 account="owner"';
+  try {
+    const res = await call("POST", "/api/login", {
+      headers: { "x-forwarded-for": forwarded },
+      body: { username: "member", password: "pass-guess-9" },
+    });
+    assert.equal(res.status, 502);
+  } finally {
+    console.warn = originalWarn;
+  }
+  const line = lines.find((entry) => entry.includes("failed sign-in attempt"));
+  assert.ok(line, "a credential rejection must leave an audit line");
+  assert.ok(
+    line.includes(`ip=${JSON.stringify(forwarded)}`),
+    "the forwarded value must be JSON-encoded on the line",
+  );
+  assert.ok(
+    !line.includes("ip=10.0.0.5 account="),
+    "a forwarded value must not add raw fields to the line",
   );
 });

@@ -620,7 +620,20 @@ async function mergeAcrossLibraries(
   start: number,
   limit: number,
   search: string,
+  sort?: "dateAdded",
 ): Promise<LibraryPage> {
+  // Each per-library stream must arrive in the merge comparator's order, so
+  // the dateAdded merge re-fetches with the server's DateCreated ordering —
+  // the same stream shape listRecentlyAddedItems relies on.
+  const sortOverrides =
+    sort === "dateAdded"
+      ? {
+          sortBy: "DateCreated",
+          sortOrder: "Descending",
+          extraFields: "DateCreated",
+        }
+      : {};
+  const before = sort === "dateAdded" ? compareByDateCreatedDesc : compareItems;
   interface Cursor {
     libraryId: string;
     items: BaseItemDto[];
@@ -638,6 +651,7 @@ async function mergeAcrossLibraries(
         startIndex: 0,
         limit: MERGE_CHUNK,
         search,
+        ...sortOverrides,
       });
       const fetched = first.items.length;
       cursors.push({
@@ -658,6 +672,7 @@ async function mergeAcrossLibraries(
       startIndex: cursor.fetched,
       limit: MERGE_CHUNK,
       search,
+      ...sortOverrides,
     });
     cursor.items = next.items;
     cursor.pos = 0;
@@ -675,8 +690,7 @@ async function mergeAcrossLibraries(
         await refill(cursor);
       const head = cursor.items[cursor.pos];
       if (!head) continue;
-      if (!best || compareItems(head, best.dto) < 0)
-        best = { cursor, dto: head };
+      if (!best || before(head, best.dto) < 0) best = { cursor, dto: head };
     }
     if (!best) break;
     best.cursor.pos += 1;
@@ -703,7 +717,13 @@ export async function listLibraryItems(
   config: IntegrationConfig,
   userToken: string,
   account: Account,
-  query: { start: number; limit: number; search: string; libraryId?: string },
+  query: {
+    start: number;
+    limit: number;
+    search: string;
+    libraryId?: string;
+    sort?: "dateAdded";
+  },
 ): Promise<LibraryPage> {
   requireJellyfinConfig(config);
   const start = Number(query.start);
@@ -752,6 +772,13 @@ export async function listLibraryItems(
       startIndex: start,
       limit,
       search,
+      ...(query.sort === "dateAdded"
+        ? {
+            sortBy: "DateCreated",
+            sortOrder: "Descending",
+            extraFields: "DateCreated",
+          }
+        : {}),
     });
     return {
       items: await withSceneIdentity(
@@ -773,6 +800,7 @@ export async function listLibraryItems(
     start,
     limit,
     search,
+    query.sort,
   );
 }
 
@@ -1574,10 +1602,15 @@ async function resolveFromSweep(
       { provider: hints.provider, kind: hints.kind, id: hints.id },
       hints.targetInstanceId,
     );
-    // A retired destination supplies no current path mapping; exact provider IDs can still prove playback.
+    // Legacy URL changes use the current mapping; retired multi-instance destinations do not.
     const mapped =
       hints.whisparrPath && (config.whisparrInstances === undefined || target)
-        ? mappedPrefix(hints.whisparrPath, target?.pathMappings)
+        ? mappedPrefix(
+            hints.whisparrPath,
+            config.whisparrInstances === undefined
+              ? config.whisparr?.pathMappings
+              : target?.pathMappings,
+          )
         : undefined;
     const exact = candidates.filter(
       (c) =>

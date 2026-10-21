@@ -33,6 +33,7 @@ test("BROWSE_KEYS includes source and adult filters alongside existing browse ke
       "type",
       "movieSource",
       "adultOnly",
+      "recentDays",
       "year",
     ].sort(),
   );
@@ -59,6 +60,7 @@ test("clearBrowseKeys nulls every key; keep spares exactly the named keys", () =
       "studioMode",
       "studioStashdb",
       "studioTpdb",
+      "recentDays",
       "year",
       "movieSource",
       "adultOnly",

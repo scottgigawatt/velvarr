@@ -45,6 +45,8 @@ To upgrade, bump the image tag in `compose.yaml`, then `docker compose pull && d
 
 Container images are published after CI checks pass. Stable releases provide exact tags such as `v0.37.0` and `0.37.0`, a minor alias such as `0.37`, and `latest`. Releases from version 1 onward also provide a major alias such as `1`. For development builds, use `ghcr.io/skare69/velvarr:edge`, which follows `main`. Prereleases provide exact version tags without updating stable aliases. Every published build also has a `sha-<commit>` tag.
 
+The container health check reads `/api/status`. The container becomes `unhealthy` when Velvarr cannot open its data directory (`/data`); run `docker compose logs velvarr` to see the cause. A new instance that waits for owner setup stays healthy.
+
 **From source** (Node 24.21+, Bun 1.3.14+):
 
 ```sh
@@ -68,7 +70,7 @@ bun run dev     # http://127.0.0.1:6699
 | `VELVARR_DISCORD_DETAIL`     | no               | `1` includes titles in notifications; off by default, messages stay identity-only.   |
 | `TMDB_READ_TOKEN` | no | Optional TMDB API read access token for movie metadata; a stored token takes precedence. |
 | `TYPESAFE_API_KEY`           | no               | TypeSafe key for AI-assisted matching when TypeSafe is selected; a stored key takes precedence. |
-| `VELVARR_JUDGMENT_PROVIDER` | no | `typesafe` (default) or `ollama`; stored AI-assisted matching settings take precedence. |
+| `VELVARR_JUDGMENT_PROVIDER` | no | `typesafe` (default), `ollama`, or `none`; stored AI-assisted matching settings take precedence. |
 | `OLLAMA_BASE_URL` | no | Ollama API root; default `http://localhost:11434`. |
 | `OLLAMA_MODEL` | no | Downloaded decision model; default `nimble`. |
 | `VELVARR_UPDATE_CHECK`       | no               | `0` disables the release check. By default the server asks GitHub (`api.github.com`) for the latest release at most once an hour — ten minutes after a failure — to show the update chip. |
@@ -84,19 +86,35 @@ ollama pull nimble
 
 In **Settings → Metadata providers → AI-assisted matching**, select **Ollama (local)**, enter its URL and the downloaded model name shown by `ollama list`, save, and use **Test saved connection**. No API key is required. Selecting Ollama never falls back to the paid TypeSafe service. Connection failures retain ordinary matching and the existing tag-based related-title order.
 
-For Velvarr running natively on the same machine, use `http://localhost:11434`. For Velvarr in Docker Desktop on a Mac with Ollama running natively, use `http://host.docker.internal:11434` and set `VELVARR_ALLOW_HTTP=1` in Velvarr's runtime environment. `localhost` inside a container refers to that container. For a different host, use Ollama's reachable private address and follow its [network configuration guidance](https://docs.ollama.com/faq#how-do-i-configure-ollama-server).
+For Velvarr running natively on the same machine, use `http://localhost:11434`. For Velvarr in Docker Desktop on a Mac with Ollama running natively, use `http://host.docker.internal:11434` and enable **Allow private HTTP** under **Settings → Connections**. `localhost` inside a container refers to that container. For a different host, use Ollama's reachable private address and follow its [network configuration guidance](https://docs.ollama.com/faq#how-do-i-configure-ollama-server).
 
 Alternatively, set `VELVARR_JUDGMENT_PROVIDER=ollama`, `OLLAMA_BASE_URL`, and `OLLAMA_MODEL` in the runtime environment. **Use environment settings** clears the stored selection, URL, and model. Existing TypeSafe deployments retain their behavior until Ollama is explicitly selected.
 
 The existing matching rules remain unchanged: AI can flag a possible title match for administrator review, never mark it available or grant playback. Local tag suggestions use bounded batches because decision models limit the number of choices; large tag lists can require multiple inference calls. Related-title ranking only reorders existing candidates. Models have different accuracy and latency, so test representative naming variants and mismatches before choosing one.
 
+## Personal browsing and appearance
+
+**Preferences** is available in the main navigation and your profile menu. Save **Preferred tags** to apply them every time you browse; titles must match every included tag from their provider, while hidden tags take priority. Picked tags filter only results from their own provider; same-named tags from other providers stay independent. Explicit free-text filters match tag names across providers. You can pause preferred tags for one All browse or turn them off in Preferences. **Use my tag preferences** controls personalization of catalog shelves on Discover. Each account keeps its own tags, shelf order, row limit, and appearance.
+
+Discover separates new TPDB movies, new StashDB scenes, and new TMDB movies. StashDB supplies its own scene trends. TMDB's **Recent popular** shelf uses `/discover/movie`, broad published adult keywords, US release dates within the last 30 days, and TMDB's popularity order. It does not use TMDB's mainstream trending endpoint or require the adult classification flag. Your TMDB include/exclude preferences narrow this default keyword scope. Without personal include tags, the broad adult-keyword scope still applies. Keyword IDs are resolved from TMDB rather than guessed; a failed lookup never substitutes an unfiltered movie list. Browse offers 30-, 90-, and 365-day release windows. This is recent-release popularity, not a US-specific or monthly trending score. TPDB has no supported trending signal and is labeled as new releases. Shelf links preserve their provider and criteria. Previews remain bounded to three listing pages, retain matches found, and offer a wider release window when coverage is limited.
+
+**Appearance** offers dark, light, and system modes, five palettes, and a custom accent. Changes apply immediately and persist with your account.
+
+Connection settings contain one Jellyfin area and one Whisparr area, with a separate status and edit form for every instance. Metadata providers have independent credential rows and checks. **AI-assisted matching** contains only the selected provider's configuration; choose **Standard matching (no AI)** to disable optional model calls.
+
+**Allow private HTTP** in Connections saves an administrator policy without editing the container environment. It permits trusted private addresses, local names, and Docker hosts; public addresses still require HTTPS. An explicit saved choice overrides the deployment fallback. Change any saved non-loopback HTTP connection to HTTPS before disabling it, so the switch cannot cut off the Jellyfin sign-in path. Before first-time setup, `VELVARR_ALLOW_HTTP=1` remains available as a deployment fallback.
+
+This feature advances the database to schema 13. Back up the data directory and retain its secret key before upgrading; older images cannot open the upgraded database.
+
 ## TMDB movies and multiple Whisparr connections
 
 TMDB is an optional movie source. Scenes still use StashDB. Add an **API read access token** from [TMDB account settings](https://www.themoviedb.org/settings/api) under **Settings → Metadata providers**, or set `TMDB_READ_TOKEN`. TMDB requires attribution and compliance with its [API terms](https://developer.themoviedb.org/docs/faq). The app's **Credits** dialog includes its official logo and required notice.
 
-In **Titles → Movies → Filters**, choose **TMDB**. Title searches use TMDB's paginated movie search with adult results included; without a title, browsing uses release recency. **Adult-flagged only** is optional and off by default because incorrectly classified titles would otherwise disappear. It filters bounded provider pages without fetching individual movie details. Sparse searches can ask you to narrow the title or year instead of pretending there are no results. TMDB supports title, year, and its adult classification here; TPDB's performer, studio, tag, and duration filters remain on TPDB. TMDB cast entries link to the source, and recommendations are provider-published. Velvarr does not merge TPDB and TMDB movies by title.
+In **Browse**, choose the movie catalog on the main page: **TPDB** or **TMDB**. **All** shows separate movie and scene rows with independent limits; **Movies** and **Scenes** open their full result grids. The default is 50 results per row, adjustable from 10 to 100 in **Preferences**. Scenes use StashDB regardless of the movie catalog.
 
-Use **Settings → Connections → Whisparr connections → Configure connections** to assign a movie provider and separate movie/scene roots and quality profiles to each instance. For a two-instance layout:
+TMDB includes its full movie catalog, including adult titles. Use include, exclude, and saved personal tags to choose your content; TMDB's adult classification never removes a title. TMDB supports title, year, release-date, keyword, cast, production-company, popularity, and recent-popular discovery. Include and exclude tags use TMDB keywords and genre labels; keyword filters hydrate bounded, cached provider pages when needed. Sparse filtered searches can ask you to narrow the query rather than claiming the catalog is empty. TMDB casts and production companies are movie filters; its cast links remain source-linked rather than adding a third performer catalog. Provider identities stay separate, and TMDB cast entries link to the source.
+
+Use **Settings → Connections → Whisparr → Edit instance** to assign a movie provider and separate movie/scene roots and quality profiles to each instance. For a two-instance layout:
 
 | Connection | Movie provider | Movie root inside Whisparr | Scene root inside Whisparr | Default for scenes |
 | --- | --- | --- | --- | --- |
@@ -105,7 +123,7 @@ Use **Settings → Connections → Whisparr connections → Configure connection
 
 The two containers can use identical internal paths while mounting different host directories. Configure **path mappings separately on each connection**, using the paths Jellyfin actually reports, such as Main `/data/movies` → `/library/main-movies` and Alternate `/data/movies` → `/library/alternate-movies`. Map scenes separately too. Velvarr does not manage Whisparr's import or recycle directories.
 
-Movies route by metadata source. Scene requests use the default instance; staff can choose another scene destination while approving a pending request. Approval pins the destination. Changing assignments later affects new approvals; moving or removing a connection retains its history and does not replay its old work against a different endpoint. API keys stay encrypted and never appear in settings responses. **Check saved connection** lists the instance's roots and quality profile IDs; enabled delivery requires those values to exist on that instance.
+Movies route by metadata source. Scene requests use the default instance; staff can choose another scene destination while approving a pending request. Approval pins the destination. Changing assignments later affects new approvals; moving or removing a connection retains its history and does not replay its old work against a different endpoint. API keys stay encrypted and never appear in settings responses. **Check connection** verifies the saved instance and supplies its root folders and named quality profiles; enabled delivery requires those values to exist on that instance.
 
 Existing single-instance configurations remain usable. When adopting the connection list, Main retains its existing connection identity, credentials, roots, path mappings, and approved work. Review its scene root before enabling scene delivery, since the original single-instance settings used one root for both kinds. Back up the data directory and keep its secret key before upgrading; the schema migration preserves history, claims, and observations, but an older image cannot open the new schema.
 
@@ -116,6 +134,8 @@ Opening a Jellyfin library item resolves its identity against Whisparr's complet
 If the collection still exceeds the allowance, measure its decoded size and set `VELVARR_WHISPARR_LIBRARY_LIMIT_MIB` above that measurement, with headroom, up to 256 MiB. This is a response-size ceiling, not a container memory limit; parsing large JSON also consumes memory. Authentication checks, redirect restrictions, and the existing request timeout remain in place.
 
 Pass the setting into the container's runtime environment and recreate the container after changing it. Compose `.env` files only supply interpolation values unless the chart also forwards the variable under `environment` or uses `env_file`. For the upstream chart's `.env.local`, add the setting there. No library titles, paths, API keys, or complete JSON responses are needed to diagnose the size limit.
+
+Each failed sign-in writes one warning line to the server log: `[auth] failed sign-in attempt: account="<name>" ip="<address>"`. The password is never logged. The address is the first `X-Forwarded-For` entry, or `unknown` when no proxy sends the header. A client can set this header, so trust the address only when your proxy replaces `X-Forwarded-For` instead of appending to it.
 
 ## Backup and recovery
 

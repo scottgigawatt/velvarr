@@ -8,7 +8,7 @@
 import type { CatalogKind, CatalogProvider } from "./contracts.ts";
 
 /** Normalized sort vocabulary. Only orders the providers genuinely
- * implement appear here; the page surfaces the exact upstream order that
+ * implement, plus explicitly labeled discovery modes, appear here; the page surfaces the exact upstream order that
  * was applied. */
 export type SortKey =
   | "relevance"
@@ -18,6 +18,7 @@ export type SortKey =
   | "date"
   | "trending"
   | "popularity"
+  | "recent-popular"
   | "created"
   | "updated";
 
@@ -33,6 +34,8 @@ export const SORT_CAPABILITIES: Readonly<
 > = {
   tmdb: {
     movie: [
+      { key: "popularity", directional: true },
+      { key: "recent-popular", directional: true },
       { key: "relevance", directional: false },
       { key: "recency", directional: true },
     ],
@@ -118,10 +121,14 @@ export function browseSortsFor(
 export function browseSortIsDirectional(
   type: "all" | "movie" | "scene",
   sort: SortKey,
+  movieProvider: "tpdb" | "tmdb" = "tpdb",
 ): boolean {
   if (type === "all") return BROWSE_MIXED_SORTS.includes(sort);
   const [provider, kind] = BROWSE_SIDES[type];
-  return sortSpec(provider, kind, sort)?.directional === true;
+  return (
+    sortSpec(type === "movie" ? movieProvider : provider, kind, sort)
+      ?.directional === true
+  );
 }
 
 /** Client-facing labels; trending/popularity are labeled as StashDB's own
@@ -132,8 +139,9 @@ export const SORT_LABELS: Record<SortKey, string> = {
   duration: "Duration",
   title: "Title",
   date: "Release date",
-  trending: "Trending (StashDB ordering)",
-  popularity: "Popularity (StashDB ordering)",
+  trending: "Trending",
+  popularity: "Popularity",
+  "recent-popular": "Recent popular",
   created: "Recently added (StashDB)",
   updated: "Last updated (StashDB)",
 };

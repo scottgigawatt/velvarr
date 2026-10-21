@@ -37,12 +37,20 @@ import type {
   Session,
   SessionGrant,
 } from "../lib/contracts.ts";
-import { AppError } from "./http.ts";
-import { DISCOVER_SHELVES, normalizeFacetName } from "../lib/contracts.ts";
+import { AppError, setHttpPolicy } from "./http.ts";
+import {
+  defaultPersonalSettings,
+  parsePersonalSettings,
+} from "../lib/personalization.ts";
+import {
+  DISCOVER_SHELVES,
+  normalizeFacetName,
+  tagSelectionKey,
+} from "../lib/contracts.ts";
 
 // Schema identity: application_id spells 'VLVR', user_version is the schema version.
 const APP_ID = 0x564c5652;
-const SCHEMA_VERSION = 12;
+const SCHEMA_VERSION = 13;
 // ponytail: fixed 7-day session TTL; make it an env knob only if an operator asks.
 const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const BUSY_TIMEOUT_MS = 5000;
@@ -174,6 +182,8 @@ type Statements = {
   countRequestsByAccount: StatementSync;
   hasEligibleRequester: StatementSync;
   insertAcquisition: StatementSync;
+  insertCarriedImported: StatementSync;
+  repairImportedFacts: StatementSync;
   getAcquisition: StatementSync;
   getAcquisitionByIdentity: StatementSync;
   latestAcquisitionForReference: StatementSync;
@@ -432,6 +442,10 @@ const MIGRATIONS: Record<number, string> = {
     ALTER TABLE requests ADD COLUMN target_instance_id TEXT;
     CREATE INDEX requests_target ON requests (target_instance_id, provider, kind, external_id);
   `,
+  13: `
+    ALTER TABLE accounts ADD COLUMN personal_settings TEXT NOT NULL DEFAULT '{}'
+      CHECK (json_valid(personal_settings));
+  `,
 };
 
 let db: DatabaseSync | null = null;
@@ -610,6 +624,52 @@ function S(): Statements {
       insertAcquisition: d.prepare(
         "INSERT OR IGNORE INTO acquisitions (id, instance_id, provider, kind, external_id, state, due_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
       ),
+      // An imported row carried to a new identity keeps its observed facts;
+      // due_at stays NULL so the row is never scheduled again.
+      insertCarriedImported: d.prepare(
+        `INSERT OR IGNORE INTO acquisitions
+           (id, instance_id, provider, kind, external_id, state, due_at,
+            created_at, updated_at, last_observed_at, whisparr_id, whisparr_path,
+            whisparr_title, whisparr_monitored, whisparr_progress, whisparr_timeleft)
+         VALUES (?, ?, ?, ?, ?, 'imported', NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ),
+      // Heals imported rows carried without their observed facts: only rows
+      // with no last observation are touched, so the run is idempotent.
+      // Scoped to the current identity: healing a retired row would stamp it
+      // with the boot time, making it latestAcquisitionForReference and
+      // hijacking the next URL change's carry with stale facts. The facts
+      // come from the newest observed imported row of a retired identity for
+      // the same media.
+      repairImportedFacts: d.prepare(
+        `UPDATE acquisitions SET
+           last_observed_at = src.last_observed_at,
+           whisparr_id = src.whisparr_id,
+           whisparr_path = src.whisparr_path,
+           whisparr_title = src.whisparr_title,
+           whisparr_monitored = src.whisparr_monitored,
+           whisparr_progress = src.whisparr_progress,
+           whisparr_timeleft = src.whisparr_timeleft,
+           updated_at = ?
+         FROM (
+           SELECT instance_id, provider, kind, external_id,
+                  last_observed_at, whisparr_id, whisparr_path, whisparr_title,
+                  whisparr_monitored, whisparr_progress, whisparr_timeleft,
+                  ROW_NUMBER() OVER (
+                    PARTITION BY provider, kind, external_id
+                    ORDER BY updated_at DESC, id DESC
+                  ) AS rn
+           FROM acquisitions
+           WHERE state = 'imported' AND last_observed_at IS NOT NULL
+         ) AS src
+         WHERE acquisitions.state = 'imported'
+           AND acquisitions.last_observed_at IS NULL
+           AND acquisitions.instance_id = ?
+           AND acquisitions.provider = src.provider
+           AND acquisitions.kind = src.kind
+           AND acquisitions.external_id = src.external_id
+           AND acquisitions.instance_id <> src.instance_id
+           AND src.rn = 1`,
+      ),
       getAcquisition: d.prepare("SELECT * FROM acquisitions WHERE id = ?"),
       getAcquisitionByIdentity: d.prepare(
         "SELECT * FROM acquisitions WHERE instance_id = ? AND provider = ? AND kind = ? AND external_id = ?",
@@ -705,10 +765,10 @@ function S(): Statements {
         "DELETE FROM performer_follows WHERE account_id = ? AND linked_provider = ? AND linked_external_id = ?",
       ),
       getPreferences: d.prepare(
-        "SELECT hidden_tags, discover_order FROM accounts WHERE id = ?",
+        "SELECT hidden_tags, discover_order, personal_settings FROM accounts WHERE id = ?",
       ),
       updatePreferences: d.prepare(
-        "UPDATE accounts SET hidden_tags = ?, discover_order = ? WHERE id = ?",
+        "UPDATE accounts SET hidden_tags = ?, discover_order = ?, personal_settings = ? WHERE id = ?",
       ),
     };
   }
@@ -1007,6 +1067,7 @@ function assertConfigShape(config: IntegrationConfig): void {
       !credentialOk(p.tpdbApiToken, 1024) ||
       !credentialOk(p.stashdbApiKey, 512) ||
       (p.judgmentProvider !== undefined &&
+        p.judgmentProvider !== "none" &&
         p.judgmentProvider !== "typesafe" &&
         p.judgmentProvider !== "ollama") ||
       (p.ollamaUrl !== undefined &&
@@ -1152,7 +1213,10 @@ function backfillTargets(
  * would replay the whole approval history against the new endpoint —
  * re-POSTing titles Whisparr no longer holds and searching them again. The
  * carried row is a new row of the new identity; rows of retired identities
- * are never reused or scheduled. */
+ * are never reused or scheduled. The carried row keeps the prior row's
+ * observed facts (path, title, id, last observation): without them every
+ * availability check reads "awaiting scan" forever, because 'imported' is
+ * never scheduled for re-observation. */
 function backfillApprovals(
   instanceId: string,
   state: "unsent" | "blocked",
@@ -1166,22 +1230,43 @@ function backfillApprovals(
       row.external_id,
     ) as AcquisitionRow | undefined;
     const carried = prior?.state === "imported" ? "imported" : state;
-    S().insertAcquisition.run(
-      randomUUID(),
-      instanceId,
-      row.provider,
-      row.kind,
-      row.external_id,
-      carried,
-      carried === "unsent" ? now : null,
-      now,
-      now,
-    );
+    if (carried === "imported" && prior) {
+      S().insertCarriedImported.run(
+        randomUUID(),
+        instanceId,
+        row.provider,
+        row.kind,
+        row.external_id,
+        now,
+        now,
+        prior.last_observed_at,
+        prior.whisparr_id,
+        prior.whisparr_path,
+        prior.whisparr_title,
+        prior.whisparr_monitored,
+        prior.whisparr_progress,
+        prior.whisparr_timeleft,
+      );
+    } else {
+      S().insertAcquisition.run(
+        randomUUID(),
+        instanceId,
+        row.provider,
+        row.kind,
+        row.external_id,
+        carried,
+        carried === "unsent" ? now : null,
+        now,
+        now,
+      );
+    }
   }
 }
 
 export function saveConfig(config: IntegrationConfig): void {
   assertConfigShape(config);
+  if (config.allowHttp !== undefined && typeof config.allowHttp !== "boolean")
+    throw new AppError(400, "invalid_config", "allowHttp must be a boolean");
   const d = open();
   inTransaction(d, () => {
     const existing = S().getConfig.get() as { data: Buffer } | undefined;
@@ -1231,6 +1316,7 @@ export function saveConfig(config: IntegrationConfig): void {
       Date.now(),
     );
   });
+  setHttpPolicy(config.allowHttp);
 }
 
 export function bootstrap(
@@ -1257,7 +1343,7 @@ export function bootstrap(
     );
   }
   const d = open();
-  return inTransaction(d, () => {
+  const grant = inTransaction(d, () => {
     // BEGIN IMMEDIATE serializes concurrent bootstraps; the single-owner unique
     // index is the second line of defense.
     if (S().hasConfig.get() || S().ownerExists.get()) {
@@ -1292,6 +1378,8 @@ export function bootstrap(
     );
     return issueSession(account, userToken);
   });
+  setHttpPolicy(resolved.allowHttp);
+  return grant;
 }
 
 export function importAccounts(users: ExternalUser[]): Account[] {
@@ -1591,6 +1679,7 @@ function isUniqueConflict(e: unknown, columns: readonly string[]): boolean {
 export function initializeStorage(): void {
   const d = open();
   const config = getConfig();
+  setHttpPolicy(config?.allowHttp);
   if (config?.whisparrInstances !== undefined) {
     inTransaction(d, () => backfillTargets(config, config));
     return;
@@ -1608,6 +1697,10 @@ export function initializeStorage(): void {
       whisparr.delivery?.enabled ? "unsent" : "blocked",
       Date.now(),
     );
+    // Heals rows an earlier build carried as imported without their observed
+    // facts, on this identity only. Idempotent: only fact-less rows are
+    // touched.
+    S().repairImportedFacts.run(Date.now(), instanceId);
   });
 }
 
@@ -2034,38 +2127,32 @@ function validTagSelection(s: unknown): s is CatalogTagSelection {
   return (
     nonemptyString(t.name, 120) &&
     t.name.trim().length > 0 &&
-    Object.keys(t).every((k) => ["name", "tpdb", "stashdb"].includes(k)) &&
+    Object.keys(t).every((k) =>
+      ["name", "tpdb", "stashdb", "tmdb"].includes(k),
+    ) &&
     (t.tpdb === undefined ||
       (typeof t.tpdb === "string" && UUID_RE.test(t.tpdb))) &&
     (t.stashdb === undefined ||
       (typeof t.stashdb === "string" && UUID_RE.test(t.stashdb))) &&
+    (t.tmdb === undefined ||
+      (typeof t.tmdb === "string" && isCatalogId("tmdb", t.tmdb))) &&
     (t.tpdb !== undefined ||
       t.stashdb !== undefined ||
+      t.tmdb !== undefined ||
       normalizeFacetName(t.name) !== "")
   );
 }
 
-/** One selection per exact folded label, sharing the catalog's tag identity
- * rule. First published spelling wins; both provider ids survive. */
+/** Deduplicate native selections without merging unrelated same-named tags. */
 function consolidateTagSelections(
   items: CatalogTagSelection[],
 ): CatalogTagSelection[] {
-  const byLabel = new Map<string, CatalogTagSelection>();
-  for (const s of items) {
-    const key = normalizeFacetName(s.name) || s.name.trim().toLowerCase();
-    const prior = byLabel.get(key);
-    byLabel.set(
-      key,
-      prior
-        ? {
-            name: prior.name,
-            tpdb: prior.tpdb ?? s.tpdb,
-            stashdb: prior.stashdb ?? s.stashdb,
-          }
-        : s,
-    );
+  const byIdentity = new Map<string, CatalogTagSelection>();
+  for (const selection of items) {
+    const key = tagSelectionKey(selection);
+    if (!byIdentity.has(key)) byIdentity.set(key, selection);
   }
-  return [...byLabel.values()];
+  return [...byIdentity.values()];
 }
 
 /** Shared trust boundary for picker-supplied tag lists: the browse API's
@@ -2073,7 +2160,7 @@ function consolidateTagSelections(
  * no database access, safe before storage is initialized. Any wrong type,
  * unknown field, or a label-only selection whose label normalizes to
  * nothing (it can never match a tag) is invalid_preferences; valid
- * duplicates consolidate and the consolidated list is capped at 25. */
+ * duplicates consolidate by provider identity and the list is capped at 25. */
 export function parseTagSelections(input: unknown): CatalogTagSelection[] {
   if (!Array.isArray(input)) {
     throw new AppError(
@@ -2095,6 +2182,7 @@ export function parseTagSelections(input: unknown): CatalogTagSelection[] {
         typeof raw.name === "string" &&
         raw.tpdb === undefined &&
         raw.stashdb === undefined &&
+        raw.tmdb === undefined &&
         normalizeFacetName(raw.name) === "";
       throw new AppError(
         400,
@@ -2104,9 +2192,10 @@ export function parseTagSelections(input: unknown): CatalogTagSelection[] {
           : "each tag selection needs a label of 1..120 characters",
       );
     }
-    // Plain copies: only name/tpdb/stashdb survive the boundary.
+    // Plain copies retain only the label and its explicit provider IDs.
     items.push({
       name: raw.name.trim(),
+      ...(raw.tmdb !== undefined ? { tmdb: raw.tmdb } : {}),
       tpdb: raw.tpdb?.toLowerCase(),
       stashdb: raw.stashdb?.toLowerCase(),
     });
@@ -2183,6 +2272,7 @@ function parseStoredHiddenTags(json: string): CatalogTagSelection[] {
     (s) =>
       s.tpdb !== undefined ||
       s.stashdb !== undefined ||
+      s.tmdb !== undefined ||
       normalizeFacetName(s.name) !== "",
   );
 }
@@ -2191,7 +2281,8 @@ function parseStoredHiddenTags(json: string): CatalogTagSelection[] {
  * the session's own account; there is deliberately no list-everyone variant. */
 export function getContentPreferences(accountId: string): ContentPreferences {
   const row = S().getPreferences.get(accountId) as
-    { hidden_tags: string; discover_order: string } | undefined;
+    | { hidden_tags: string; discover_order: string; personal_settings: string }
+    | undefined;
   if (!row) {
     throw new AppError(404, "account_not_found", "account not found");
   }
@@ -2199,6 +2290,8 @@ export function getContentPreferences(accountId: string): ContentPreferences {
   return {
     hiddenTags: parseStoredHiddenTags(row.hidden_tags),
     discoverOrder: effectiveDiscoverOrder(JSON.parse(row.discover_order)),
+    ...defaultPersonalSettings(),
+    ...JSON.parse(row.personal_settings),
   };
 }
 
@@ -2212,42 +2305,64 @@ export function saveContentPreferences(
   accountId: string,
   input: unknown,
 ): ContentPreferences {
-  const account = S().getAccount.get(accountId) as AccountRow | undefined;
-  if (!account) {
-    throw new AppError(404, "account_not_found", "account not found");
-  }
-  if (!input || typeof input !== "object" || Array.isArray(input)) {
+  const current = getContentPreferences(accountId);
+  if (!input || typeof input !== "object" || Array.isArray(input))
     throw new AppError(
       400,
       "invalid_preferences",
-      "preferences must be an object with hiddenTags and/or discoverOrder",
+      "Preferences must be an object",
     );
-  }
   const doc = input as Record<string, unknown>;
-  const hasTags = "hiddenTags" in doc;
-  const hasOrder = "discoverOrder" in doc;
+  const allowed = [
+    "hiddenTags",
+    "discoverOrder",
+    "includeTags",
+    "applyIncludeTags",
+    "personalizeDiscover",
+    "browseRowLimit",
+    "appearance",
+  ];
   if (
-    (!hasTags && !hasOrder) ||
-    Object.keys(doc).some((k) => k !== "hiddenTags" && k !== "discoverOrder")
-  ) {
+    Object.keys(doc).length === 0 ||
+    Object.keys(doc).some((key) => !allowed.includes(key))
+  )
     throw new AppError(
       400,
       "invalid_preferences",
-      "preferences must be an object with hiddenTags and/or discoverOrder",
+      "Unknown or empty preferences patch",
+    );
+  const hiddenTags =
+    "hiddenTags" in doc
+      ? parseTagSelections(doc.hiddenTags)
+      : current.hiddenTags;
+  const discoverOrder =
+    "discoverOrder" in doc
+      ? parseDiscoverOrder(doc.discoverOrder)
+      : current.discoverOrder;
+  const includeTags =
+    "includeTags" in doc
+      ? parseTagSelections(doc.includeTags)
+      : current.includeTags;
+  let settings;
+  try {
+    settings = {
+      ...parsePersonalSettings({ ...current, ...doc }),
+      includeTags,
+    };
+  } catch (error) {
+    throw new AppError(
+      400,
+      "invalid_preferences",
+      error instanceof Error ? error.message : "Invalid preferences",
     );
   }
-  const hiddenTags = hasTags
-    ? parseTagSelections(doc.hiddenTags)
-    : parseStoredHiddenTags(account.hidden_tags);
-  const discoverOrder = hasOrder
-    ? parseDiscoverOrder(doc.discoverOrder)
-    : (JSON.parse(account.discover_order) as DiscoverShelfId[]);
   S().updatePreferences.run(
     JSON.stringify(hiddenTags),
     JSON.stringify(discoverOrder),
+    JSON.stringify(settings),
     accountId,
   );
-  return { hiddenTags, discoverOrder: effectiveDiscoverOrder(discoverOrder) };
+  return getContentPreferences(accountId);
 }
 
 /** Durable request view, filtered by the viewer's role: requesters see only
@@ -2791,6 +2906,7 @@ export function recoverAbandonedWork(): void {
 }
 
 export function closeStorage(): void {
+  setHttpPolicy(undefined);
   stmts = null;
   if (db) {
     try {

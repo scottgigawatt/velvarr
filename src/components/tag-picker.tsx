@@ -12,6 +12,7 @@
 import { useEffect, useRef, useState, type KeyboardEvent } from "react";
 import {
   normalizeFacetName,
+  tagSelectionKey,
   type BrowseTagsResponse,
   type CatalogTagSelection,
 } from "../lib/contracts.ts";
@@ -35,20 +36,27 @@ function realTag(t: CatalogTagSelection): boolean {
     t.name.trim().length > 0 &&
     t.name.length <= 120 &&
     ((typeof t.tpdb === "string" && UUID_RE.test(t.tpdb)) ||
-      (typeof t.stashdb === "string" && UUID_RE.test(t.stashdb)))
+      (typeof t.stashdb === "string" && UUID_RE.test(t.stashdb)) ||
+      (typeof t.tmdb === "string" && /^[1-9][0-9]*$/.test(t.tmdb)))
   );
 }
 
 /** The typed term itself: a selection with no provider id, workable only
  * where matching runs locally. */
 function isFreeText(t: CatalogTagSelection): boolean {
-  return t.tpdb === undefined && t.stashdb === undefined;
+  return (
+    t.tpdb === undefined && t.stashdb === undefined && t.tmdb === undefined
+  );
 }
 
 /** Where a tag exists, in library terms: TPDB publishes movies, StashDB
  * scenes; both references means both. */
 function sources(t: CatalogTagSelection): string {
-  return [t.tpdb !== undefined && "Movies", t.stashdb !== undefined && "Scenes"]
+  return [
+    t.tpdb !== undefined && "TPDB",
+    t.stashdb !== undefined && "StashDB",
+    t.tmdb !== undefined && "TMDB",
+  ]
     .filter((s): s is string => typeof s === "string")
     .join(", ");
 }
@@ -61,6 +69,7 @@ export function TagPicker({
   description,
   disabled,
   allowFreeText = false,
+  provider,
 }: {
   id: string;
   label: string;
@@ -77,7 +86,10 @@ export function TagPicker({
    * carries no provider id, so it can never travel as an exact native
    * tag. */
   allowFreeText?: boolean;
+  provider?: "tmdb" | "tpdb" | "stashdb";
 }) {
+  const [tagSource, setTagSource] = useState<"tmdb" | undefined>(undefined);
+  const effectiveProvider = provider ?? tagSource;
   const [term, setTerm] = useState("");
   const [open, setOpen] = useState(false);
   const [active, setActive] = useState(0);
@@ -101,15 +113,13 @@ export function TagPicker({
   const { data, error, loading } = useApiGet<BrowseTagsResponse>(
     disabled || capped || committed === null
       ? null
-      : `/api/browse/tags?q=${encodeURIComponent(committed)}`,
-    [committed],
+      : `/api/browse/tags?q=${encodeURIComponent(committed)}${effectiveProvider ? "&provider=" + effectiveProvider : ""}`,
+    [committed, effectiveProvider],
   );
 
-  const picked = new Set(selected.map((s) => normalizeFacetName(s.name)));
+  const picked = new Set(selected.map(tagSelectionKey));
   const take = (rows: CatalogTagSelection[] | undefined) =>
-    (rows ?? []).filter(
-      (r) => realTag(r) && !picked.has(normalizeFacetName(r.name)),
-    );
+    (rows ?? []).filter((r) => realTag(r) && !picked.has(tagSelectionKey(r)));
   // A failed search hides the previous list; a partial source failure keeps
   // the returned tags and says so below.
   const current = committed === t && !loading;
@@ -127,7 +137,7 @@ export function TagPicker({
     t.length >= 2 &&
     t.length <= 120 &&
     normalizeFacetName(t) !== "" &&
-    !picked.has(normalizeFacetName(t))
+    !picked.has(tagSelectionKey({ name: t }))
       ? { name: t }
       : null;
   // Exact real-tag matches go above the pinned free-text row: the default
@@ -151,7 +161,7 @@ export function TagPicker({
   const showList = open && choices.length > 0;
 
   function pick(tag: CatalogTagSelection) {
-    if (disabled || capped || picked.has(normalizeFacetName(tag.name))) return;
+    if (disabled || capped || picked.has(tagSelectionKey(tag))) return;
     onChange([...selected, tag]);
     setTerm("");
     setOpen(false);
@@ -186,6 +196,22 @@ export function TagPicker({
 
   return (
     <div>
+      {provider === undefined && (
+        <label className="label" htmlFor={id + "-source"}>
+          Tag catalog
+          <select
+            id={id + "-source"}
+            className="input"
+            value={tagSource ?? "combined"}
+            onChange={(event) =>
+              setTagSource(event.target.value === "tmdb" ? "tmdb" : undefined)
+            }
+          >
+            <option value="combined">TPDB and StashDB</option>
+            <option value="tmdb">TMDB keywords</option>
+          </select>
+        </label>
+      )}
       <label className="label" htmlFor={id}>
         {label}
       </label>
@@ -257,14 +283,7 @@ export function TagPicker({
                 // loaded tag; the label-only row needs its own key.
                 const free = isFreeText(tag);
                 return (
-                  <li
-                    key={
-                      free
-                        ? `free:${normalizeFacetName(tag.name)}`
-                        : normalizeFacetName(tag.name)
-                    }
-                    role="presentation"
-                  >
+                  <li key={tagSelectionKey(tag)} role="presentation">
                     <button
                       type="button"
                       role="option"
@@ -309,7 +328,7 @@ export function TagPicker({
           aria-label={`Selected ${label}`}
         >
           {selected.map((tag, i) => (
-            <li key={normalizeFacetName(tag.name)}>
+            <li key={tagSelectionKey(tag)}>
               <button
                 type="button"
                 className="chip"
@@ -322,7 +341,11 @@ export function TagPicker({
                 {isFreeText(tag) && (
                   <span className="text-muted">Free text:</span>
                 )}
-                {tag.name} <span aria-hidden="true">×</span>
+                {tag.name}{" "}
+                {!isFreeText(tag) && (
+                  <span className="text-muted">({sources(tag)})</span>
+                )}{" "}
+                <span aria-hidden="true">×</span>
               </button>
             </li>
           ))}
