@@ -61,7 +61,7 @@ export function judgmentConfiguration(options?: JudgmentOptions): {
   const errors: string[] = [];
   if (provider !== providerRaw) {
     errors.push(
-      `VELVARR_JUDGMENT_PROVIDER has an invalid value ${JSON.stringify(providerRaw)}; judgment features stay disabled until it is "typesafe" or "ollama".`,
+      `VELVARR_JUDGMENT_PROVIDER has an invalid value ${JSON.stringify(providerRaw)}; judgment features stay disabled until it is "none", "typesafe", or "ollama".`,
     );
   }
   const rawUrl =
@@ -95,7 +95,9 @@ export function judgmentConfiguration(options?: JudgmentOptions): {
   const keyPresent = Boolean(
     stored?.typesafeApiKey?.trim() || process.env.TYPESAFE_API_KEY?.trim(),
   );
-  const valid = errors.length === 0;
+  // Disabled AI must not be blocked by settings for an unused backend.
+  const activeErrors = provider === "none" ? [] : errors;
+  const valid = activeErrors.length === 0;
   return {
     provider,
     url,
@@ -106,7 +108,7 @@ export function judgmentConfiguration(options?: JudgmentOptions): {
       stored?.judgmentProvider !== undefined ||
       stored?.ollamaUrl !== undefined ||
       stored?.ollamaModel !== undefined,
-    ...(errors.length > 0 ? { error: errors.join(" ") } : {}),
+    ...(activeErrors.length > 0 ? { error: activeErrors.join(" ") } : {}),
   };
 }
 
@@ -179,6 +181,12 @@ export function judgmentConfigured(options?: JudgmentOptions): boolean {
 /** Probe the configured model with one bounded decision, without catalog data. */
 export async function checkJudgmentConnection(options?: JudgmentOptions) {
   const settings = judgmentConfiguration(options);
+  if (settings.provider === "none")
+    return {
+      provider: settings.provider,
+      connected: false,
+      error: "AI-assisted matching is disabled.",
+    };
   if (settings.error !== undefined)
     return {
       provider: settings.provider,

@@ -697,6 +697,26 @@ export async function updateWhisparrConnections(
   return json({ connections: connectionShapes(getConfig()!) });
 }
 
+/**
+ * Provider rejection is status feedback. Returning HTTP 401 here would trigger
+ * the client's global sign-out even though its Velvarr session is still valid.
+ */
+export async function adminProvider(provider: string): Promise<Response> {
+  if (provider !== "tpdb" && provider !== "tmdb" && provider !== "stashdb")
+    throw new AppError(400, "invalid_query", "Unknown metadata provider.");
+  try {
+    return json(await getProviderStatus(provider));
+  } catch (error) {
+    if (!(error instanceof AppError)) throw error;
+    return json({
+      provider,
+      configured: true,
+      verified: false,
+      error: { code: error.code, message: error.message },
+    });
+  }
+}
+
 import type { RouteDef } from "../admission.ts";
 
 export const routes: RouteDef[] = [
@@ -704,25 +724,7 @@ export const routes: RouteDef[] = [
     method: "GET",
     segments: ["admin", "providers", ":provider"],
     auth: "admin",
-    run: async (_ctx, _request, params) => {
-      if (!["tpdb", "tmdb", "stashdb"].includes(params.provider ?? ""))
-        throw new AppError(400, "invalid_query", "Unknown provider");
-      try {
-        return json(
-          await getProviderStatus(
-            params.provider as "tpdb" | "tmdb" | "stashdb",
-          ),
-        );
-      } catch (error) {
-        if (!(error instanceof AppError)) throw error;
-        return json({
-          provider: params.provider,
-          configured: true,
-          verified: false,
-          error: { code: error.code, message: error.message },
-        });
-      }
-    },
+    run: async (_ctx, _request, params) => adminProvider(params.provider!),
   },
   {
     method: "GET",
