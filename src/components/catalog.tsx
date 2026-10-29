@@ -1729,7 +1729,7 @@ function SingleTitlesView() {
             selected={include}
             onChange={onInclude}
             allowFreeText
-            description="Match every included tag from the result’s provider. Free-text terms apply across providers."
+            description="Match every included tag from the result’s provider. A typed term matches tag names across providers; an exact tag published by both providers matches exactly on both."
           />
           <TagPicker
             id="titles-exclude"

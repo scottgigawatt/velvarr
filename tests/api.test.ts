@@ -16,6 +16,7 @@ import {
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { rmTempDir } from "./setup.ts";
 import { Buffer } from "node:buffer";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -5479,6 +5480,92 @@ test("one follow covers both metadata sources, lists the performer once, and unf
   );
 });
 
+test("a counterpart already followed on its own still folds into one 201 follow", async () => {
+  // The documented benign conflict: the StashDB side is followed standalone
+  // first, so the counterpart insert hits the unique conflict and stays
+  // swallowed — the pair still answers 201 and lists as one identity.
+  const standalone = await call("POST", "/api/follows", {
+    cookie: member2,
+    body: {
+      performer: {
+        provider: "stashdb",
+        kind: "performer",
+        id: STASH_PERFORMER2,
+      },
+      name: "Linked Fixture Performer",
+    },
+  });
+  assert.equal(standalone.status, 201);
+  const paired = await call("POST", "/api/follows", {
+    cookie: member2,
+    body: {
+      performer: { provider: "tpdb", kind: "performer", id: TPDB_PERFORMER4 },
+      name: "Linked Fixture Performer",
+    },
+  });
+  assert.equal(paired.status, 201);
+  const listed = await call("GET", "/api/follows", { cookie: member2 });
+  // Wire JSON boundary: the suite's FollowShape list, cast once by name.
+  const listedBody = (await listed.json()) as { follows: FollowShape[] };
+  assert.equal(
+    listedBody.follows.filter(
+      (f) =>
+        f.reference.id === TPDB_PERFORMER4 ||
+        f.reference.id === STASH_PERFORMER2,
+    ).length,
+    1,
+  );
+  // Unfollowing the pair restores the baseline for later tests.
+  const dropped = await call(
+    "DELETE",
+    `/api/follows/stashdb/${STASH_PERFORMER2}`,
+    { cookie: member2 },
+  );
+  assert.equal(dropped.status, 204);
+});
+
+test("a counterpart write failure surfaces a named error instead of a fake 201", async () => {
+  // A real storage fault, not a provider outage: a trigger aborts only the
+  // counterpart row's insert. That abort is not a unique conflict, so the
+  // route must refuse with a named error rather than answer 201 with the
+  // pair half-recorded.
+  const db = new DatabaseSync(join(apiDataDir, "velvarr.sqlite"));
+  db.exec(
+    `CREATE TRIGGER velv54_counterpart_fault BEFORE INSERT ON performer_follows
+     WHEN NEW.account_id = '${MEMBER2_ID}' AND NEW.provider = 'stashdb'
+       AND NEW.external_id = '${STASH_PERFORMER2}'
+     BEGIN SELECT RAISE(ABORT, 'sabotaged counterpart insert'); END`,
+  );
+  try {
+    const created = await call("POST", "/api/follows", {
+      cookie: member2,
+      body: {
+        performer: {
+          provider: "tpdb",
+          kind: "performer",
+          id: TPDB_PERFORMER4,
+        },
+        name: "Linked Fixture Performer",
+      },
+    });
+    assert.equal(created.status, 500);
+    assert.equal((await errorShape(created, 500)).code, "internal");
+  } finally {
+    db.exec("DROP TRIGGER velv54_counterpart_fault");
+    db.close();
+  }
+  // The asked-for follow stands after the surfaced failure; drop it again so
+  // later tests see the unchanged baseline.
+  const listed = await call("GET", "/api/follows", { cookie: member2 });
+  // Wire JSON boundary: the suite's FollowShape list, cast once by name.
+  const listedBody = (await listed.json()) as { follows: FollowShape[] };
+  assert.ok(listedBody.follows.some((f) => f.reference.id === TPDB_PERFORMER4));
+  const dropped = await call("DELETE", `/api/follows/tpdb/${TPDB_PERFORMER4}`, {
+    cookie: member2,
+  });
+  assert.equal(dropped.status, 204);
+});
+
 test("a user merge folds two standalone follows into one identity", async () => {
   // No provider publishes a URL between these entries, so each follow goes
   // in standalone (the counterpart lookup resolves nothing to pair).
@@ -5637,6 +5724,62 @@ test("a merge auto-follows the current performer without partial writes on a pro
       cookie: member2,
     });
   }
+});
+
+test("a follow survives a counterpart-lookup outage and names the failure", async () => {
+  const performer = {
+    provider: "tpdb",
+    kind: "performer",
+    id: TPDB_PERFORMER3,
+  };
+  const listed = async () => {
+    const res = await call("GET", "/api/follows", { cookie: member2 });
+    assert.equal(res.status, 200);
+    const body: { follows: FollowShape[] } = await res.json();
+    return body.follows;
+  };
+  const baseline = await listed();
+  try {
+    resetMetaCache();
+    tpdbFx.failPaths = [`/performers/${TPDB_PERFORMER3}`];
+    const created = await call("POST", "/api/follows", {
+      cookie: member2,
+      body: { performer, name: "Bulk Fixture Performer" },
+    });
+    // The follow itself survives the outage: 201, unpaired — but the 201
+    // names the pairing failure beside it, so the outage never reads as
+    // "the providers published no link".
+    assert.equal(created.status, 201);
+    const createdBody = (await created.json()) as {
+      follow: FollowShape;
+      errors?: { code: string; message: string }[];
+    };
+    assert.deepEqual(createdBody.follow.reference, performer);
+    assert.equal(createdBody.follow.linked, null);
+    assert.deepEqual(createdBody.errors, [
+      {
+        code: "upstream_unavailable",
+        message: "TPDB reported an unexpected error.",
+      },
+    ]);
+
+    // The stored row is the unpaired follow the outage left behind: the
+    // merge flow can still repair it once the provider answers again.
+    const stored = (await listed()).find(
+      (f) => f.reference.id === TPDB_PERFORMER3,
+    );
+    assert.ok(stored);
+    assert.equal(stored.linked, null);
+  } finally {
+    tpdbFx.failPaths = [];
+    resetMetaCache();
+  }
+  // Cleanup: unfollow the outage's row, so later tests keep the baseline.
+  const dropped = await call("DELETE", `/api/follows/tpdb/${TPDB_PERFORMER3}`, {
+    cookie: member2,
+  });
+  assert.equal(dropped.status, 204);
+  assert.deepEqual(await listed(), baseline);
 });
 
 test("a merge auto-follows the StashDB side without partial writes on a provider failure", async () => {

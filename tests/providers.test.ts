@@ -37,6 +37,7 @@ import {
   searchCatalogTags,
   studioCounterpart,
   tagCounterpart,
+  tagWalkStateForTest,
   warmCatalogTagListing,
 } from "../src/server/providers.ts";
 import type {
@@ -1127,6 +1128,48 @@ test("stashdb graphql resolver failures read as outages, not absence", async () 
       }),
       (err: unknown) => {
         assertProviderError(err, 502, "upstream_bad_response");
+        return true;
+      },
+    );
+  } finally {
+    await fixture.close();
+    restore();
+  }
+});
+
+// Provider error text is lower-trust upstream content: the client-facing
+// message is flattened and capped at construction, never echoed verbatim.
+test("stashdb graphql error text is bounded and control-character free on the wire", async () => {
+  const restore = setEnv({ STASHDB_API_KEY: STASH_TOKEN });
+  const hostile = "boom\n\t explained: " + "x".repeat(5000);
+  const fixture = await startFixture((_req, res, body) => {
+    const parsed = JSON.parse(body) as { query: string };
+    if (parsed.query.includes("findScene")) {
+      sendJson(res, 200, { data: null, errors: [{ message: hostile }] });
+      return;
+    }
+    sendJson(res, 200, { data: {} });
+  });
+  try {
+    process.env.STASHDB_BASE_URL = fixture.origin;
+    await assert.rejects(
+      getCatalogDetail({
+        provider: "stashdb",
+        kind: "scene",
+        id: STASH_SCENE_ID,
+      }),
+      (err: unknown) => {
+        assertProviderError(err, 502, "upstream_bad_response");
+        const message = (err as AppError).message;
+        assert.match(message, /boom/);
+        assert.ok(
+          !/[\u0000-\u001f\u007f]/.test(message),
+          `control character reached the wire: ${JSON.stringify(message)}`,
+        );
+        assert.ok(
+          message.length <= 250,
+          `wire message unbounded, got ${message.length} chars`,
+        );
         return true;
       },
     );
@@ -2832,12 +2875,15 @@ test("a picker miss on a listing past the completeness window falls back to the 
     assert.equal(nativeReads, 1);
     // Two hours in: the memo is past the completeness window but well
     // inside the suggestion window. A miss must not claim absence over the
-    // month-old copy — the native search answers, and no walk is paid.
+    // month-old copy — the native search answers. The keystroke also
+    // re-walks the aged listing in the background (moved pin: it used to
+    // pay no walk), so the browse a pick leads to finds a fresh listing.
     Date.now = () => realNow() + 2 * 60 * 60_000;
     assert.deepEqual(await searchCatalogTags("tpdb", "nova"), [
       { id: TAG_B, name: "Nova" },
     ]);
-    assert.equal(walks, 1);
+    await warmCatalogTagListing("tpdb");
+    assert.equal(walks, 2);
     assert.equal(nativeReads, 2);
     // Thirty-one days in: even the suggestion window has expired, so the
     // keystroke answers natively again and the background re-warm brings
@@ -2849,7 +2895,7 @@ test("a picker miss on a listing past the completeness window falls back to the 
     ]);
     assert.equal(nativeReads, 3);
     await warmCatalogTagListing("tpdb");
-    assert.equal(walks, 2);
+    assert.equal(walks, 3);
     assert.deepEqual(await searchCatalogTags("tpdb", "nova"), []);
     assert.equal(nativeReads, 3);
   } finally {
@@ -2885,6 +2931,250 @@ test("a cold tag search answers from the native search while the listing walk wa
       { id: LISTING_ID, name: "Alpha Listing" },
     ]);
   } finally {
+    await fixture.close();
+    restore();
+  }
+});
+
+test("the expansion listing walk is shared, reads pages ahead, and refreshes before its window expires", async () => {
+  const restore = setEnv({ STASHDB_API_KEY: STASH_TOKEN });
+  const tags = Array.from({ length: 1200 }, (_, i) => ({
+    id: `d0d00000-0000-4000-8000-${String(i).padStart(12, "0")}`,
+    name: `Tag ${i}`,
+  }));
+  let reads = 0;
+  let inFlight = 0;
+  let maxInFlight = 0;
+  const fixture = await startFixture((_req, res, body) => {
+    const parsed = JSON.parse(body) as { variables?: { p?: number } };
+    const p = parsed.variables?.p ?? 1;
+    reads += 1;
+    inFlight += 1;
+    maxInFlight = Math.max(maxInFlight, inFlight);
+    // A real 20 ms hold per page: concurrency is only observable while
+    // responses are still open, which no fake clock can drive over HTTP.
+    setTimeout(() => {
+      inFlight -= 1;
+      sendJson(res, 200, {
+        data: {
+          queryTags: {
+            count: tags.length,
+            tags: tags.slice((p - 1) * 100, p * 100),
+          },
+        },
+      });
+    }, 20);
+  });
+  const realNow = Date.now;
+  const expected = tags
+    .filter((t) => t.name.toLowerCase().includes("tag 1"))
+    .map((t) => t.id);
+  try {
+    process.env.STASHDB_BASE_URL = fixture.origin;
+    // Two expansions at once (two terms, or a browse beside a counterpart
+    // lookup) join one walk: 12 pages, never 24.
+    const [a, b] = await Promise.all([
+      expandCatalogTagTerm("stashdb", "tag 1"),
+      expandCatalogTagTerm("stashdb", "Tag 1"),
+    ]);
+    assert.deepEqual(a, { ids: expected, dropped: false, complete: true });
+    assert.deepEqual(b, a);
+    assert.equal(reads, 12);
+    // Page 1's count lets the walk read ahead, within the fan-out bound.
+    assert.ok(maxInFlight > 1 && maxInFlight <= 5, `in flight ${maxInFlight}`);
+    // Forty-five minutes in: still inside the completeness window, so the
+    // expansion answers from the memo without waiting on upstream, while a
+    // background walk refreshes it ahead of expiry.
+    Date.now = () => realNow() + 45 * 60_000;
+    assert.deepEqual(await expandCatalogTagTerm("stashdb", "tag 1"), a);
+    assert.ok(reads < 24, "the memo answered before the refresh finished");
+    await warmCatalogTagListing("stashdb"); // joins the refresh in flight
+    assert.equal(reads, 24);
+    // The refreshed memo is fresh: the next read pays nothing.
+    assert.deepEqual(await expandCatalogTagTerm("stashdb", "tag 1"), a);
+    assert.equal(reads, 24);
+  } finally {
+    Date.now = realNow;
+    await fixture.close();
+    restore();
+  }
+});
+
+test("the listing walk stops at the 50-page ceiling and reports the rows incomplete", async () => {
+  // A degraded provider serving fewer valid rows per page than requested
+  // must not hold the walk open past the documented 50-page bound: the
+  // row cap counts validated rows, so one surviving row per page would
+  // otherwise keep the walk going for thousands of awaited pages.
+  const restoreStash = setEnv({ STASHDB_API_KEY: STASH_TOKEN });
+  let stashReads = 0;
+  const stash = await startFixture((_req, res, body) => {
+    const parsed = JSON.parse(body) as { variables?: { p?: number } };
+    const p = parsed.variables?.p ?? 1;
+    stashReads += 1;
+    // count still claims far more than the row cap, so only a page cap
+    // can end this walk.
+    sendJson(res, 200, {
+      data: {
+        queryTags: {
+          count: 100_000,
+          tags: [
+            {
+              id: `d0d00000-0000-4000-8000-${String(p).padStart(12, "0")}`,
+              name: `Tag ${p}`,
+            },
+          ],
+        },
+      },
+    });
+  });
+  try {
+    process.env.STASHDB_BASE_URL = stash.origin;
+    const stashExpansion = await expandCatalogTagTerm("stashdb", "tag");
+    assert.equal(stashReads, 50, `stashdb walk read ${stashReads} pages`);
+    assert.equal(stashExpansion.complete, false);
+  } finally {
+    await stash.close();
+    restoreStash();
+  }
+
+  // The TPDB walk has no count at all (no meta total here, so the read
+  // stays sequential): links.next must not chain past the page cap.
+  const restoreTpdb = setEnv({ TPDB_API_TOKEN: TPDB_TOKEN });
+  let tpdbReads = 0;
+  const tpdb = await startFixture((req, res) => {
+    const url = new URL(req.url ?? "/", "http://fixture.test");
+    if (url.pathname !== "/tags") return sendJson(res, 404, {});
+    const p = Number(url.searchParams.get("page") ?? "1");
+    tpdbReads += 1;
+    sendJson(res, 200, {
+      data: [
+        {
+          id: 1000 + p,
+          uuid: `d0d10000-0000-4000-8000-${String(p).padStart(12, "0")}`,
+          name: `Tag ${p}`,
+        },
+      ],
+      links: { next: `https://fixture.test/tags?page=${p + 1}` },
+    });
+  });
+  try {
+    process.env.TPDB_BASE_URL = tpdb.origin;
+    const tpdbExpansion = await expandCatalogTagTerm("tpdb", "tag");
+    assert.equal(tpdbReads, 50, `tpdb walk read ${tpdbReads} pages`);
+    assert.equal(tpdbExpansion.complete, false);
+  } finally {
+    await tpdb.close();
+    restoreTpdb();
+  }
+});
+
+// A failed walk arms a per-provider cooldown: the picker's keystrokes and
+// the refresh-ahead read re-walk nothing until the window passes, so an
+// outage is not prolonged by one fresh burst per keystroke. Foreground cold
+// reads still try — the named error surfaces — and re-arm the window.
+test("a failed listing walk cools the background re-walks down before the next keystroke", async () => {
+  const restore = setEnv({ TPDB_API_TOKEN: TPDB_TOKEN });
+  const healthyRows = [
+    { id: 70, uuid: TPDB_TAG_A, name: "Anna" },
+    { id: 194, uuid: TPDB_TAG_B, name: "Annabella" },
+  ];
+  const expected = {
+    ids: [TPDB_TAG_A, TPDB_TAG_B],
+    dropped: false,
+    complete: true,
+  };
+  let walkReads = 0;
+  // Walk reads start in a held 503; the test releases the first one so the
+  // keystroke's background walk can be joined deterministically. The
+  // refresh-ahead phase fails with 404: an authoritative status bypasses
+  // the stale-on-error fallback, so the walk really fails although the
+  // healthy read before it is still in the metadata cache.
+  let mode: "held503" | "open503" | "ok" | "open404" = "held503";
+  let releaseWalk: () => void = () => {};
+  const walkGate = new Promise<void>((resolve) => {
+    releaseWalk = resolve;
+  });
+  const fixture = await startFixture((req, res) => {
+    const url = new URL(req.url ?? "/", "http://fixture.test");
+    if (url.pathname !== "/tags") return sendJson(res, 404, {});
+    // The walk reads the bare listing; the picker's native fallback carries q.
+    if (url.searchParams.has("q")) {
+      return sendJson(res, 200, {
+        data: [],
+        links: { next: null },
+        meta: { total: 0 },
+      });
+    }
+    walkReads += 1;
+    if (mode === "ok") {
+      return sendJson(res, 200, {
+        data: healthyRows,
+        links: { next: null },
+        meta: { total: healthyRows.length },
+      });
+    }
+    if (mode === "held503") {
+      void walkGate.then(() => sendJson(res, 503, {}));
+      return;
+    }
+    sendJson(res, mode === "open404" ? 404 : 503, {});
+  });
+  const realNow = Date.now;
+  let offsetMs = 0;
+  try {
+    process.env.TPDB_BASE_URL = fixture.origin;
+    Date.now = () => realNow() + offsetMs;
+    // Cold memo: the keystroke fires the background walk (held on the gate)
+    // and answers from the native search.
+    assert.deepEqual(await searchCatalogTags("tpdb", "anna"), []);
+    const warm = warmCatalogTagListing("tpdb"); // joins the held walk
+    releaseWalk(); // the walk fails with 503 and arms the cooldown
+    await warm;
+    assert.deepEqual(tagWalkStateForTest("tpdb"), {
+      coolingDown: true,
+      walkInFlight: false,
+    });
+    assert.equal(walkReads, 1);
+    // The next keystroke inside the cooldown window re-walks nothing.
+    assert.deepEqual(await searchCatalogTags("tpdb", "anna"), []);
+    assert.deepEqual(tagWalkStateForTest("tpdb"), {
+      coolingDown: true,
+      walkInFlight: false,
+    });
+    assert.equal(walkReads, 1);
+    // A foreground cold read may still try: the named error surfaces.
+    await assert.rejects(
+      expandCatalogTagTerm("tpdb", "anna"),
+      (err: unknown) => {
+        assertProviderError(err, 502, "upstream_unavailable", 503);
+        return true;
+      },
+    );
+    assert.equal(walkReads, 2);
+    // Past the window the background warm tries again.
+    offsetMs = 46_000;
+    await warmCatalogTagListing("tpdb");
+    assert.equal(walkReads, 3);
+    // The provider recovers: a foreground cold read walks and memoizes.
+    mode = "ok";
+    assert.deepEqual(await expandCatalogTagTerm("tpdb", "anna"), expected);
+    assert.equal(walkReads, 4);
+    // Thirty-one minutes in, a failure during the refresh-ahead read
+    // re-arms the cooldown: the next expansion answers from the memo and
+    // starts no background walk.
+    offsetMs = 31 * 60_000;
+    mode = "open404";
+    assert.deepEqual(await expandCatalogTagTerm("tpdb", "anna"), expected);
+    await warmCatalogTagListing("tpdb"); // joins the failed refresh-ahead
+    assert.equal(walkReads, 5);
+    assert.deepEqual(await expandCatalogTagTerm("tpdb", "anna"), expected);
+    assert.deepEqual(tagWalkStateForTest("tpdb"), {
+      coolingDown: true,
+      walkInFlight: false,
+    });
+    assert.equal(walkReads, 5);
+  } finally {
+    Date.now = realNow;
     await fixture.close();
     restore();
   }

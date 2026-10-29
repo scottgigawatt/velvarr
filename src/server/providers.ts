@@ -51,7 +51,13 @@ import {
 //   studio records carry explicit provider URLs, which drive cross-provider
 //   linking; movies and scenes are never linked across providers.
 
-import { AppError, parseJson, requestBytes, requestJsonBytes } from "./http.ts";
+import {
+  AppError,
+  parseJson,
+  requestBytes,
+  requestJsonBytes,
+  shelfError,
+} from "./http.ts";
 import type { Service } from "./http.ts";
 import type {
   CatalogDetail,
@@ -139,7 +145,21 @@ export function resetMetaCache(): void {
   tpdbTagNumbers.clear();
   counterpartMemo.clear();
   tagListingMemo.clear();
-  tagListingWarm.clear();
+  tagListingWalk.clear();
+  tagListingFailedAt.clear();
+}
+
+/** Test seam: the failure cooldown and the walk in flight are module state
+ * the suite must assert without racing loopback reads (a joined walk masks
+ * read counts). */
+export function tagWalkStateForTest(provider: CatalogProvider): {
+  coolingDown: boolean;
+  walkInFlight: boolean;
+} {
+  return {
+    coolingDown: tagWalkCooldownActive(provider),
+    walkInFlight: tagListingWalk.has(provider),
+  };
 }
 
 /** Learns the numeric filter key behind a TPDB tag uuid while rows map.
@@ -327,9 +347,12 @@ function stashGraphQlFailureError(errors: unknown): AppError {
   const first = Array.isArray(errors)
     ? (errors[0] as { message?: unknown } | undefined)
     : undefined;
+  // stash-box message text is lower-trust upstream content and this AppError
+  // message is the client-facing wire text: flatten control characters and
+  // cap the length before it leaves the server.
   const detail =
     typeof first?.message === "string" && first.message !== ""
-      ? `: ${first.message}`
+      ? `: ${first.message.replace(/[\u0000-\u001f\u007f]/g, " ").slice(0, 200)}`
       : "";
   return new AppError(
     502,
@@ -1678,6 +1701,12 @@ export async function getCatalogDetail(
  * hidden. */
 const TAG_EXPANSION_MAX_ROWS = 5000;
 
+/** The same bound in provider pages of 100: the documented ceiling on the
+ * listing walk's awaited page reads. A degraded provider serving fewer
+ * valid rows per page than requested must not hold the walk (and every
+ * free-text browse joining it) open past this many pages. */
+const TAG_EXPANSION_MAX_PAGES = TAG_EXPANSION_MAX_ROWS / 100;
+
 interface TagListing {
   rows: { id: string; name: string }[];
   complete: boolean;
@@ -1702,6 +1731,16 @@ interface TagListing {
 // churns faster.
 const TAG_LISTING_TTL_MS = 60 * 60_000;
 const TAG_SUGGESTION_TTL_MS = 30 * 24 * 60 * 60_000;
+// Past half the completeness window, a read still answers from the memo
+// but re-walks in the background, so steady browsing never waits on a walk:
+// only the first read after a restart or an idle hour pays one.
+const TAG_REFRESH_AHEAD_MS = TAG_LISTING_TTL_MS / 2;
+// After a walk fails, background re-walks (the picker's warm, the
+// refresh-ahead read) pause for this window: one fresh burst per keystroke
+// against a down or rate-limiting provider extends the outage without
+// improving any answer. Foreground cold reads still try — the named error
+// surfaces — and their failure re-arms the window.
+const TAG_WALK_COOLDOWN_MS = 45 * 1000;
 // The tag picker's empty answer must not claim absence over a memo older
 // than the completeness window: searchCatalogTags re-checks the provider
 // natively in that case, so a tag published after the walk still answers.
@@ -1709,10 +1748,68 @@ const tagListingMemo = new Map<
   CatalogProvider,
   { at: number; listing: TagListing }
 >();
-// The picker's cold-path background walk: at most one in flight per
-// provider, so a keystroke burst joins the first warm instead of stacking
-// walks.
-const tagListingWarm = new Map<CatalogProvider, Promise<void>>();
+// The walk in flight per provider: every caller (a browse expansion, a
+// counterpart lookup, the picker's background warm) joins it instead of
+// stacking a second sequential burst behind it.
+const tagListingWalk = new Map<
+  CatalogProvider,
+  Promise<TagListing & { at: number }>
+>();
+// When each provider's last walk failed: background re-walks wait out
+// TAG_WALK_COOLDOWN_MS from this time before they try again.
+const tagListingFailedAt = new Map<CatalogProvider, number>();
+
+function tagWalkCooldownActive(provider: CatalogProvider): boolean {
+  const failedAt = tagListingFailedAt.get(provider);
+  return failedAt !== undefined && Date.now() - failedAt < TAG_WALK_COOLDOWN_MS;
+}
+// Listing pages read at once once page 1 has told the walk where the
+// listing ends. ponytail: fixed fan-out; lower it if a provider starts
+// rate-limiting the burst.
+const TAG_WALK_PARALLEL = 5;
+
+/** In-order page reader for the listing walks. Once `last` is known, each
+ * read starts the next pages up to TAG_WALK_PARALLEL in flight, so a cold
+ * walk costs about 1/TAG_WALK_PARALLEL of the sequential round trips. The
+ * walk's own end rules still decide which rows count; a read never goes
+ * past `last`, and with `last` unknown (1) the walk stays sequential. */
+function tagPageReader<T>(read: (page: number) => Promise<T>): {
+  last: number;
+  at: (page: number) => Promise<T>;
+} {
+  const started = new Map<number, Promise<T>>();
+  const start = (page: number): Promise<T> => {
+    let pending = started.get(page);
+    if (pending === undefined) {
+      pending = read(page);
+      // A read-ahead the walk stops before awaiting must not surface as an
+      // unhandled rejection; an awaited page still throws to the walk.
+      pending.catch(() => {});
+      started.set(page, pending);
+    }
+    return pending;
+  };
+  const reader = {
+    last: 1,
+    at(page: number): Promise<T> {
+      const end = Math.min(page + TAG_WALK_PARALLEL - 1, reader.last);
+      for (let p = page + 1; p <= end; p++) start(p);
+      const pending = start(page);
+      started.delete(page);
+      return pending;
+    },
+  };
+  return reader;
+}
+
+/** The last listing page a walk may read: the provider's row count in
+ * pages of 100, clamped to the row cap. An unusable count keeps 1. */
+function lastTagPage(count: unknown): number {
+  if (typeof count !== "number" || !Number.isInteger(count) || count < 1) {
+    return 1;
+  }
+  return Math.min(Math.ceil(count / 100), TAG_EXPANSION_MAX_ROWS / 100);
+}
 
 /** Shared StashDB tag-row parsing for the flat [Tag] {id, name} shapes
  * (searchTag, queryTags): validated, deduplicated by id. */
@@ -1737,24 +1834,58 @@ function stashTagRows(rows: unknown[]): { id: string; name: string }[] {
  * match with prefix and fuzzy distance on name/aliases, TPDB's `q` is
  * documented only as a "search query" — which guarantees neither mid-word
  * substrings nor every row below its cap. `complete` is false when the walk
- * hit its row cap or ended on a rows-less page the provider's own end
- * signal contradicts; callers must then treat the rows as possibly missing
- * matches. */
+ * hit its row cap or page ceiling (50 pages of 100) or ended on a
+ * rows-less page the provider's own end signal contradicts; callers must
+ * then treat the rows as possibly missing matches. */
 async function catalogTagListing(
   provider: CatalogProvider,
-  maxAgeMs: number = TAG_LISTING_TTL_MS,
 ): Promise<TagListing & { at: number }> {
   const memo = tagListingMemo.get(provider);
-  if (memo !== undefined && Date.now() - memo.at < maxAgeMs) {
-    return { ...memo.listing, at: memo.at };
+  const age = memo === undefined ? Infinity : Date.now() - memo.at;
+  if (memo === undefined || age >= TAG_LISTING_TTL_MS) {
+    return joinTagListingWalk(provider);
   }
+  // Refresh ahead: the memo still answers inside the completeness window,
+  // while the background walk keeps it fresh for the reads after this one.
+  // A failed refresh leaves the memo as it is; a failed walk pauses the
+  // background refreshes for TAG_WALK_COOLDOWN_MS.
+  if (age >= TAG_REFRESH_AHEAD_MS && !tagWalkCooldownActive(provider)) {
+    joinTagListingWalk(provider).catch(() => {});
+  }
+  return { ...memo.listing, at: memo.at };
+}
+
+/** Starts the provider's listing walk, or joins the one in flight. */
+function joinTagListingWalk(
+  provider: CatalogProvider,
+): Promise<TagListing & { at: number }> {
+  const pending = tagListingWalk.get(provider);
+  if (pending !== undefined) return pending;
+  const walk = walkTagListing(provider);
+  tagListingWalk.set(provider, walk);
+  const done = () => {
+    if (tagListingWalk.get(provider) === walk) tagListingWalk.delete(provider);
+  };
+  // A rejection arms the cooldown (background re-walks pause) without
+  // touching what awaiting callers observe.
+  walk.then(done, () => {
+    tagListingFailedAt.set(provider, Date.now());
+    done();
+  });
+  return walk;
+}
+
+async function walkTagListing(
+  provider: CatalogProvider,
+): Promise<TagListing & { at: number }> {
   const rows: { id: string; name: string }[] = [];
   let complete = true;
   if (provider === "tpdb") {
+    const pages = tagPageReader((page) =>
+      tpdbGet<TpdbListBody>(`/tags${tpdbQuery({ page, per_page: 100 })}`),
+    );
     for (let page = 1; ; page++) {
-      const body = await tpdbGet<TpdbListBody>(
-        `/tags${tpdbQuery({ page, per_page: 100 })}`,
-      );
+      const body = await pages.at(page);
       if (!Array.isArray(body?.data)) {
         throw new AppError(
           502,
@@ -1762,6 +1893,9 @@ async function catalogTagListing(
           "TPDB returned an unusable tag listing.",
         );
       }
+      // TPDB's total (capped at 10000) bounds the read-ahead; a body
+      // without one keeps the walk sequential.
+      if (page === 1) pages.last = lastTagPage(body.meta?.total);
       const batch = tpdbTags(body.data, recordTagPair);
       rows.push(...batch);
       // A rows-less page beside a next link is a walk the provider did not
@@ -1771,18 +1905,24 @@ async function catalogTagListing(
         break;
       }
       if (typeof body.links?.next !== "string") break;
-      if (rows.length >= TAG_EXPANSION_MAX_ROWS) {
+      if (
+        rows.length >= TAG_EXPANSION_MAX_ROWS ||
+        page >= TAG_EXPANSION_MAX_PAGES
+      ) {
         complete = false;
         break;
       }
     }
   } else {
-    for (let page = 1; ; page++) {
-      const res = await stashQuery(
+    const pages = tagPageReader((page) =>
+      stashQuery(
         "query($p: Int!) { queryTags(input: { page: $p, per_page: 100 }) { count tags { id name } } }",
         { p: page },
         "queryTags",
-      );
+      ),
+    );
+    for (let page = 1; ; page++) {
+      const res = await pages.at(page);
       if (
         res === null ||
         typeof res !== "object" ||
@@ -1804,6 +1944,7 @@ async function catalogTagListing(
           "StashDB returned an unusable tag count.",
         );
       }
+      if (page === 1) pages.last = lastTagPage(count);
       const batch = stashTagRows(res.tags);
       rows.push(...batch);
       // A rows-less page while `count` still claims more is a walk the
@@ -1816,7 +1957,10 @@ async function catalogTagListing(
         break;
       }
       if (rows.length >= count) break;
-      if (rows.length >= TAG_EXPANSION_MAX_ROWS) {
+      if (
+        rows.length >= TAG_EXPANSION_MAX_ROWS ||
+        page >= TAG_EXPANSION_MAX_PAGES
+      ) {
         complete = false;
         break;
       }
@@ -1828,24 +1972,18 @@ async function catalogTagListing(
   return { ...listing, at };
 }
 
-/** Warms the provider's tag listing without blocking the caller: at most
- * one walk in flight per provider, and it never rejects — a failed warm
- * leaves the memo cold and the next picker search re-warms. The picker
- * fires this on a cold memo so the keystroke answers from the native
- * search while up to 50 sequential listing reads run in the background. */
+/** Warms the provider's tag listing without blocking the caller: it joins
+ * the walk in flight (or the fresh memo) and never rejects — a failed warm
+ * leaves the memo as it was, and background re-walks pause for
+ * TAG_WALK_COOLDOWN_MS. The picker fires this so a keystroke answers at
+ * once while the listing reads run in the background. */
 export function warmCatalogTagListing(
   provider: CatalogProvider,
 ): Promise<void> {
-  const pending = tagListingWarm.get(provider);
-  if (pending !== undefined) return pending;
-  const warm = catalogTagListing(provider)
-    .then(() => undefined)
-    .catch(() => undefined);
-  tagListingWarm.set(provider, warm);
-  void warm.finally(() => {
-    if (tagListingWarm.get(provider) === warm) tagListingWarm.delete(provider);
-  });
-  return warm;
+  return (tagListingWalk.get(provider) ?? catalogTagListing(provider)).then(
+    () => undefined,
+    () => undefined,
+  );
 }
 
 /** Free-text include expansion on one provider: every published tag whose
@@ -1886,10 +2024,11 @@ export async function expandCatalogTagTerm(
  * cannot prove, while the native search sees the provider's current
  * vocabulary; a fresh walk's miss is an honest absence and answers empty.
  * On a cold memo (a restart, or a listing past the window) the keystroke
- * is answered from the native relevance search immediately while
- * warmCatalogTagListing re-walks the listing in the background — the
- * first search after a restart must not wait on up to 50 sequential
- * reads. The native search stays as the fallback for a listing past the
+ * is answered from the native relevance search immediately. A cold memo,
+ * or one past half the completeness window, also re-walks the listing in
+ * the background: the browse a pick leads to expands on that listing, so
+ * it joins the walk the typing started instead of paying its own. The
+ * native search stays as the fallback for a listing past the
  * walk cap and for terms whose fold is empty (non-Latin text, symbols),
  * where folding cannot match. Ids are never mapped across providers; the
  * cap bounds the returned list. */
@@ -1909,7 +2048,12 @@ export async function searchCatalogTags(
   const needle = normalizeFacetName(q);
   if (needle !== "") {
     const memo = tagListingMemo.get(provider);
-    if (memo !== undefined && Date.now() - memo.at < TAG_SUGGESTION_TTL_MS) {
+    const age = memo === undefined ? Infinity : Date.now() - memo.at;
+    // One walk per provider — a burst of keystrokes joins it. A walk that
+    // just failed pauses the warm for TAG_WALK_COOLDOWN_MS.
+    if (age >= TAG_REFRESH_AHEAD_MS && !tagWalkCooldownActive(provider))
+      void warmCatalogTagListing(provider);
+    if (memo !== undefined && age < TAG_SUGGESTION_TTL_MS) {
       if (memo.listing.complete) {
         const exact: { id: string; name: string }[] = [];
         const prefixed: typeof exact = [];
@@ -1922,15 +2066,10 @@ export async function searchCatalogTags(
           else contained.push(row);
         }
         const hits = [...exact, ...prefixed, ...contained].slice(0, MAX.tags);
-        if (hits.length > 0 || Date.now() - memo.at < TAG_LISTING_TTL_MS) {
+        if (hits.length > 0 || age < TAG_LISTING_TTL_MS) {
           return hits;
         }
       }
-    } else {
-      // Cold memo: answer from the native search below; the background
-      // warm serves the folded-substring listing from the next keystroke
-      // on. One walk per provider — a burst of keystrokes joins it.
-      void warmCatalogTagListing(provider);
     }
   }
   if (provider === "tpdb") {
@@ -2017,8 +2156,9 @@ const counterpartMemo = new Map<string, CrossProviderLink | null>();
  * profile link (identityLinkKey) with this one. Names never merge anything;
  * exactly one sharing candidate links, zero extends the explicit reason
  * honestly, and two or more is ambiguous and refused, never guessed.
- * Outage, not-configured, or bad payload returns the explicit reason
- * unchanged; this never throws. */
+ * Outage, not-configured, or bad payload returns the explicit reason beside
+ * a named `failure` (an honest "no link" stays failure-free); this never
+ * throws. */
 export async function linkedPerformerCounterpart(
   detail: CatalogDetail,
 ): Promise<CrossProviderLink> {
@@ -2086,10 +2226,12 @@ export async function linkedPerformerCounterpart(
             };
     counterpartMemo.set(memoKey, result);
     return result;
-  } catch {
-    // Outage/not-configured/bad payload: the explicit reason stands, and the
-    // failure is not memoized so a later call can retry.
-    return explicit;
+  } catch (err) {
+    // Outage/not-configured/bad payload: the explicit reason stands beside
+    // the named failure, so a caller can tell an honest "no published link"
+    // from a lookup that never finished. The failure is not memoized so a
+    // later call can retry.
+    return { ...explicit, failure: shelfError(err) };
   }
 }
 
