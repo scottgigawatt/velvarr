@@ -230,6 +230,28 @@ function ConnectionCard({
       ? "Add a URL and API key, then save to check the connection."
       : null;
   const current = info?.[service];
+  const saveFeedback = (
+    <>
+      {saved && (
+        <p
+          ref={noticeRef}
+          className="mt-3 text-sm text-muted"
+          role="status"
+          tabIndex={-1}
+        >
+          {saved}
+        </p>
+      )}
+      {saveError && (
+        <div className="mt-3">
+          <ErrorPanel
+            title={"Saving " + name + " settings failed"}
+            message={saveError}
+          />
+        </div>
+      )}
+    </>
+  );
 
   return (
     <section className="panel p-5" aria-labelledby={service + "-heading"}>
@@ -382,6 +404,7 @@ function ConnectionCard({
               </button>
             </div>
           </fieldset>
+          {saveFeedback}
         </form>
       )}
       {editing && service === "whisparr" && info?.whisparr && (
@@ -434,24 +457,7 @@ function ConnectionCard({
           </dialog>
         </>
       )}
-      {saved && (
-        <p
-          ref={noticeRef}
-          className="mt-3 text-sm text-muted"
-          role="status"
-          tabIndex={-1}
-        >
-          {saved}
-        </p>
-      )}
-      {saveError && (
-        <div className="mt-3">
-          <ErrorPanel
-            title={"Saving " + name + " settings failed"}
-            message={saveError}
-          />
-        </div>
-      )}
+      {!editing && saveFeedback}
       {failure && !unsaved && !checking && (
         <div className="mt-3">
           <ErrorPanel
@@ -518,21 +524,23 @@ function WhisparrFields({
               Root folder
             </label>
             {roots.length ? (
-              <select
-                id={id + "-root"}
-                className="input mt-2"
-                value={draft.rootFolderPath}
-                onChange={(event) =>
-                  patch({ rootFolderPath: event.target.value })
-                }
-              >
-                <option value="">Choose a root folder</option>
-                {roots.map((root) => (
-                  <option key={root} value={root}>
-                    {root}
-                  </option>
-                ))}
-              </select>
+              <div className="settings-select mt-2">
+                <select
+                  id={id + "-root"}
+                  className="input"
+                  value={draft.rootFolderPath}
+                  onChange={(event) =>
+                    patch({ rootFolderPath: event.target.value })
+                  }
+                >
+                  <option value="">Choose a root folder</option>
+                  {roots.map((root) => (
+                    <option key={root} value={root}>
+                      {root}
+                    </option>
+                  ))}
+                </select>
+              </div>
             ) : (
               <input
                 id={id + "-root"}
@@ -553,21 +561,23 @@ function WhisparrFields({
               Quality profile
             </label>
             {profiles.length ? (
-              <select
-                id={id + "-profile"}
-                className="input mt-2"
-                value={draft.qualityProfileId}
-                onChange={(event) =>
-                  patch({ qualityProfileId: event.target.value })
-                }
-              >
-                <option value="">Choose a quality profile</option>
-                {profiles.map((profile) => (
-                  <option key={profile.id} value={profile.id}>
-                    {profile.name}
-                  </option>
-                ))}
-              </select>
+              <div className="settings-select mt-2">
+                <select
+                  id={id + "-profile"}
+                  className="input"
+                  value={draft.qualityProfileId}
+                  onChange={(event) =>
+                    patch({ qualityProfileId: event.target.value })
+                  }
+                >
+                  <option value="">Choose a quality profile</option>
+                  {profiles.map((profile) => (
+                    <option key={profile.id} value={profile.id}>
+                      {profile.name}
+                    </option>
+                  ))}
+                </select>
+              </div>
             ) : (
               <input
                 id={id + "-profile"}
