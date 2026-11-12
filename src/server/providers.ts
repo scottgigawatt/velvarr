@@ -536,7 +536,9 @@ export type ProviderVerification =
  * Not-configured is returned, never faked; outages and auth failures throw
  * AppError so callers never confuse them with an empty catalog. The call
  * bypasses the metadata cache: a cached or stale-on-error identity would
- * report a dead key or an outage as verified. */
+ * report a dead key or an outage as verified. Only the admin credential
+ * routes call it; /api/me reads providerConfigured() instead, so the shell
+ * never waits on this round trip. */
 export async function getProviderStatus(
   provider: "tpdb" | "stashdb",
 ): Promise<ProviderVerification> {

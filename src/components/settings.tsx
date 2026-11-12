@@ -9,6 +9,7 @@
 import {
   useCallback,
   useEffect,
+  useId,
   useRef,
   useReducer,
   useState,
@@ -34,17 +35,24 @@ import {
 import { LimitsPanel, ReleaseStatusPanel } from "./limits.tsx";
 import {
   initJudgmentEditor,
+  judgmentCheckDisabledReason,
   judgmentEditorSettings,
   providerSettingsActions,
   reduceJudgmentEditor,
 } from "../lib/judgment-editor.ts";
 import {
   canClearCredential,
-  canSaveCredential,
   canTestCredential,
   connectionState,
   createProviderSettingsQueue,
 } from "../lib/provider-settings.ts";
+import {
+  applyCredentialSave,
+  credentialCardBusy,
+  credentialEditorView,
+  initCredentialCard,
+  reduceCredentialCard,
+} from "../lib/credential-card.ts";
 
 /* ---------- App-local API view records (not in contracts.ts) ---------- */
 
@@ -936,6 +944,28 @@ function ConnectionState({ state }: { state: ConnectionStateLabel }) {
   );
 }
 
+/** WCAG 2.4.3 (focus order): closing an inline editor must not drop keyboard
+ * focus on <body>. Focus returns to the card's Edit button; while the
+ * post-save probe keeps that button disabled, focus parks on the save
+ * notice line (tabIndex={-1}) instead. */
+function useEditorFocusReturn(editing: boolean) {
+  const editRef = useRef<HTMLButtonElement>(null);
+  const noticeRef = useRef<HTMLParagraphElement>(null);
+  const closePending = useRef(false);
+  useEffect(() => {
+    if (editing) {
+      closePending.current = true;
+      return;
+    }
+    if (!closePending.current) return;
+    closePending.current = false;
+    const edit = editRef.current;
+    if (edit && !edit.disabled) edit.focus();
+    else noticeRef.current?.focus();
+  }, [editing]);
+  return { editRef, noticeRef };
+}
+
 function MetadataSettings() {
   const { refreshSession } = useSession();
   const [info, setInfo] = useState<ProviderSettingsInfo | null>(null);
@@ -1032,34 +1062,34 @@ function ProviderCredentialCard({
   onSave: SaveProviderSettings;
   runOperation: RunProviderOperation;
 } & (typeof CREDENTIAL_ROWS)[number]) {
-  const [editing, setEditing] = useState(false);
-  const [draft, setDraft] = useState("");
-  const [check, setCheck] = useState<ProviderCheck | null>(null);
+  const [editor, dispatch] = useReducer(
+    reduceCredentialCard,
+    undefined,
+    initCredentialCard,
+  );
   const inputRef = useRef<HTMLInputElement>(null);
+  const { editRef, noticeRef } = useEditorFocusReturn(editor.editing);
+  // Deleting a stored credential is destructive, so the click first opens this
+  // confirmation; the id must be unique — this card renders once per provider.
+  const clearRef = useRef<HTMLDialogElement>(null);
+  const clearTitleId = useId();
   useEffect(() => {
-    if (editing) inputRef.current?.focus();
-  }, [editing]);
-  const [checking, setChecking] = useState(false);
-  const [checkError, setCheckError] = useState<string | null>(null);
-  const [saveError, setSaveError] = useState<string | null>(null);
-  const [saved, setSaved] = useState<string | null>(null);
-  const [forbidden, setForbidden] = useState(false);
+    if (editor.editing) inputRef.current?.focus();
+  }, [editor.editing]);
 
   const verify = useCallback(async () => {
-    setChecking(true);
-    setCheck(null);
-    setCheckError(null);
+    dispatch({ type: "checking" });
     try {
-      setCheck(
-        await runOperation(() =>
+      dispatch({
+        type: "checked",
+        check: await runOperation(() =>
           api<ProviderCheck>("/api/admin/providers/" + id),
         ),
-      );
+      });
     } catch (error) {
-      if (error instanceof ApiError && error.status === 403) setForbidden(true);
-      else setCheckError(messageOf(error));
-    } finally {
-      setChecking(false);
+      if (error instanceof ApiError && error.status === 403)
+        dispatch({ type: "forbidden" });
+      else dispatch({ type: "checkFailed", message: messageOf(error) });
     }
   }, [id, runOperation]);
   useEffect(() => {
@@ -1067,54 +1097,57 @@ function ProviderCredentialCard({
   }, [verify]);
 
   function cancel() {
-    setDraft("");
-    setSaveError(null);
-    setEditing(false);
+    dispatch({ type: "cancel" });
   }
 
   async function apply(clear = false) {
-    setSaveError(null);
-    setSaved(null);
-    try {
-      // A blank edit keeps the current credential; removal is explicit.
-      if (clear || canSaveCredential({ draft, pending: false })) {
-        await onSave({ [field]: clear ? "" : draft.trim() });
-        setSaved(
-          clear
-            ? "Stored credential cleared. Environment settings apply."
-            : "Credential saved.",
-        );
-      }
-      setDraft("");
-      setEditing(false);
-      if (clear || draft.trim()) await verify();
-    } catch (error) {
-      if (error instanceof ApiError && error.status === 403) setForbidden(true);
-      else setSaveError(messageOf(error));
-    }
+    const { saved } = await applyCredentialSave({
+      draft: editor.draft,
+      clear,
+      configured: config?.configured,
+      name,
+      label,
+      performSave: (value) => onSave({ [field]: value }).then(() => undefined),
+      dispatch,
+      failureOf: (error) => ({
+        forbidden: error instanceof ApiError && error.status === 403,
+        message: messageOf(error),
+      }),
+    });
+    if (saved) await verify();
   }
 
   // Checks read persisted credentials; a replacement draft is not yet verified.
-  const unsaved = editing && draft.trim() !== "";
+  const unsaved = editor.editing && editor.draft.trim() !== "";
   const error =
-    checkError ??
-    (check?.configured && !check.verified ? check.error.message : null);
-  const busy = saving || checking || forbidden;
+    editor.checkError ??
+    (editor.check?.configured && !editor.check.verified
+      ? editor.check.error.message
+      : null);
+  const busy = credentialCardBusy(editor, saving);
   const actions = {
     canCheck: canTestCredential({
-      draft,
-      pending: saving || forbidden,
-      checking,
+      draft: editor.draft,
+      pending: saving || editor.forbidden,
+      checking: editor.checking,
       configured: config?.configured,
     }),
     canEdit: !busy && Boolean(config),
     canClear: canClearCredential({ source: config?.source, pending: busy }),
   };
+  // Transient busy states are announced by the live status row instead.
+  const checkDisabledReason = !actions.canCheck
+    ? unsaved
+      ? "Save or cancel your changes before checking the connection."
+      : config?.configured === false
+        ? "Add a key to check the connection."
+        : null
+    : null;
   const state = connectionState({
-    draft: editing ? draft : "",
-    checking,
-    check,
-    requestError: checkError,
+    draft: editor.editing ? editor.draft : "",
+    checking: editor.checking,
+    check: editor.check,
+    requestError: editor.checkError,
   });
   const stateLabels = {
     unsaved: "Unsaved changes",
@@ -1137,34 +1170,35 @@ function ProviderCredentialCard({
             type="button"
             className="btn"
             disabled={!actions.canCheck}
-            title={
-              unsaved
-                ? "Save or cancel your changes before checking the connection."
-                : undefined
+            aria-describedby={
+              checkDisabledReason ? "check-help-" + id : undefined
             }
             onClick={() => void verify()}
           >
             Check connection
           </button>
-          {!editing && (
+          {!editor.editing && (
             <button
               type="button"
+              ref={editRef}
               className="btn"
               disabled={!actions.canEdit}
-              onClick={() => {
-                setSaved(null);
-                setEditing(true);
-              }}
+              onClick={() => dispatch({ type: "edit" })}
             >
               Edit
             </button>
           )}
         </div>
       </div>
+      {checkDisabledReason && (
+        <p id={"check-help-" + id} className="mt-3 text-sm text-muted">
+          {checkDisabledReason}
+        </p>
+      )}
       <div className="settings-service-status" aria-live="polite">
         <ConnectionState state={connectionStateLabel} />
-        {!unsaved && check?.configured && check.verified && (
-          <span className="text-muted">{check.account}</span>
+        {!unsaved && editor.check?.configured && editor.check.verified && (
+          <span className="text-muted">{editor.check.account}</span>
         )}
         {config?.configured && (
           <span className="chip">
@@ -1174,81 +1208,91 @@ function ProviderCredentialCard({
           </span>
         )}
       </div>
-      {editing && (
-        <form
-          id={"provider-editor-" + id}
-          className="settings-service-editor"
-          onSubmit={(event) => {
+      {editor.editing &&
+        credentialEditorView({
+          id,
+          name,
+          label,
+          maxLength,
+          configured: config?.configured,
+          state: editor,
+          canEdit: actions.canEdit,
+          busy,
+          inputRef,
+          onDraftChange: (value) => dispatch({ type: "draft", value }),
+          onCancel: cancel,
+          onSubmit: (event) => {
             event.preventDefault();
             if (!busy && config) void apply();
-          }}
-        >
-          <label className="label" htmlFor={"provider-" + id}>
-            {name} {label}
-          </label>
-          <input
-            id={"provider-" + id}
-            ref={inputRef}
-            className="input mt-2"
-            type="password"
-            autoComplete="off"
-            maxLength={maxLength}
-            disabled={!actions.canEdit}
-            value={draft}
-            onChange={(event) => {
-              setDraft(event.target.value);
-              setSaveError(null);
-            }}
-            placeholder={
-              config?.configured
-                ? "Leave blank to keep the current credential"
-                : "Enter credential"
-            }
-          />
-          <p className="mt-2 text-sm text-muted">
-            Saved credentials are encrypted and take precedence over the
-            environment. Connection checks use the saved credential or
-            environment fallback.
-          </p>
-          <div className="settings-service-buttons mt-4">
-            <button
-              type="submit"
-              className="btn btn-accent"
-              disabled={!actions.canEdit}
-            >
-              Save
-            </button>
+          },
+        })}
+      {editor.editing && config?.source === "stored" && (
+        <>
+          {/* Deleting the stored credential is destructive, so the action
+              lives in its own row below the form and asks first. */}
+          <div className="settings-destructive-row">
             <button
               type="button"
-              className="btn"
-              disabled={busy}
-              onClick={cancel}
+              className="btn btn-danger"
+              disabled={!actions.canClear}
+              onClick={() => clearRef.current?.showModal()}
             >
-              Cancel
+              Clear stored credential
             </button>
-            {config?.source === "stored" && (
-              <button
-                type="button"
-                className="btn"
-                disabled={!actions.canClear}
-                onClick={() => void apply(true)}
-              >
-                Clear stored credential
-              </button>
-            )}
           </div>
-        </form>
+          <dialog
+            ref={clearRef}
+            className="bulk-dialog"
+            aria-labelledby={clearTitleId}
+          >
+            <div className="p-5">
+              <h3 id={clearTitleId} className="font-semibold">
+                Clear the stored {name} credential?
+              </h3>
+              <p className="mt-2 text-sm text-muted">
+                The encrypted credential is deleted from storage. {name} then
+                falls back to the environment settings, and connection checks
+                use that fallback.
+              </p>
+              <div className="mt-4 flex justify-end gap-2">
+                <button
+                  type="button"
+                  className="btn"
+                  onClick={() => clearRef.current?.close()}
+                >
+                  Keep credential
+                </button>
+                <button
+                  type="button"
+                  className="btn btn-danger"
+                  disabled={!actions.canClear}
+                  onClick={() => {
+                    clearRef.current?.close();
+                    void apply(true);
+                  }}
+                >
+                  Clear credential
+                </button>
+              </div>
+            </div>
+          </dialog>
+        </>
       )}
-      {saved && (
-        <p className="mt-3 text-sm text-muted" role="status">
-          {saved}
+      {editor.saved && (
+        <p
+          ref={noticeRef}
+          className="mt-3 text-sm text-muted"
+          role="status"
+          tabIndex={-1}
+        >
+          {editor.saved}
         </p>
       )}
-      {saveError && (
+      {editor.saveError && (
         <div className="mt-3">
           <ErrorPanel
             title={"Saving " + name + " credential failed"}
-            message={saveError}
+            message={editor.saveError}
           />
         </div>
       )}
@@ -1261,7 +1305,7 @@ function ProviderCredentialCard({
           />
         </div>
       )}
-      {forbidden && (
+      {editor.forbidden && (
         <p className="mt-3 text-sm text-muted">
           An administrator account is required to edit and verify credentials.
         </p>
@@ -1294,6 +1338,13 @@ function JudgmentCard({
   const [forbidden, setForbidden] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
   const selectRef = useRef<HTMLSelectElement>(null);
+  const { editRef, noticeRef } = useEditorFocusReturn(editing);
+  // Both actions below delete stored settings, so each click first opens a
+  // confirmation dialog (unique ids: dialogs resolve aria-labelledby by id).
+  const clearKeyRef = useRef<HTMLDialogElement>(null);
+  const useEnvRef = useRef<HTMLDialogElement>(null);
+  const clearKeyTitleId = useId();
+  const useEnvTitleId = useId();
   const { provider, url, model } = editor.draft;
   const checking = editor.check?.state === "checking";
   const connected = editor.check?.state === "connected";
@@ -1339,11 +1390,11 @@ function JudgmentCard({
     displayedProvider === "ollama"
       ? "Enter your Ollama URL and model, then save to check the connection."
       : "Enter your TypeSafe API key, then save to check the connection.";
-  const checkDisabledReason = !config
-    ? "Loading saved configuration."
-    : unsaved || !config.configured
-      ? setupMessage
-      : config.error;
+  const checkDisabledReason = judgmentCheckDisabledReason(
+    config,
+    unsaved,
+    setupMessage,
+  );
 
   function begin() {
     if (!config) return;
@@ -1472,7 +1523,7 @@ function JudgmentCard({
                 : "Not configured")}
         </p>
       )}
-      {!editing && checkDisabledReason && (
+      {checkDisabledReason && (
         <p id="judgment-check-help" className="mt-3 text-sm text-muted">
           {checkDisabledReason}
         </p>
@@ -1493,10 +1544,7 @@ function JudgmentCard({
       type="button"
       className="btn"
       disabled={busy || Boolean(checkDisabledReason)}
-      title={checkDisabledReason}
-      aria-describedby={
-        !editing && checkDisabledReason ? "judgment-check-help" : undefined
-      }
+      aria-describedby={checkDisabledReason ? "judgment-check-help" : undefined}
       onClick={() => void check()}
     >
       {checking ? "Checking…" : "Check connection"}
@@ -1514,6 +1562,7 @@ function JudgmentCard({
             {!standard && checkButton}
             <button
               type="button"
+              ref={editRef}
               className="btn"
               disabled={busy || !config}
               onClick={begin}
@@ -1659,17 +1708,23 @@ function JudgmentCard({
                 Cancel
               </button>
               {!standard && checkButton}
+            </div>
+          </div>
+        </form>
+      )}
+      {editing &&
+        ((provider === "typesafe" && keyConfig?.source === "stored") ||
+          config?.stored) && (
+          <>
+            {/* Both actions delete stored settings, so they live in their own
+                row below the form and each asks first. */}
+            <div className="settings-destructive-row">
               {provider === "typesafe" && keyConfig?.source === "stored" && (
                 <button
                   type="button"
-                  className="btn"
+                  className="btn btn-danger"
                   disabled={busy}
-                  onClick={() =>
-                    void apply(
-                      { typesafeApiKey: "" },
-                      "Stored TypeSafe credential cleared. Environment settings apply.",
-                    )
-                  }
+                  onClick={() => clearKeyRef.current?.showModal()}
                 >
                   Clear stored credential
                 </button>
@@ -1677,24 +1732,104 @@ function JudgmentCard({
               {config?.stored && (
                 <button
                   type="button"
-                  className="btn"
+                  className="btn btn-danger"
                   disabled={busy}
-                  onClick={() =>
-                    void apply(
-                      { judgmentProvider: "", ollamaUrl: "", ollamaModel: "" },
-                      "Using environment settings. Check the saved connection to verify the selected model.",
-                    )
-                  }
+                  onClick={() => useEnvRef.current?.showModal()}
                 >
                   Use environment settings
                 </button>
               )}
             </div>
-          </div>
-        </form>
-      )}
+            <dialog
+              ref={clearKeyRef}
+              className="bulk-dialog"
+              aria-labelledby={clearKeyTitleId}
+            >
+              <div className="p-5">
+                <h3 id={clearKeyTitleId} className="font-semibold">
+                  Clear the stored TypeSafe credential?
+                </h3>
+                <p className="mt-2 text-sm text-muted">
+                  The stored key is deleted from storage. Environment settings
+                  apply; without a key, standard matching remains active.
+                </p>
+                <div className="mt-4 flex justify-end gap-2">
+                  <button
+                    type="button"
+                    className="btn"
+                    onClick={() => clearKeyRef.current?.close()}
+                  >
+                    Keep credential
+                  </button>
+                  <button
+                    type="button"
+                    className="btn btn-danger"
+                    disabled={busy}
+                    onClick={() => {
+                      clearKeyRef.current?.close();
+                      void apply(
+                        { typesafeApiKey: "" },
+                        "Stored TypeSafe credential cleared. Environment settings apply.",
+                      );
+                    }}
+                  >
+                    Clear credential
+                  </button>
+                </div>
+              </div>
+            </dialog>
+            <dialog
+              ref={useEnvRef}
+              className="bulk-dialog"
+              aria-labelledby={useEnvTitleId}
+            >
+              <div className="p-5">
+                <h3 id={useEnvTitleId} className="font-semibold">
+                  Use environment settings?
+                </h3>
+                <p className="mt-2 text-sm text-muted">
+                  The stored AI settings are deleted. The provider, URL and
+                  model then come from the environment. Check the saved
+                  connection afterwards to verify the selected model.
+                </p>
+                <div className="mt-4 flex justify-end gap-2">
+                  <button
+                    type="button"
+                    className="btn"
+                    onClick={() => useEnvRef.current?.close()}
+                  >
+                    Keep AI settings
+                  </button>
+                  <button
+                    type="button"
+                    className="btn btn-danger"
+                    disabled={busy}
+                    onClick={() => {
+                      useEnvRef.current?.close();
+                      void apply(
+                        {
+                          judgmentProvider: "",
+                          ollamaUrl: "",
+                          ollamaModel: "",
+                        },
+                        "Using environment settings. Check the saved connection to verify the selected model.",
+                      );
+                    }}
+                  >
+                    Use environment settings
+                  </button>
+                </div>
+              </div>
+            </dialog>
+          </>
+        )}
       {editor.notice && !unsaved && (
-        <p className="mt-3 text-sm text-muted" role="status">
+        <p
+          ref={noticeRef}
+          className="mt-3 text-sm text-muted"
+          role="status"
+          tabIndex={-1}
+        >
           {editor.notice}
         </p>
       )}

@@ -3093,6 +3093,24 @@ test("an administrator can disable AI-assisted matching and credential edits kee
   }
 });
 
+test("an explicit typesafe provider save is accepted and stored", async () => {
+  try {
+    const saved = await call("PATCH", "/api/admin/integrations", {
+      cookie: owner,
+      body: { judgmentProvider: "typesafe" },
+    });
+    assert.equal(saved.status, 200);
+    const shape = await saved.json();
+    assert.equal(shape.judgment.provider, "typesafe");
+    assert.equal(shape.judgment.stored, true);
+  } finally {
+    await call("PATCH", "/api/admin/integrations", {
+      cookie: owner,
+      body: { judgmentProvider: "", typesafeApiKey: "" },
+    });
+  }
+});
+
 test("an invalid environment judgment provider degrades the integrations response", async () => {
   const before = process.env.VELVARR_JUDGMENT_PROVIDER;
   try {
@@ -4399,6 +4417,62 @@ test("per-provider credential check: each provider verifies alone; unknown provi
   } finally {
     process.env.STASHDB_API_KEY = stashdbKey;
   }
+});
+
+test("/api/me reads provider presence from stored config, never upstream", async () => {
+  await boot();
+  const owner = await loginAs("owner");
+  // Cold cache, warm cache, outage: the coarse signal reads the stored
+  // credential, so none of them may spend an upstream identity call.
+  resetMetaCache();
+  const tpdbBefore = tpdbFx.calls;
+  const stashBefore = stashdbFx.calls;
+  const first = await call("GET", "/api/me", { cookie: owner });
+  assert.equal(first.status, 200);
+  const body = (await first.json()) as { providers: Record<string, string> };
+  assert.deepEqual(body.providers, {
+    tpdb: "not_verified",
+    stashdb: "not_verified",
+  });
+  await call("GET", "/api/me", { cookie: owner });
+  // Regression pin: 49fe462 shipped both reads as cache bypasses, so every
+  // app load fired two live identity reads on the operator's credentials; a
+  // warm metadata cache only hid that for ten minutes (a cold cache, an
+  // expired TTL, and a rejected key have no cached answer to serve).
+  assert.equal(tpdbFx.calls, tpdbBefore, "no TPDB call on /api/me");
+  assert.equal(stashdbFx.calls, stashBefore, "no StashDB call on /api/me");
+
+  // A failing provider keeps the shell honest and unstalled: /api/me stays
+  // silent upstream and still reports the provider as configured.
+  tpdbFx.fail = 5;
+  stashdbFx.fail = 5;
+  try {
+    const during = await call("GET", "/api/me", { cookie: owner });
+    assert.equal(during.status, 200);
+    const duringBody = (await during.json()) as {
+      providers: Record<string, string>;
+    };
+    assert.deepEqual(duringBody.providers, {
+      tpdb: "not_verified",
+      stashdb: "not_verified",
+    });
+    assert.equal(tpdbFx.calls, tpdbBefore, "no TPDB call during an outage");
+    assert.equal(
+      stashdbFx.calls,
+      stashBefore,
+      "no StashDB call during an outage",
+    );
+  } finally {
+    tpdbFx.fail = 0;
+    stashdbFx.fail = 0;
+  }
+
+  // The admin surface keeps its live check: it reaches the upstream and
+  // verifies against the fixtures.
+  const live = await call("GET", "/api/admin/providers", { cookie: owner });
+  assert.equal(live.status, 200);
+  assert.equal(tpdbFx.calls, tpdbBefore + 1, "admin check is live");
+  assert.equal(stashdbFx.calls, stashBefore + 1, "admin check is live");
 });
 
 // --- M3 phase B: discover shelves + global multi-category search ---
