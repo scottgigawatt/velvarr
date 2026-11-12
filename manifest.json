@@ -1,0 +1,149 @@
+[
+  {
+    "source_ref": "origin/wee/provider-review-screenshots-20261108",
+    "source_commit": "749659d75797904044f142cadeb5b53dbcc97689",
+    "source_path": "docs/reviews/provider-credentials-20261108/README.md",
+    "path": "reviews/provider-credentials-20261108/README.md",
+    "blob": "26b5d3ae22c9d850463e66334887a60f8a47ae08"
+  },
+  {
+    "source_ref": "origin/wee/provider-review-screenshots-20261108",
+    "source_commit": "749659d75797904044f142cadeb5b53dbcc97689",
+    "source_path": "docs/reviews/provider-credentials-20261108/after.jpg",
+    "path": "reviews/provider-credentials-20261108/after.jpg",
+    "blob": "2d4336dd7715559197c53ac6652df057f1ffc1ad"
+  },
+  {
+    "source_ref": "origin/wee/provider-review-screenshots-20261108",
+    "source_commit": "749659d75797904044f142cadeb5b53dbcc97689",
+    "source_path": "docs/reviews/provider-credentials-20261108/before.jpg",
+    "path": "reviews/provider-credentials-20261108/before.jpg",
+    "blob": "753f6c73f3191405ee71c06c6b039060ce09e089"
+  },
+  {
+    "source_ref": "origin/wee/provider-review-screenshots-20261108",
+    "source_commit": "749659d75797904044f142cadeb5b53dbcc97689",
+    "source_path": "docs/reviews/provider-credentials-20261108/drafts.jpg",
+    "path": "reviews/provider-credentials-20261108/drafts.jpg",
+    "blob": "5726b030c64486c99a32064716c621b801584a45"
+  },
+  {
+    "source_ref": "origin/wee/provider-review-screenshots-20261108",
+    "source_commit": "749659d75797904044f142cadeb5b53dbcc97689",
+    "source_path": "docs/reviews/provider-credentials-20261108/mobile.jpg",
+    "path": "reviews/provider-credentials-20261108/mobile.jpg",
+    "blob": "7b23b73f730f729e58253d44d692fb2f083c4215"
+  },
+  {
+    "source_ref": "origin/wee/provider-review-screenshots-20261108",
+    "source_commit": "749659d75797904044f142cadeb5b53dbcc97689",
+    "source_path": "docs/reviews/provider-credentials-20261108/ollama.jpg",
+    "path": "reviews/provider-credentials-20261108/ollama.jpg",
+    "blob": "3ce9980b9199055a9d22622a667f0f12d2e6f9af"
+  },
+  {
+    "source_ref": "origin/wee/provider-review-screenshots-20261108",
+    "source_commit": "749659d75797904044f142cadeb5b53dbcc97689",
+    "source_path": "docs/reviews/provider-credentials-20261108/standard.jpg",
+    "path": "reviews/provider-credentials-20261108/standard.jpg",
+    "blob": "55c2c368f096d970a463ea2152f848198f742678"
+  },
+  {
+    "source_ref": "origin/wee/provider-review-screenshots-20261108",
+    "source_commit": "749659d75797904044f142cadeb5b53dbcc97689",
+    "source_path": "docs/reviews/provider-credentials-20261108/typesafe.jpg",
+    "path": "reviews/provider-credentials-20261108/typesafe.jpg",
+    "blob": "fbe087dfa1b432af00e48474f5d29171e4b880bd"
+  },
+  {
+    "source_ref": "origin/wee/provider-review-screenshots-20261109",
+    "source_commit": "1648a612c721878a1114446ba962d3c4bda2c4d9",
+    "source_path": "docs/reviews/provider-credentials-20261109/README.md",
+    "path": "reviews/provider-credentials-20261109/README.md",
+    "blob": "215e6c247ba1c8a24e16e72a20d66063c3446e84"
+  },
+  {
+    "source_ref": "origin/wee/provider-review-screenshots-20261109",
+    "source_commit": "1648a612c721878a1114446ba962d3c4bda2c4d9",
+    "source_path": "docs/reviews/provider-credentials-20261109/after.jpg",
+    "path": "reviews/provider-credentials-20261109/after.jpg",
+    "blob": "646f65fc1a995219a39815907df074f00c53ba86"
+  },
+  {
+    "source_ref": "origin/wee/provider-review-screenshots-20261109",
+    "source_commit": "1648a612c721878a1114446ba962d3c4bda2c4d9",
+    "source_path": "docs/reviews/provider-credentials-20261109/before.jpg",
+    "path": "reviews/provider-credentials-20261109/before.jpg",
+    "blob": "86a84c5ad9346670e885215f5a7bd4f695b17330"
+  },
+  {
+    "source_ref": "dev",
+    "source_commit": "8aea7a4780010b0d1fdad1e4deb1331e66260d93",
+    "source_path": "docs/reviews/provider-credentials/after.jpg",
+    "path": "reviews/legacy-dev/provider-credentials/after.jpg",
+    "blob": "d43989e0636e9fc2aba3b5030f56ef4c0cf30f17"
+  },
+  {
+    "source_ref": "dev",
+    "source_commit": "8aea7a4780010b0d1fdad1e4deb1331e66260d93",
+    "source_path": "docs/reviews/provider-credentials/before.jpg",
+    "path": "reviews/legacy-dev/provider-credentials/before.jpg",
+    "blob": "87097a734b98f7f98ae156c5cc0dde7411ecad9a"
+  },
+  {
+    "source_ref": "dev",
+    "source_commit": "8aea7a4780010b0d1fdad1e4deb1331e66260d93",
+    "source_path": "docs/reviews/provider-credentials/desktop.jpg",
+    "path": "reviews/legacy-dev/provider-credentials/desktop.jpg",
+    "blob": "7ec3d9c4a950f7f937d6ed147616cdf24819f7b8"
+  },
+  {
+    "source_ref": "dev",
+    "source_commit": "8aea7a4780010b0d1fdad1e4deb1331e66260d93",
+    "source_path": "docs/reviews/provider-credentials/drafts.jpg",
+    "path": "reviews/legacy-dev/provider-credentials/drafts.jpg",
+    "blob": "603c3e5fb97b5c1130cbb6d28913abb7db2672f0"
+  },
+  {
+    "source_ref": "dev",
+    "source_commit": "8aea7a4780010b0d1fdad1e4deb1331e66260d93",
+    "source_path": "docs/reviews/provider-credentials/ollama.jpg",
+    "path": "reviews/legacy-dev/provider-credentials/ollama.jpg",
+    "blob": "8c8a229d7dbee0f68840b5d31b4304567010f4ed"
+  },
+  {
+    "source_ref": "dev",
+    "source_commit": "8aea7a4780010b0d1fdad1e4deb1331e66260d93",
+    "source_path": "docs/reviews/provider-credentials/standard.jpg",
+    "path": "reviews/legacy-dev/provider-credentials/standard.jpg",
+    "blob": "702b288a445b11d79e36908deefb37eeff9b29e1"
+  },
+  {
+    "source_ref": "dev",
+    "source_commit": "8aea7a4780010b0d1fdad1e4deb1331e66260d93",
+    "source_path": "docs/reviews/provider-credentials/typesafe.jpg",
+    "path": "reviews/legacy-dev/provider-credentials/typesafe.jpg",
+    "blob": "5e54e58f931903266018ebcc6392e9cef9e27a62"
+  },
+  {
+    "source_ref": "dev",
+    "source_commit": "8aea7a4780010b0d1fdad1e4deb1331e66260d93",
+    "source_path": "docs/reviews/settings-connections/after-desktop.jpg",
+    "path": "reviews/settings-connections/after-desktop.jpg",
+    "blob": "875567151f7b0f9ae4aa70119d57d97465aff977"
+  },
+  {
+    "source_ref": "dev",
+    "source_commit": "8aea7a4780010b0d1fdad1e4deb1331e66260d93",
+    "source_path": "docs/reviews/settings-connections/after-mobile.jpg",
+    "path": "reviews/settings-connections/after-mobile.jpg",
+    "blob": "f35ce55985140a210d206251618116b39a6876ad"
+  },
+  {
+    "source_ref": "dev",
+    "source_commit": "8aea7a4780010b0d1fdad1e4deb1331e66260d93",
+    "source_path": "docs/reviews/settings-connections/before-desktop.jpg",
+    "path": "reviews/settings-connections/before-desktop.jpg",
+    "blob": "8221f21b7933a636b9d2e2b506b6ec6b601050be"
+  }
+]
