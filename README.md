@@ -96,6 +96,12 @@ the acquisition life cycle, each tied to its source paths.
 - **Update notice** when a newer GitHub release is available.
 - **Optional:** Discord notifications, and AI-assisted title matching through [TypeSafe](https://typesafe.ai) or an [Ollama](#ai-matching-with-ollama) decision model. AI only flags a near match for administrator review. It never marks a title as available.
 
+## Connection settings
+
+**Settings → Connections** uses the same compact cards and status indicators as **Metadata providers**. Choose **Edit** on Jellyfin or Whisparr, then **Save** or **Cancel** within that card. Saving one service preserves the other service's settings and draft. A blank API key keeps the saved credential; moving to a different server origin requires the key again. Jellyfin's server identity and library grants stay unchanged.
+
+**Check connection** tests saved settings. Unsaved changes show a neutral badge and must be saved or cancelled before checking. Successful saves run a new check; a connection failure is reported separately from the save notice. Whisparr's editor retains delivery controls, root folders, quality profiles, and path mappings. **Remove connection** asks for confirmation before deleting Whisparr's saved connection and delivery configuration.
+
 ## Configuration
 
 Put the variables in `.env.local`.

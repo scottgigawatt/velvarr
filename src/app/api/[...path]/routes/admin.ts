@@ -462,7 +462,18 @@ export async function adminUpdateIntegrations(
     saveConfig(patched);
     return json(integrationsShape(patched));
   }
-  const jellyfin = await nextJellyfin(ctx.config.jellyfin, body);
+  // A Whisparr card saves only its own fields. Preserve Jellyfin verbatim:
+  // neither its saved playback URL nor its key comes from another editor.
+  const whisparrOnly =
+    bodyKeys.length > 0 &&
+    bodyKeys.every((key) =>
+      ["whisparrUrl", "whisparrApiKey", "delivery", "pathMappings"].includes(
+        key,
+      ),
+    );
+  const jellyfin = whisparrOnly
+    ? ctx.config.jellyfin
+    : await nextJellyfin(ctx.config.jellyfin, body);
   const whisparr = nextWhisparr(ctx.config.whisparr, body);
   const providers = nextProviderCredentials(ctx.config.providers, body);
   const config: IntegrationConfig = {

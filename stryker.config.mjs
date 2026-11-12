@@ -54,6 +54,7 @@ const config = {
       "tests/discovery.test.ts",
       "tests/judgment-editor.test.ts",
       "tests/provider-settings.test.ts",
+      "tests/connection-settings.test.ts",
     ],
     nodeArgs: [
       "--experimental-strip-types",
