@@ -1,0 +1,53 @@
+{
+  "results": [
+    {
+      "name": "Compact cards share Metadata headings, actions and badge positions",
+      "passed": true
+    },
+    {
+      "name": "Jellyfin saves preserve Whisparr drafts and omit blank credentials",
+      "passed": true
+    },
+    {
+      "name": "Whisparr saves preserve Jellyfin drafts and retain delivery controls",
+      "passed": true
+    },
+    {
+      "name": "Blank unchanged Save gives feedback and Cancel restores focus",
+      "passed": true
+    },
+    {
+      "name": "Save failures retain drafts and recover on retry",
+      "passed": true
+    },
+    {
+      "name": "Failed post-save checks remain separate from successful persistence",
+      "passed": true
+    },
+    {
+      "name": "Configuration read failures leave service checks available and retry restores editing",
+      "passed": true
+    },
+    {
+      "name": "Incomplete mappings cannot save and a blank URL cannot remove Whisparr",
+      "passed": true
+    },
+    {
+      "name": "Whisparr removal requires confirmation and a new connection can be saved without delivery",
+      "passed": true
+    },
+    {
+      "name": "Cross-tab saves and checks wait for persistence without losing provider drafts",
+      "passed": true
+    },
+    {
+      "name": "Desktop and mobile editors have sibling forms, named controls and no overflow",
+      "passed": true
+    },
+    {
+      "name": "Administrator denial replaces the connection editor",
+      "passed": true
+    }
+  ],
+  "pageErrors": []
+}

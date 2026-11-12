@@ -4,6 +4,8 @@ One permanent, asset-only branch for screenshots and review provenance. Do not m
 
 ## Reviews
 
+- [Connections and Metadata parity, November 12](reviews/settings-connections-parity-20261112/README.md).
+
 - [Settings connections](reviews/settings-connections/): earlier Connections layout.
 - [Provider credentials, November 8](reviews/provider-credentials-20261108/README.md).
 - [Provider credentials, November 9](reviews/provider-credentials-20261109/README.md).
