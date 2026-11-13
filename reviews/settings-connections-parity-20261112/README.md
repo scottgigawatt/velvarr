@@ -54,3 +54,16 @@ its tracked source tree is identical to the fork main source listed above.
 Both are full-page desktop captures at a 1440 × 1200 viewport using synthetic
 services and credentials. [Capture provenance](upstream-screenshots.json).
 Images remain on the consolidated asset branch, outside the code diff.
+
+## Expanded connection editors
+
+Captured from production builds of upstream main `adf0191` and fork main
+`1028613`, using the same synthetic configuration and 1440 × 1200 viewport.
+Upstream keeps these fields open by default; the After captures open each
+editor using Edit. Each image shows the complete service panel.
+
+- Jellyfin: [Before](jellyfin-expanded-before.jpg) / [After](jellyfin-expanded-after.jpg).
+- Whisparr: [Before](whisparr-expanded-before.jpg) / [After](whisparr-expanded-after.jpg).
+- [Expanded capture provenance](expanded-screenshots.json).
+
+No real credentials or live services were used. Both pages reported no errors.

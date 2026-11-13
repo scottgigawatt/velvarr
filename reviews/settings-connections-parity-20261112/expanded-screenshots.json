@@ -1,0 +1,70 @@
+{
+  "source": "scottgigawatt/velvarr:main",
+  "target": "Skare69/velvarr:main",
+  "viewport": {
+    "width": 1440,
+    "height": 1200
+  },
+  "synthetic_services": true,
+  "real_credentials": false,
+  "note": "Upstream keeps connection fields open by default. After captures open both editors using Edit. Captures show each complete service panel.",
+  "captures": [
+    {
+      "service": "jellyfin",
+      "comparison": "before",
+      "file": "jellyfin-expanded-before.jpg",
+      "source_commit": "adf0191663a34650f806bdf87fc600ce59c85658",
+      "expanded": true,
+      "bounds": {
+        "x": 260,
+        "y": 270.5,
+        "width": 1152,
+        "height": 448.28125
+      },
+      "captured_at": "2026-11-13T04:08:34.511Z"
+    },
+    {
+      "service": "whisparr",
+      "comparison": "before",
+      "file": "whisparr-expanded-before.jpg",
+      "source_commit": "adf0191663a34650f806bdf87fc600ce59c85658",
+      "expanded": true,
+      "bounds": {
+        "x": 260,
+        "y": 319.78125,
+        "width": 1152,
+        "height": 880.015625
+      },
+      "captured_at": "2026-11-13T04:08:34.648Z"
+    },
+    {
+      "service": "jellyfin",
+      "comparison": "after",
+      "file": "jellyfin-expanded-after.jpg",
+      "source_commit": "10286135faa7354296025df740918f687df6079b",
+      "expanded": true,
+      "bounds": {
+        "x": 260,
+        "y": 270.5,
+        "width": 1152,
+        "height": 513.734375
+      },
+      "captured_at": "2026-11-13T04:08:40.012Z"
+    },
+    {
+      "service": "whisparr",
+      "comparison": "after",
+      "file": "whisparr-expanded-after.jpg",
+      "source_commit": "10286135faa7354296025df740918f687df6079b",
+      "expanded": true,
+      "bounds": {
+        "x": 260,
+        "y": 299.234375,
+        "width": 1152,
+        "height": 900.28125
+      },
+      "captured_at": "2026-11-13T04:08:40.149Z"
+    }
+  ],
+  "page_errors": []
+}
