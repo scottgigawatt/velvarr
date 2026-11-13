@@ -18,7 +18,16 @@
   "synthetic_services": true,
   "real_credentials": false,
   "page_errors": [],
-  "upstream_pr_head": "82ccacb8bca64c4761c0cafc2f7a062d88ab0ce3",
-  "fork_main_merge": "52c4c12b18a300064d0c3e14c8f6abcc0e187365",
-  "source_tree_equivalence": "Captured feature head, merged fork main, and clean upstream PR head have identical tracked trees."
+  "source_tree_equivalence": "The After capture has the same tracked source tree as the main-to-main PR head. Only commit history and metadata were rebuilt.",
+  "source": {
+    "repository": "scottgigawatt/velvarr",
+    "branch": "main",
+    "commit": "10286135faa7354296025df740918f687df6079b",
+    "tree": "659908cf95febc5366d0e92d0f7e615220c0350c"
+  },
+  "target": {
+    "repository": "Skare69/velvarr",
+    "branch": "main",
+    "commit": "adf0191663a34650f806bdf87fc600ce59c85658"
+  }
 }

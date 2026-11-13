@@ -41,16 +41,16 @@ PRs #1 and #2, shared-code ownership, and the consistency fixes.
 checks. Each test suite runs once per CI run. Screenshot capture provenance
 above continues to describe the original image captures.
 
-## Upstream PR screenshot pair
+## Upstream main-to-main screenshot pair
 
-- **Before:** [Connections on current upstream main](connections-before-desktop.jpg),
-  source `adf0191663a34650f806bdf87fc600ce59c85658` (captured from the identical
-  application tree on fork main `bd8fd20`).
-- **After:** [Connections with this change](upstream-after-desktop.jpg), captured
-  freshly from the reviewed production build at `8b75efd`. Its source tree is
-  identical to clean upstream head `82ccacb8bca64c4761c0cafc2f7a062d88ab0ce3`
-  and merged fork main `52c4c12`.
+Source: `scottgigawatt/velvarr:main` at `10286135faa7354296025df740918f687df6079b`.
+Target: `Skare69/velvarr:main` at `adf0191663a34650f806bdf87fc600ce59c85658`.
 
+- [Before: current upstream Connections](connections-before-desktop.jpg).
+- [After: updated Connections](upstream-after-desktop.jpg).
+
+The After image was captured from the reviewed production build at `8b75efd`;
+its tracked source tree is identical to the fork main source listed above.
 Both are full-page desktop captures at a 1440 × 1200 viewport using synthetic
-services and credentials. [Machine-readable provenance](upstream-screenshots.json).
-These images stay on the consolidated asset branch and are not in the source PR.
+services and credentials. [Capture provenance](upstream-screenshots.json).
+Images remain on the consolidated asset branch, outside the code diff.
