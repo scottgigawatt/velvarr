@@ -50,12 +50,13 @@ screenshot and trace in the ignored `test-results/` directory.
 ## Settings source modules
 
 The tabs share UI behavior while keeping their service-specific rules in separate
-modules. Connections gained a new module in this change. Metadata providers
-already had the following TypeScript modules on `main`; they remain in use.
+modules. Connections uses the new draft and card-lifecycle modules. Metadata
+providers reuses its existing credential and AI modules from `main`.
 
 | Source | Role | Direct unit tests |
 | --- | --- | --- |
 | [`src/lib/connection-settings.ts`](../src/lib/connection-settings.ts) | Jellyfin/Whisparr draft initialization, change detection, field validation, and service-only save patches | `tests/connection-settings.test.ts` |
+| [`src/lib/connection-card.ts`](../src/lib/connection-card.ts) | Jellyfin/Whisparr editor lifecycle, busy state, save/removal flow, and connection checks | `tests/connection-card.test.ts` |
 | [`src/lib/provider-settings.ts`](../src/lib/provider-settings.ts) | TPDB/StashDB status, credential save/check/clear decisions, and the operation queue now used by both tabs | `tests/provider-settings.test.ts` |
 | [`src/lib/credential-card.ts`](../src/lib/credential-card.ts) | TPDB/StashDB editor state, save flow, and editor markup | `tests/provider-card.test.ts` |
 | [`src/lib/judgment-editor.ts`](../src/lib/judgment-editor.ts) | AI provider drafts, normalization, save/check outcomes, and available actions | `tests/judgment-editor.test.ts` |
@@ -90,14 +91,19 @@ Ollama fields. The operator guides for [Connections](connections.md) and
 | `tests/ui/metadata-providers.spec.mjs` | Metadata providers and cross-tab parity | 18 browser cases for TPDB, StashDB, TypeSafe, Ollama, and matching card/status/action layout across both tabs |
 | `tests/ui/settings-fixture.mjs` | Shared by both tabs | Starts the real production UI with isolated synthetic service responses; not a test suite |
 | `tests/ui/settings-harness.mjs` | Shared by both tabs | Resets state, supplies browser helpers, and checks page errors; not a test suite |
-| `tests/connection-settings.test.ts` | Connections | Unit tests for connection drafts, patches, and validation |
+| `tests/connection-settings.test.ts` | Connections settings rules | Unit tests for connection drafts, patches, and validation |
+| `tests/connection-card.test.ts` | Connections card lifecycle | Edit/Cancel, unchanged and invalid saves, persistence/probe ordering, failed saves and checks, permission failures, busy guards, and confirmed removal |
 | `tests/api.test.ts` | Both tabs and other application APIs | Server authorization, validation, persistence, and preservation of unrelated settings |
-| `tests/provider-settings.test.ts`, `tests/provider-card.test.ts` | Metadata providers and shared settings operations | Provider credential behavior, status handling, and the save/probe queue used by both tabs |
+| `tests/provider-settings.test.ts` | Metadata settings rules and shared operations | Credential save/check/clear decisions, status handling, and the save/probe queue used by both tabs |
+| `tests/provider-card.test.ts` | Metadata credential card lifecycle | TPDB/StashDB editor state, save flow, credential clearing, failed and forbidden saves, and editor markup |
 | `tests/judgment-editor.test.ts`, `tests/ollama.test.ts`, `tests/integrations.test.ts` | Metadata providers and integrations | AI editor behavior, Ollama, upstream error classification, and integration requests |
 
-The connection-only unit file is intentionally narrower than the browser suite.
-Metadata provider logic is covered by the existing provider and AI unit files;
-it does not need a duplicate unit file to match the Connections filename.
+Unit tests are organized at two levels for both tabs. `connection-settings.test.ts`
+and `provider-settings.test.ts` test settings rules. `connection-card.test.ts` and
+`provider-card.test.ts` drive the real card lifecycle and save flow used by the UI;
+the provider suite also renders its credential editor markup. The AI card has
+its own lifecycle suite in `judgment-editor.test.ts`. Browser tests cover the
+actual rendered cards, focus, controls, and layout for both tabs.
 
 ## Coverage map for both settings tabs
 
@@ -107,7 +113,7 @@ it does not need a duplicate unit file to match the Connections filename.
 | Whisparr-only saves, preservation of Jellyfin/provider settings, failed validation, and removal | `tests/api.test.ts`; settings browser suite |
 | Session, administrator, origin, and malformed-field guards on connection-only requests | `tests/api.test.ts` |
 | Shared headings, button/status placement, unique IDs, live regions, sibling forms, and focus entry/return | `tests/ui/connections.spec.mjs`, `tests/ui/metadata-providers.spec.mjs` |
-| Save failures retain drafts; feedback stays beside Save/Cancel; successful saves remain distinct from failed probes | `tests/ui/connections.spec.mjs`, `tests/ui/metadata-providers.spec.mjs` |
+| Save failures retain drafts; feedback stays beside Save/Cancel; successful saves remain distinct from failed probes | `tests/connection-card.test.ts`, `tests/provider-card.test.ts`, `tests/judgment-editor.test.ts`; both browser suites |
 | Status cards remain mounted during loading, failure, retry, and saves | `tests/ui/connections.spec.mjs`, `tests/ui/metadata-providers.spec.mjs` |
 | Settings-wide save/probe ordering, drafts surviving tab switches, and recovery after failure | `tests/provider-settings.test.ts`; both settings browser suites |
 | Existing provider error classification, AI normalization, and saved probe results survive the shared-component refactor | `tests/integrations.test.ts`, `tests/judgment-editor.test.ts`, `tests/provider-card.test.ts`; settings browser suite |

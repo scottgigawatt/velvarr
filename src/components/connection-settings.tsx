@@ -5,18 +5,25 @@ import {
   useEffect,
   useId,
   useRef,
+  useReducer,
   useState,
   type FormEvent,
 } from "react";
 import {
-  connectionDraft,
   connectionDraftChanged,
-  connectionPatch,
   type ConnectionDraft,
   type ConnectionPatch,
   type ConnectionService,
   type ConnectionsInfo,
 } from "../lib/connection-settings.ts";
+import {
+  applyConnectionSave,
+  checkConnection,
+  connectionCardBusy,
+  initConnectionCard,
+  reduceConnectionCard,
+  type ConnectionStatus,
+} from "../lib/connection-card.ts";
 import { ApiError, api, ErrorPanel, messageOf } from "./shared.tsx";
 import {
   ConnectionState,
@@ -26,16 +33,11 @@ import {
   type SettingsOperations,
 } from "./settings-service.tsx";
 
-type ServiceStatus = {
-  configured: boolean;
-  serverName?: string;
-  appName?: string;
-  version?: string;
-  rootFolders?: { id: number; path: string }[];
-  profiles?: { id: number; name: string }[];
-  error?: { code: string; message: string };
-};
 type SaveConnection = (body: ConnectionPatch) => Promise<ConnectionsInfo>;
+const failureOf = (error: unknown) => ({
+  forbidden: error instanceof ApiError && error.status === 403,
+  message: messageOf(error),
+});
 
 export function ConnectionsSettings({
   onForbidden,
@@ -110,21 +112,28 @@ function ConnectionCard({
   onForbidden: () => void;
 }) {
   const name = service === "jellyfin" ? "Jellyfin" : "Whisparr";
-  const [status, setStatus] = useState<ServiceStatus | null>(null);
-  const [checking, setChecking] = useState(false);
-  const [checkError, setCheckError] = useState<string | null>(null);
-  const [editing, setEditing] = useState(false);
-  const [draft, setDraft] = useState(() => connectionDraft(service));
-  const [pending, setPending] = useState(false);
-  const [saveError, setSaveError] = useState<string | null>(null);
-  const [saved, setSaved] = useState<string | null>(null);
+  const [editor, dispatch] = useReducer(
+    reduceConnectionCard,
+    service,
+    initConnectionCard,
+  );
+  const {
+    status,
+    checking,
+    checkError,
+    editing,
+    draft,
+    pending,
+    saveError,
+    saved,
+  } = editor;
   const inputRef = useRef<HTMLInputElement>(null);
   const { editRef, noticeRef } = useEditorFocusReturn(editing);
   const removeRef = useRef<HTMLDialogElement>(null);
   const removeTitleId = useId();
   const editorId = useId();
   const helpId = useId();
-  const busy = saving || pending || checking;
+  const busy = connectionCardBusy(editor, saving);
   const unsaved =
     editing &&
     info !== undefined &&
@@ -134,20 +143,17 @@ function ConnectionCard({
     (info ? Boolean(info[service]?.apiKeyConfigured) : undefined);
   const failure = checkError ?? status?.error?.message;
 
-  const verify = useCallback(async () => {
-    setChecking(true);
-    setCheckError(null);
-    try {
-      setStatus(
-        await runOperation(() => api<ServiceStatus>("/api/admin/" + service)),
-      );
-    } catch (error) {
-      if (error instanceof ApiError && error.status === 403) onForbidden();
-      else setCheckError(messageOf(error));
-    } finally {
-      setChecking(false);
-    }
-  }, [service, runOperation, onForbidden]);
+  const verify = useCallback(
+    () =>
+      checkConnection({
+        dispatch,
+        performCheck: () =>
+          runOperation(() => api<ConnectionStatus>("/api/admin/" + service)),
+        failureOf,
+        onForbidden,
+      }),
+    [service, runOperation, onForbidden],
+  );
   useEffect(() => {
     void verify();
   }, [verify]);
@@ -155,59 +161,28 @@ function ConnectionCard({
     if (editing) inputRef.current?.focus();
   }, [editing]);
 
-  const patch = (changes: Partial<ConnectionDraft>) => {
-    setDraft((current) => ({ ...current, ...changes }));
-    setSaveError(null);
-    setSaved(null);
-  };
+  const patch = (changes: Partial<ConnectionDraft>) =>
+    dispatch({ type: "draft", changes });
   function begin() {
-    if (!info) return;
-    setDraft(connectionDraft(service, info));
-    setSaved(null);
-    setSaveError(null);
-    setEditing(true);
+    if (info) dispatch({ type: "edit", service, info });
   }
   function cancel() {
-    setDraft(connectionDraft(service, info));
-    setSaveError(null);
-    setSaved(null);
-    setEditing(false);
+    dispatch({ type: "cancel", service, info });
   }
   async function apply(remove = false) {
-    if (!info || busy || configurationUnavailable) return;
-    setSaveError(null);
-    setSaved(null);
-    let body: ConnectionPatch;
-    try {
-      body = remove
-        ? { whisparrUrl: "" }
-        : connectionPatch(service, draft, info);
-      if (!remove && !connectionDraftChanged(service, draft, info)) {
-        setSaved("No changes to save.");
-        return;
-      }
-    } catch (error) {
-      setSaveError(messageOf(error));
-      return;
-    }
-    setPending(true);
-    try {
-      const data = await onSave(body);
-      setDraft(connectionDraft(service, data));
-      setSaved(
-        remove ? "Whisparr connection removed." : name + " settings saved.",
-      );
-      setEditing(false);
-      // A failed probe cannot turn successful persistence into a failed Save.
-      // Invalidate the old diagnosis before checking the newly saved settings.
-      setStatus(null);
-      await verify();
-    } catch (error) {
-      if (error instanceof ApiError && error.status === 403) onForbidden();
-      else setSaveError(messageOf(error));
-    } finally {
-      setPending(false);
-    }
+    await applyConnectionSave({
+      service,
+      info,
+      state: editor,
+      saving,
+      configurationUnavailable,
+      remove,
+      dispatch,
+      performSave: onSave,
+      verify,
+      failureOf,
+      onForbidden,
+    });
   }
   const state: ConnectionStateLabel = checking
     ? "Checking…"
@@ -478,7 +453,7 @@ function WhisparrFields({
   id,
 }: {
   draft: ConnectionDraft;
-  status: ServiceStatus | null;
+  status: ConnectionStatus | null;
   patch: (value: Partial<ConnectionDraft>) => void;
   id: string;
 }) {
