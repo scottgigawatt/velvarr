@@ -544,3 +544,75 @@ scenario(
       expect(await metrics(own)).toEqual(baseline);
   },
 );
+
+scenario(
+  "Metadata saves share the queue with Connections and tab switches preserve both editors",
+  async (h) => {
+    const { page, jf, w, provider, fresh, control, edit, save, cancel, check } =
+      h;
+    await fresh();
+    const configReads = (state) =>
+      state.requests.filter(
+        (request) =>
+          request.method === "GET" &&
+          request.path === "/api/admin/integrations",
+      ).length;
+    const initialReads = configReads(await control({}));
+    await edit(jf).click();
+    await jf
+      .getByLabel("Jellyfin external URL")
+      .fill("https://draft.example.test");
+    await showMetadata(page);
+    await edit(provider).click();
+    await provider.getByLabel("TPDB API token").fill("synthetic-metadata-save");
+    const ai = aiCard(page);
+    await edit(ai).click();
+    await ai.getByLabel("Provider", { exact: true }).selectOption("ollama");
+    await ai
+      .getByLabel("Ollama URL")
+      .fill("http://draft-ollama.example.test:11434");
+    await ai.getByLabel("Decision model").fill("draft-model");
+
+    await control({ holdPatch: true });
+    await save(provider).click();
+    await page
+      .getByRole("button", { name: "Connections", exact: true })
+      .click();
+    await expect(save(jf)).toBeDisabled();
+    await expect(check(w)).toBeDisabled();
+    await expect(edit(w)).toBeDisabled();
+    await expect(jf.getByLabel("Jellyfin external URL")).toHaveValue(
+      "https://draft.example.test",
+    );
+    await control({ holdPatch: false });
+    await expect(save(jf)).toBeEnabled();
+    await showMetadata(page);
+    await expect(edit(provider)).toBeEnabled();
+    await expect(
+      provider.getByText("Credential saved.", { exact: true }),
+    ).toBeVisible();
+    await expect(ai.getByLabel("Provider", { exact: true })).toHaveValue(
+      "ollama",
+    );
+    await expect(ai.getByLabel("Ollama URL")).toHaveValue(
+      "http://draft-ollama.example.test:11434",
+    );
+    await expect(ai.getByLabel("Decision model")).toHaveValue("draft-model");
+    await page
+      .getByRole("button", { name: "Connections", exact: true })
+      .click();
+    await expect(jf.getByLabel("Jellyfin external URL")).toHaveValue(
+      "https://draft.example.test",
+    );
+    await cancel(jf).click();
+    await expect(edit(jf)).toBeFocused();
+    await showMetadata(page);
+    await cancel(ai).click();
+    await expect(edit(ai)).toBeFocused();
+    const state = await control({});
+    expect(configReads(state)).toBe(initialReads);
+    expect(patches(state).map((request) => request.body)).toEqual([
+      { tpdbApiToken: "synthetic-metadata-save" },
+    ]);
+  },
+);

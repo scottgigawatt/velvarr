@@ -47,7 +47,7 @@ export const CREDENTIAL_CLEARED_NOTICE =
 
 /** What one Save click on a credential editor does, decided before any
  * network call so the button's disabled state and the click cannot drift
- * apart (settings.tsx renders both from this decision):
+ * apart (metadata-settings.tsx renders both from this decision):
  * - a non-blank draft saves the trimmed value;
  * - the confirmed clear (destructive dialog) saves "" so the environment
  *   settings apply again, even over a typed draft;

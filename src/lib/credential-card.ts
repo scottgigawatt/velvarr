@@ -1,4 +1,4 @@
-// The TPDB/StashDB credential card's lifecycle (settings.tsx renders
+// The TPDB/StashDB credential card's lifecycle (metadata-settings.tsx renders
 // ProviderCredentialCard through this module), React-API-free so node --test
 // can drive it directly: the test runner cannot import the .tsx component
 // itself, because type stripping does not parse JSX. The card keeps its

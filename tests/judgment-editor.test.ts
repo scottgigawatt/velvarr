@@ -300,7 +300,7 @@ test("a normalized save and configuration sync preserve the subsequent probe res
   assert.equal(e.notice, "Settings saved.");
 });
 
-// The check button's disabled reason: settings.tsx renders it as the help
+// The check button's disabled reason: metadata-settings.tsx renders it as the help
 // line under the saved settings and as the button's title.
 const setupHint =
   "Enter your TypeSafe API key, then save to check the connection.";

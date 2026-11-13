@@ -66,22 +66,28 @@ editor focus return, and settings-wide save/check queue. Both tabs also use the
 same card, status, editor, and dropdown styles in `src/app/globals.css`.
 The browser suites exercise these shared components through each tab.
 
-The UI composition remains organized differently: Connections lives in
-`src/components/connection-settings.tsx`, while Metadata providers' existing
-cards remain in `src/components/settings.tsx`. Its existing metadata `.ts`
-modules provide the counterpart to `connection-settings.ts`. Service-specific
-differences remain intentional: Connections validates URLs and Whisparr delivery/mappings;
-metadata credentials support confirmed clearing with environment fallback;
-the AI editor supports backend selection and Ollama fields. The operator guides
-for [Connections](connections.md) and [Metadata providers](metadata-providers.md)
-describe these behaviors.
+The UI composition follows the same structure for each tab:
+
+- [`src/components/connection-settings.tsx`](../src/components/connection-settings.tsx)
+  owns the Jellyfin and Whisparr cards.
+- [`src/components/metadata-settings.tsx`](../src/components/metadata-settings.tsx)
+  owns the TPDB, StashDB, and AI-assisted matching cards.
+- [`src/components/settings.tsx`](../src/components/settings.tsx) owns tab
+  navigation and creates one shared operation queue for both tab components.
+  Both stay mounted when switching tabs so drafts and check results survive.
+
+Service-specific rules remain in the library modules above: Connections validates
+URLs and Whisparr delivery/mappings; metadata credentials support confirmed
+clearing with environment fallback; the AI editor supports backend selection and
+Ollama fields. The operator guides for [Connections](connections.md) and
+[Metadata providers](metadata-providers.md) describe these behaviors.
 
 ## Test files and their scope
 
 | File | Scope | Purpose |
 | --- | --- | --- |
 | `tests/ui/connections.spec.mjs` | Connections and cross-tab behavior | 21 browser cases for Jellyfin/Whisparr editors, dropdown spacing, and shared settings behavior |
-| `tests/ui/metadata-providers.spec.mjs` | Metadata providers and cross-tab parity | 17 browser cases for TPDB, StashDB, TypeSafe, Ollama, and matching card/status/action layout across both tabs |
+| `tests/ui/metadata-providers.spec.mjs` | Metadata providers and cross-tab parity | 18 browser cases for TPDB, StashDB, TypeSafe, Ollama, and matching card/status/action layout across both tabs |
 | `tests/ui/settings-fixture.mjs` | Shared by both tabs | Starts the real production UI with isolated synthetic service responses; not a test suite |
 | `tests/ui/settings-harness.mjs` | Shared by both tabs | Resets state, supplies browser helpers, and checks page errors; not a test suite |
 | `tests/connection-settings.test.ts` | Connections | Unit tests for connection drafts, patches, and validation |
@@ -103,7 +109,7 @@ it does not need a duplicate unit file to match the Connections filename.
 | Shared headings, button/status placement, unique IDs, live regions, sibling forms, and focus entry/return | `tests/ui/connections.spec.mjs`, `tests/ui/metadata-providers.spec.mjs` |
 | Save failures retain drafts; feedback stays beside Save/Cancel; successful saves remain distinct from failed probes | `tests/ui/connections.spec.mjs`, `tests/ui/metadata-providers.spec.mjs` |
 | Status cards remain mounted during loading, failure, retry, and saves | `tests/ui/connections.spec.mjs`, `tests/ui/metadata-providers.spec.mjs` |
-| Settings-wide save/probe ordering across tabs and recovery after failure | `tests/provider-settings.test.ts`; settings browser suite |
+| Settings-wide save/probe ordering, drafts surviving tab switches, and recovery after failure | `tests/provider-settings.test.ts`; both settings browser suites |
 | Existing provider error classification, AI normalization, and saved probe results survive the shared-component refactor | `tests/integrations.test.ts`, `tests/judgment-editor.test.ts`, `tests/provider-card.test.ts`; settings browser suite |
 | First-time/manual Whisparr delivery settings, stale saved choices, path-mapping limits, and removal confirmation | Pure/API regressions; `tests/ui/connections.spec.mjs` |
 | Both picker arrows retain their inset and text padding; editors fit mobile widths | `tests/ui/connections.spec.mjs`, `tests/ui/metadata-providers.spec.mjs` |
