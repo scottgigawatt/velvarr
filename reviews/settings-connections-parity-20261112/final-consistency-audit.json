@@ -1,0 +1,195 @@
+{
+  "source_commit": "8b75efd07620714cba0921aab70266ab62d2926b",
+  "upstream_prs": [
+    "https://github.com/Skare69/velvarr/pull/1",
+    "https://github.com/Skare69/velvarr/pull/2"
+  ],
+  "scope": "All upstream PRs by scottgigawatt in Skare69/velvarr (PRs 1 and 2), including issue comments, review submissions, inline feedback, and subsequent confirmations; re-fetched for this review.",
+  "findings": [
+    {
+      "source": "https://github.com/Skare69/velvarr/pull/1#pullrequestreview-5719518969",
+      "topic": "Connection status independent of configuration loading",
+      "result": "verified",
+      "implementation": "ConnectionsSettings keeps keyed cards mounted; status checks do not depend on the configuration request.",
+      "evidence": "Delayed-config and config-failure browser scenarios; no unrelated remount after Save."
+    },
+    {
+      "source": "https://github.com/Skare69/velvarr/pull/1#pullrequestreview-5719518969",
+      "topic": "Save feedback near its action",
+      "result": "verified",
+      "implementation": "Shared SettingsSaveFeedback renders inside each connection, credential and AI editor directly after Save/Cancel, before destructive controls.",
+      "evidence": "Shared browser helper measures error position for Whisparr, TPDB, StashDB and AI; draft retention and retry assertions pass."
+    },
+    {
+      "source": "https://github.com/Skare69/velvarr/pull/1#pullrequestreview-5719518969",
+      "topic": "Distinct status headings",
+      "result": "verified",
+      "implementation": "Named Jellyfin and Whisparr h2 sections replace duplicate generic status headings.",
+      "evidence": "Rendered heading-outline browser assertion."
+    },
+    {
+      "source": "https://github.com/Skare69/velvarr/pull/1#pullrequestreview-5719518969",
+      "topic": "Unused classes and CSS formatting",
+      "result": "verified",
+      "implementation": "Removed old connection layout rules; old grid and unused section class have no references.",
+      "evidence": "Repository search and complete Prettier check."
+    },
+    {
+      "source": "https://github.com/Skare69/velvarr/pull/1#pullrequestreview-5719518969",
+      "topic": "Valid forms and explicit button types",
+      "result": "verified",
+      "implementation": "Editors use sibling forms and explicit submit/button types.",
+      "evidence": "Production browser checks for nested forms and missing button types."
+    },
+    {
+      "source": "https://github.com/Skare69/velvarr/pull/1#pullrequestreview-5806381140",
+      "topic": "Accessible labels on generic elements",
+      "result": "verified",
+      "implementation": "Sections use labeled headings and status rows use aria-live; no unsupported generic div labels.",
+      "evidence": "Browser role/label assertions and unique ID check."
+    },
+    {
+      "source": "https://github.com/Skare69/velvarr/pull/1#pullrequestreview-5806381140",
+      "topic": "Disable fields when configuration is unavailable",
+      "result": "verified",
+      "implementation": "Fieldsets include configurationUnavailable; successful saves use the PATCH response without reloading configuration.",
+      "evidence": "Config-failure retry browser case and request-count assertions."
+    },
+    {
+      "source": "https://github.com/Skare69/velvarr/pull/2#pullrequestreview-5824614145",
+      "topic": "Distinguish upstream credential errors from local failures",
+      "result": "verified",
+      "implementation": "All three service-route paths use upstreamCheckError, an explicit allowlist shared in server/http.ts.",
+      "evidence": "Provider allowlist tests, local/decryption/unexpected-error identity tests, and real Jellyfin/Whisparr endpoint tests for upstream 401 and invalid local URLs."
+    },
+    {
+      "source": "https://github.com/Skare69/velvarr/pull/2#pullrequestreview-5824614145",
+      "topic": "Persisted no-AI rollback compatibility",
+      "result": "verified",
+      "implementation": "README retains explicit v0.40.0-and-earlier rollback instructions; this feature changes no persisted provider contract.",
+      "evidence": "README and diff review; existing judgment tests."
+    },
+    {
+      "source": "https://github.com/Skare69/velvarr/pull/2#pullrequestreview-5824614145",
+      "topic": "Serialize probes with saves",
+      "result": "verified",
+      "implementation": "One neutral operation queue is created in SettingsView through useSettingsOperations and passed to both tab components.",
+      "evidence": "Queue tests moved to settings-service.test.ts; browser tests cover blocking and ordering in both directions plus draft preservation."
+    },
+    {
+      "source": "https://github.com/Skare69/velvarr/pull/2#pullrequestreview-5824614145",
+      "topic": "Real editor focus instead of no-op disclosure state",
+      "result": "verified",
+      "implementation": "Transient Edit controls have no misleading disclosure attributes; focus enters editors and returns on close.",
+      "evidence": "Connection and AI editor focus browser checks."
+    },
+    {
+      "source": "https://github.com/Skare69/velvarr/pull/2#pullrequestreview-5824614145",
+      "topic": "Correct heading hierarchy",
+      "result": "verified",
+      "implementation": "Settings is h1; service/provider cards are sibling h2 sections.",
+      "evidence": "Rendered outline and source review."
+    },
+    {
+      "source": "https://github.com/Skare69/velvarr/pull/2#pullrequestreview-5824614145",
+      "topic": "Nonempty successful save notices",
+      "result": "verified",
+      "implementation": "Shared save feedback separates persistence from probe outcomes; AI begin/saveStarted clears obsolete notices without resetting diagnosis.",
+      "evidence": "AI reducer regression tests and failed-after-success browser scenario, alongside existing configured/unconfigured AI and post-save failure cases."
+    },
+    {
+      "source": "https://github.com/Skare69/velvarr/pull/2#pullrequestreview-5832427947",
+      "topic": "Keep normalized post-save AI probe results",
+      "result": "verified",
+      "implementation": "Shared judgmentEditorSettings normalizes save/sync state; probes require configured settings.",
+      "evidence": "Normalized-save unit regressions and configured/unconfigured AI browser cases."
+    },
+    {
+      "source": "https://github.com/Skare69/velvarr/pull/2#discussion_r4542758804",
+      "topic": "Avoid redundant savedProvider effect dependency",
+      "result": "verified",
+      "implementation": "Judgment sync effect still depends only on config and editor.saved.",
+      "evidence": "Source review; later upstream review confirms this fix."
+    }
+  ],
+  "additional_fix": {
+    "topic": "Whisparr picker arrow spacing",
+    "result": "verified",
+    "arrow_inset_px": 14,
+    "text_padding_end_px": 40,
+    "controls": [
+      "Root folder",
+      "Quality profile"
+    ],
+    "implementation": "Reuse existing settings-select styling and retain native labeled select elements."
+  },
+  "tests_passed": 765,
+  "browser_scenarios_passed": 41,
+  "page_errors": [],
+  "ci": "https://github.com/scottgigawatt/velvarr/actions/runs/43353367539",
+  "upstream_comments_changed": false,
+  "shared_ownership": {
+    "src/components/settings-service.tsx": [
+      "heading/actions layout",
+      "status indicator",
+      "check button",
+      "configuration loading/saving",
+      "save feedback",
+      "confirmation dialogs",
+      "focus return",
+      "shared operation hook",
+      "failure classification"
+    ],
+    "src/lib/settings-service.ts": [
+      "status vocabulary",
+      "failure contract",
+      "operation queue"
+    ],
+    "src/server/http.ts": [
+      "allowlisted upstream-check error conversion"
+    ],
+    "src/app/globals.css": [
+      "card layout",
+      "status placement",
+      "dropdown arrows",
+      "editor/action styling"
+    ]
+  },
+  "service_specific_rules": [
+    "Jellyfin identity and playback URLs",
+    "Whisparr roots, quality profiles, delivery, mappings and removal",
+    "TPDB/StashDB credential preservation and environment fallback",
+    "TypeSafe/Ollama/no-AI selection, normalization and reset"
+  ],
+  "additional_fixes": [
+    "Removed repeated configuration load/save code, dialogs, feedback markup and check buttons; moved the operation queue and its tests to neutral shared files.",
+    "Applied the existing provider upstream error allowlist to Jellyfin and Whisparr; local and unexpected faults no longer become configured:true connection feedback.",
+    "Metadata and AI failed-save feedback now renders inside the editor beside Save/Cancel and above destructive controls; both tabs use the same feedback component.",
+    "Correcting TypeSafe/Ollama fields clears obsolete save errors.",
+    "Opening an AI editor or starting a new save clears stale success notices without dropping saved configuration or probe results.",
+    "Both tab components use the same parent configuration permission boundary; unavailable configuration disables editing while independent credential probes remain mounted."
+  ],
+  "exact_duplicate_12_line_blocks_across_tab_and_card_modules": 0,
+  "ci_status": "completed",
+  "validation": {
+    "format": "passed",
+    "typescript": "passed",
+    "unit_api": "765 passed",
+    "production_build": "passed",
+    "production_browser": "41 passed, no page errors",
+    "tests_per_ci_run": [
+      "bun run test once",
+      "bun run test:ui once"
+    ]
+  },
+  "ci_conclusion": "success",
+  "ci_jobs": {
+    "gates": "success",
+    "container": "success",
+    "publication": "skipped"
+  },
+  "refetched_feedback_entries": {
+    "upstream_pr_1": 7,
+    "upstream_pr_2": 7
+  }
+}

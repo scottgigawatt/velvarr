@@ -29,3 +29,14 @@ Both Root folder and Quality profile now use the existing settings picker stylin
 - [Audit of all 15 findings and follow-up items from upstream PRs #1 and #2](upstream-review-audit.json)
 
 The audit includes the original discussions, review submissions, inline comments, and later confirmations. All listed regressions were checked against this source. No upstream comments or review-thread states were changed.
+
+## Final consistency review
+
+The [refreshed review audit](final-consistency-audit.json) covers source commit
+`8b75efd07620714cba0921aab70266ab62d2926b`, all 15 findings/follow-ups from upstream
+PRs #1 and #2, shared-code ownership, and the consistency fixes.
+
+[CI passed](https://github.com/scottgigawatt/velvarr/actions/runs/43353367539):
+765 unit/API tests, 41 production-build browser cases, and all build/container
+checks. Each test suite runs once per CI run. Screenshot capture provenance
+above continues to describe the original image captures.
