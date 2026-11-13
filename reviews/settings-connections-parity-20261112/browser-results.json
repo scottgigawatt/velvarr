@@ -45,6 +45,22 @@
       "passed": true
     },
     {
+      "name": "Root folder and quality profile arrows have inset spacing and remain labeled native pickers",
+      "passed": true
+    },
+    {
+      "name": "Connection status stays mounted during delayed configuration loading",
+      "passed": true
+    },
+    {
+      "name": "Unconfigured AI saves retain a nonempty notice and skip the persisted probe",
+      "passed": true
+    },
+    {
+      "name": "AI normalization preserves a failed post-save result across configuration sync and Cancel",
+      "passed": true
+    },
+    {
       "name": "Administrator denial replaces the connection editor",
       "passed": true
     }

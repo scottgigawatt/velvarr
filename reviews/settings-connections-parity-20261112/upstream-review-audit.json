@@ -1,0 +1,131 @@
+{
+  "source_commit": "70e928a3229ac416f1178c8058ce29c3ac2335f4",
+  "upstream_prs": [
+    "https://github.com/Skare69/velvarr/pull/1",
+    "https://github.com/Skare69/velvarr/pull/2"
+  ],
+  "scope": "All discussion, review and inline feedback on both PRs; follow-up confirmations included.",
+  "findings": [
+    {
+      "source": "https://github.com/Skare69/velvarr/pull/1#pullrequestreview-5719518969",
+      "topic": "Connection status independent of configuration loading",
+      "result": "verified",
+      "implementation": "ConnectionsSettings keeps keyed cards mounted; status checks do not depend on the configuration request.",
+      "evidence": "Delayed-config and config-failure browser scenarios; no unrelated remount after Save."
+    },
+    {
+      "source": "https://github.com/Skare69/velvarr/pull/1#pullrequestreview-5719518969",
+      "topic": "Save feedback near its action",
+      "result": "verified",
+      "implementation": "Moved save feedback inside each editor immediately after Save/Cancel, ahead of destructive controls.",
+      "evidence": "Browser checks measure feedback distance and confirm failure retains drafts."
+    },
+    {
+      "source": "https://github.com/Skare69/velvarr/pull/1#pullrequestreview-5719518969",
+      "topic": "Distinct status headings",
+      "result": "verified",
+      "implementation": "Named Jellyfin and Whisparr h2 sections replace duplicate generic status headings.",
+      "evidence": "Rendered heading-outline browser assertion."
+    },
+    {
+      "source": "https://github.com/Skare69/velvarr/pull/1#pullrequestreview-5719518969",
+      "topic": "Unused classes and CSS formatting",
+      "result": "verified",
+      "implementation": "Removed old connection layout rules; old grid and unused section class have no references.",
+      "evidence": "Repository search and complete Prettier check."
+    },
+    {
+      "source": "https://github.com/Skare69/velvarr/pull/1#pullrequestreview-5719518969",
+      "topic": "Valid forms and explicit button types",
+      "result": "verified",
+      "implementation": "Editors use sibling forms and explicit submit/button types.",
+      "evidence": "Production browser checks for nested forms and missing button types."
+    },
+    {
+      "source": "https://github.com/Skare69/velvarr/pull/1#pullrequestreview-5806381140",
+      "topic": "Accessible labels on generic elements",
+      "result": "verified",
+      "implementation": "Sections use labeled headings and status rows use aria-live; no unsupported generic div labels.",
+      "evidence": "Browser role/label assertions and unique ID check."
+    },
+    {
+      "source": "https://github.com/Skare69/velvarr/pull/1#pullrequestreview-5806381140",
+      "topic": "Disable fields when configuration is unavailable",
+      "result": "verified",
+      "implementation": "Fieldsets include configurationUnavailable; successful saves use the PATCH response without reloading configuration.",
+      "evidence": "Config-failure retry browser case and request-count assertions."
+    },
+    {
+      "source": "https://github.com/Skare69/velvarr/pull/2#pullrequestreview-5824614145",
+      "topic": "Distinguish upstream credential errors from local failures",
+      "result": "verified",
+      "implementation": "providerCheckFailure still allows only known upstream codes; storage/decryption/configuration errors propagate.",
+      "evidence": "Existing integration regressions passed in the 731-test suite."
+    },
+    {
+      "source": "https://github.com/Skare69/velvarr/pull/2#pullrequestreview-5824614145",
+      "topic": "Persisted no-AI rollback compatibility",
+      "result": "verified",
+      "implementation": "README retains explicit v0.40.0-and-earlier rollback instructions; this feature changes no persisted provider contract.",
+      "evidence": "README and diff review; existing judgment tests."
+    },
+    {
+      "source": "https://github.com/Skare69/velvarr/pull/2#pullrequestreview-5824614145",
+      "topic": "Serialize probes with saves",
+      "result": "verified",
+      "implementation": "Settings-wide queue serializes connection and metadata writes/probes, including same-tick operations.",
+      "evidence": "Cross-tab browser request timing and existing queue regressions."
+    },
+    {
+      "source": "https://github.com/Skare69/velvarr/pull/2#pullrequestreview-5824614145",
+      "topic": "Real editor focus instead of no-op disclosure state",
+      "result": "verified",
+      "implementation": "Transient Edit controls have no misleading disclosure attributes; focus enters editors and returns on close.",
+      "evidence": "Connection and AI editor focus browser checks."
+    },
+    {
+      "source": "https://github.com/Skare69/velvarr/pull/2#pullrequestreview-5824614145",
+      "topic": "Correct heading hierarchy",
+      "result": "verified",
+      "implementation": "Settings is h1; service/provider cards are sibling h2 sections.",
+      "evidence": "Rendered outline and source review."
+    },
+    {
+      "source": "https://github.com/Skare69/velvarr/pull/2#pullrequestreview-5824614145",
+      "topic": "Nonempty successful save notices",
+      "result": "verified",
+      "implementation": "Connections and AI keep explicit save notices separate from probe results.",
+      "evidence": "Connection/AI failed-post-save-probe browser checks."
+    },
+    {
+      "source": "https://github.com/Skare69/velvarr/pull/2#pullrequestreview-5832427947",
+      "topic": "Keep normalized post-save AI probe results",
+      "result": "verified",
+      "implementation": "Shared judgmentEditorSettings normalizes save/sync state; probes require configured settings.",
+      "evidence": "Normalized-save unit regressions and configured/unconfigured AI browser cases."
+    },
+    {
+      "source": "https://github.com/Skare69/velvarr/pull/2#discussion_r4542758804",
+      "topic": "Avoid redundant savedProvider effect dependency",
+      "result": "verified",
+      "implementation": "Judgment sync effect still depends only on config and editor.saved.",
+      "evidence": "Source review; later upstream review confirms this fix."
+    }
+  ],
+  "additional_fix": {
+    "topic": "Whisparr picker arrow spacing",
+    "result": "verified",
+    "arrow_inset_px": 14,
+    "text_padding_end_px": 40,
+    "controls": [
+      "Root folder",
+      "Quality profile"
+    ],
+    "implementation": "Reuse existing settings-select styling and retain native labeled select elements."
+  },
+  "tests_passed": 731,
+  "browser_scenarios_passed": 16,
+  "page_errors": [],
+  "ci": "https://github.com/scottgigawatt/velvarr/actions/runs/43333404872",
+  "upstream_comments_changed": false
+}
