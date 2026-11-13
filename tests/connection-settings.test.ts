@@ -5,6 +5,7 @@ import {
   connectionDraftChanged,
   connectionPatch,
   type ConnectionsInfo,
+  type ConnectionDraft,
 } from "../src/lib/connection-settings.ts";
 
 const settings = (): ConnectionsInfo => ({
@@ -217,4 +218,27 @@ test("blank Whisparr Save cannot silently remove a configured connection", () =>
       connectionPatch("whisparr", connectionDraft("whisparr", empty), empty),
     /Enter a Whisparr URL and API key/,
   );
+});
+
+test("loading a connection without configuration creates an empty, independent draft", () => {
+  const expected: ConnectionDraft = {
+    url: "",
+    externalUrl: "",
+    apiKey: "",
+    deliveryEnabled: false,
+    rootFolderPath: "",
+    qualityProfileId: "",
+    searchOnAdd: true,
+    pathMappings: [],
+  };
+  const jellyfin = connectionDraft("jellyfin");
+  const whisparr = connectionDraft("whisparr");
+  assert.deepEqual(jellyfin, expected);
+  assert.deepEqual(whisparr, expected);
+  whisparr.pathMappings.push({
+    whisparrPrefix: "/unsaved",
+    jellyfinPrefix: "/draft",
+  });
+  assert.deepEqual(jellyfin, expected);
+  assert.deepEqual(connectionDraft("whisparr"), expected);
 });

@@ -33,9 +33,14 @@ jobs:
         run: bun audit
       - run: bun run check
       - run: bun run test
+      - run: bun run test:coverage:connections
       - run: bun run build
         env:
           NEXT_TELEMETRY_DISABLED: '1'
+      - name: Install browser test runtime
+        run: bunx playwright install --with-deps chromium
+      - name: Settings browser regressions (production build)
+        run: bun run test:ui
 
   container:
     name: Container smoke (build, readiness, restart)

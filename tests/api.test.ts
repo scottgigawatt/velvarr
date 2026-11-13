@@ -2401,6 +2401,45 @@ test("session validation is cached: one /Users/Me per token per TTL window", asy
   resetSessionCache();
 });
 
+test("Whisparr-only card saves retain session, administrator, origin and field validation guards", async () => {
+  const original = getConfig();
+  assert.ok(original);
+  const body = { whisparrUrl, whisparrApiKey: whisparrKey };
+  try {
+    await errorShape(
+      await call("PATCH", "/api/admin/integrations", { body }),
+      401,
+    );
+    await errorShape(
+      await call("PATCH", "/api/admin/integrations", { cookie: member, body }),
+      403,
+    );
+    await errorShape(
+      await call("PATCH", "/api/admin/integrations", {
+        cookie: owner,
+        origin: "https://foreign.example.test",
+        body,
+      }),
+      403,
+    );
+    for (const invalid of [{}, { ...body, unknownField: true }]) {
+      await errorShape(
+        await call("PATCH", "/api/admin/integrations", {
+          cookie: owner,
+          body: invalid,
+        }),
+      );
+    }
+    assert.deepEqual(
+      getConfig(),
+      original,
+      "rejected requests must preserve all saved services",
+    );
+  } finally {
+    saveConfig(original);
+  }
+});
+
 test("connection cards save and remove Whisparr without rewriting Jellyfin or providers", async () => {
   const original = getConfig();
   assert.ok(original);
