@@ -100,7 +100,7 @@ the acquisition life cycle, each tied to its source paths.
 
 ## Configuration
 
-Put the variables in `.env.local`. For Jellyfin and Whisparr setup, see the [connection settings guide](docs/connections.md).
+Put the variables in `.env.local`. See the [connection settings guide](docs/connections.md) for Jellyfin and Whisparr, and the [metadata providers guide](docs/metadata-providers.md) for TPDB, StashDB, and AI-assisted matching.
 
 | Variable                      | Required        | Meaning |
 | ----------------------------- | --------------- | ------- |

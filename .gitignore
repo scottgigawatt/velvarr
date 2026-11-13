@@ -8,6 +8,7 @@
 /docs/*
 !/docs/how-it-works.md
 !/docs/connections.md
+!/docs/metadata-providers.md
 !/docs/testing.md
 
 # Generated files.

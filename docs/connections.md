@@ -2,7 +2,8 @@
 
 Administrators manage Jellyfin and Whisparr in **Settings → Connections**.
 Each service uses the same compact cards and status indicators as **Metadata
-providers**.
+providers**. See the [metadata providers guide](metadata-providers.md) for those
+credentials and AI settings.
 
 ## Edit a connection
 

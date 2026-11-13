@@ -1,62 +1,6 @@
-import { test, expect } from "@playwright/test";
+import { expect } from "@playwright/test";
 import assert from "node:assert/strict";
-
-// One isolated fixture server is shared serially. Every test gets a new
-// browser context, resets synthetic data, and fails on page errors.
-function harness(page) {
-  const jf = page.locator('section[aria-labelledby="jellyfin-heading"]');
-  const w = page.locator('section[aria-labelledby="whisparr-heading"]');
-  const provider = page.locator(
-    'section[aria-labelledby="provider-heading-tpdb"]',
-  );
-  const control = async (data) => {
-    const response = await page.request.post("/__settings_test", { data });
-    expect(response.ok()).toBeTruthy();
-    return response.json();
-  };
-  const fresh = async (mode = {}) => {
-    await control({ reset: true, ...mode });
-    await page.goto("/?view=settings");
-    await expect(jf.locator(".connection-state")).toHaveText("Connected");
-    await expect(w.locator(".connection-state")).toHaveText("Connected");
-  };
-  return {
-    page,
-    jf,
-    w,
-    provider,
-    control,
-    fresh,
-    edit: (card) => card.getByRole("button", { name: "Edit", exact: true }),
-    save: (card) => card.getByRole("button", { name: "Save", exact: true }),
-    cancel: (card) => card.getByRole("button", { name: "Cancel", exact: true }),
-    check: (card) =>
-      card.getByRole("button", { name: "Check connection", exact: true }),
-    badge: (card) => card.locator(".connection-state"),
-  };
-}
-async function expectNoHorizontalOverflow(page) {
-  // Resizing the viewport and applying its media queries can finish on
-  // different browser frames. Wait for the layout condition, not a fixed delay.
-  await expect
-    .poll(
-      () =>
-        page.evaluate(() => document.documentElement.scrollWidth - innerWidth),
-      {
-        message: "The settled settings layout must fit the viewport",
-      },
-    )
-    .toBeLessThanOrEqual(0);
-}
-
-function scenario(name, run) {
-  test(name, async ({ page }) => {
-    const errors = [];
-    page.on("pageerror", (error) => errors.push(String(error)));
-    await run(harness(page));
-    expect(errors).toEqual([]);
-  });
-}
+import { scenario, expectNoHorizontalOverflow } from "./settings-harness.mjs";
 
 scenario(
   "Compact cards share Metadata headings, actions and badge positions",

@@ -195,18 +195,27 @@ const server = http.createServer(async (req, res) => {
         ])
           if (key in b)
             config.providers[id] = {
-              configured: !!b[key],
+              configured: Boolean(b[key] || mode.environmentProviders?.[id]),
               source: b[key] ? "stored" : "environment",
             };
         if ("judgmentProvider" in b)
           config.judgment = {
             ...config.judgment,
-            provider: b.judgmentProvider || "typesafe",
+            provider:
+              b.judgmentProvider ||
+              mode.environmentJudgment?.provider ||
+              "typesafe",
             configured: b.judgmentProvider !== "none",
             stored: !!b.judgmentProvider,
           };
-        if ("ollamaUrl" in b) config.judgment.url = b.ollamaUrl;
-        if ("ollamaModel" in b) config.judgment.model = b.ollamaModel;
+        if ("ollamaUrl" in b)
+          config.judgment.url =
+            b.ollamaUrl ||
+            mode.environmentJudgment?.url ||
+            "http://localhost:11434";
+        if ("ollamaModel" in b)
+          config.judgment.model =
+            b.ollamaModel || mode.environmentJudgment?.model || "review-model";
         config.judgment.configured =
           config.judgment.provider === "typesafe"
             ? config.providers.typesafe.configured
@@ -267,6 +276,27 @@ const server = http.createServer(async (req, res) => {
     }
     if (path.startsWith("/api/admin/providers/")) {
       const provider = path.split("/").at(-1);
+      if (mode.holdProbe) await hold(heldProbe);
+      if (requestGeneration !== generation)
+        return error(res, 409, "Obsolete test request.");
+      if (mode[provider + "403"])
+        return error(res, 403, "Administrators only.");
+      if (mode[provider + "HttpFail"])
+        return error(
+          res,
+          503,
+          "The synthetic provider status endpoint is unavailable.",
+        );
+      if (mode[provider + "Fail"])
+        return json(res, 200, {
+          provider,
+          configured: true,
+          verified: false,
+          error: {
+            code: "upstream_auth",
+            message: "The synthetic " + provider + " credential was rejected.",
+          },
+        });
       return json(
         res,
         200,
@@ -280,7 +310,11 @@ const server = http.createServer(async (req, res) => {
           : { provider, configured: false },
       );
     }
-    if (path === "/api/admin/judgment/check")
+    if (path === "/api/admin/judgment/check") {
+      if (mode.holdProbe) await hold(heldProbe);
+      if (requestGeneration !== generation)
+        return error(res, 409, "Obsolete test request.");
+      if (mode.judgment403) return error(res, 403, "Administrators only.");
       return json(res, 200, {
         provider: config.judgment.provider,
         connected: !mode.judgmentFail,
@@ -288,6 +322,7 @@ const server = http.createServer(async (req, res) => {
           ? { error: "The synthetic AI service is unavailable." }
           : {}),
       });
+    }
     return error(res, 404, "Unexpected test API route: " + path);
   }
   const upstream = http.request(
