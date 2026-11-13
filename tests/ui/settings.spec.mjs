@@ -35,6 +35,20 @@ function harness(page) {
     badge: (card) => card.locator(".connection-state"),
   };
 }
+async function expectNoHorizontalOverflow(page) {
+  // Resizing the viewport and applying its media queries can finish on
+  // different browser frames. Wait for the layout condition, not a fixed delay.
+  await expect
+    .poll(
+      () =>
+        page.evaluate(() => document.documentElement.scrollWidth - innerWidth),
+      {
+        message: "The settled settings layout must fit the viewport",
+      },
+    )
+    .toBeLessThanOrEqual(0);
+}
+
 function scenario(name, run) {
   test(name, async ({ page }) => {
     const errors = [];
@@ -568,11 +582,7 @@ scenario(
           requestAnimationFrame(() => requestAnimationFrame(resolve)),
         ),
     );
-    assert.ok(
-      await page.evaluate(
-        () => document.documentElement.scrollWidth <= innerWidth,
-      ),
-    );
+    await expectNoHorizontalOverflow(page);
 
     await cancel(w).click();
     await cancel(jf).click();
@@ -580,11 +590,7 @@ scenario(
     await page
       .getByRole("button", { name: "Metadata providers", exact: true })
       .click();
-    assert.ok(
-      await page.evaluate(
-        () => document.documentElement.scrollWidth <= innerWidth,
-      ),
-    );
+    await expectNoHorizontalOverflow(page);
   },
 );
 scenario(
@@ -635,11 +641,7 @@ scenario(
           requestAnimationFrame(() => requestAnimationFrame(resolve)),
         ),
     );
-    assert.ok(
-      await page.evaluate(
-        () => document.documentElement.scrollWidth <= innerWidth,
-      ),
-    );
+    await expectNoHorizontalOverflow(page);
   },
 );
 scenario(
