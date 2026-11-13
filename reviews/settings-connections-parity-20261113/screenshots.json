@@ -13,43 +13,43 @@
       "comparison": "before",
       "view": "overview",
       "file": "connections-before-desktop.jpg",
-      "source_commit": "c80ad195f8d510e8d3b74a225eb5ac5403371185",
-      "captured_at": "2026-11-13T21:57:43.265Z"
+      "source_commit": "904593b67cacf49b8960cfc44351b2818fa6fe94",
+      "captured_at": "2026-11-13T22:02:30.510Z"
     },
     {
       "comparison": "before",
       "view": "jellyfin expanded",
       "file": "jellyfin-expanded-before.jpg",
-      "source_commit": "c80ad195f8d510e8d3b74a225eb5ac5403371185",
-      "captured_at": "2026-11-13T21:57:43.479Z"
+      "source_commit": "904593b67cacf49b8960cfc44351b2818fa6fe94",
+      "captured_at": "2026-11-13T22:02:30.727Z"
     },
     {
       "comparison": "before",
       "view": "whisparr expanded",
       "file": "whisparr-expanded-before.jpg",
-      "source_commit": "c80ad195f8d510e8d3b74a225eb5ac5403371185",
-      "captured_at": "2026-11-13T21:57:43.614Z"
+      "source_commit": "904593b67cacf49b8960cfc44351b2818fa6fe94",
+      "captured_at": "2026-11-13T22:02:30.861Z"
     },
     {
       "comparison": "after",
       "view": "overview",
       "file": "connections-after-desktop.jpg",
-      "source_commit": "9fdf929c1d9a29f9c9a24fe3e00f68b5558b14c2",
-      "captured_at": "2026-11-13T21:57:43.839Z"
+      "source_commit": "145f063ef60ba514b9dae1f7a2028bfb90682f72",
+      "captured_at": "2026-11-13T22:02:31.098Z"
     },
     {
       "comparison": "after",
       "view": "jellyfin expanded",
       "file": "jellyfin-expanded-after.jpg",
-      "source_commit": "9fdf929c1d9a29f9c9a24fe3e00f68b5558b14c2",
-      "captured_at": "2026-11-13T21:57:44.051Z"
+      "source_commit": "145f063ef60ba514b9dae1f7a2028bfb90682f72",
+      "captured_at": "2026-11-13T22:02:31.311Z"
     },
     {
       "comparison": "after",
       "view": "whisparr expanded",
       "file": "whisparr-expanded-after.jpg",
-      "source_commit": "9fdf929c1d9a29f9c9a24fe3e00f68b5558b14c2",
-      "captured_at": "2026-11-13T21:57:44.185Z"
+      "source_commit": "145f063ef60ba514b9dae1f7a2028bfb90682f72",
+      "captured_at": "2026-11-13T22:02:31.446Z"
     }
   ],
   "page_errors": []

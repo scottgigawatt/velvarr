@@ -1,7 +1,7 @@
 # Settings parity after upstream synchronization
 
-Source: scottgigawatt/velvarr main `9fdf929c1d9a29f9c9a24fe3e00f68b5558b14c2`.
-Target: Skare69/velvarr main `c80ad195f8d510e8d3b74a225eb5ac5403371185`.
+Source: scottgigawatt/velvarr main `145f063ef60ba514b9dae1f7a2028bfb90682f72`.
+Target: Skare69/velvarr main `904593b67cacf49b8960cfc44351b2818fa6fe94`.
 
 Production builds, 1440 x 1200 viewport, synthetic configuration and service
 responses. No real credentials or live services. The expanded captures open
