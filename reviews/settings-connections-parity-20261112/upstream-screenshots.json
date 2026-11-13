@@ -1,0 +1,24 @@
+{
+  "before": {
+    "file": "connections-before-desktop.jpg",
+    "source_commit": "adf0191663a34650f806bdf87fc600ce59c85658",
+    "captured_from": "bd8fd20abf14687a48d826c34ae8a50f8513eef6",
+    "note": "Existing Before capture; fork main application tree was verified identical to this upstream main."
+  },
+  "after": {
+    "file": "upstream-after-desktop.jpg",
+    "source_commit": "8b75efd07620714cba0921aab70266ab62d2926b",
+    "captured_at": "2026-11-13T03:20:17.700Z"
+  },
+  "viewport": {
+    "width": 1440,
+    "height": 1200
+  },
+  "full_page": true,
+  "synthetic_services": true,
+  "real_credentials": false,
+  "page_errors": [],
+  "upstream_pr_head": "82ccacb8bca64c4761c0cafc2f7a062d88ab0ce3",
+  "fork_main_merge": "52c4c12b18a300064d0c3e14c8f6abcc0e187365",
+  "source_tree_equivalence": "Captured feature head, merged fork main, and clean upstream PR head have identical tracked trees."
+}
