@@ -47,6 +47,35 @@ To use an installed Chrome locally instead of downloading Chromium, set
 `PLAYWRIGHT_CHANNEL=chrome` when running `bun run test:ui`. Failed runs leave a
 screenshot and trace in the ignored `test-results/` directory.
 
+## Settings source modules
+
+The tabs share UI behavior while keeping their service-specific rules in separate
+modules. Connections gained a new module in this change. Metadata providers
+already had the following TypeScript modules on `main`; they remain in use.
+
+| Source | Role | Direct unit tests |
+| --- | --- | --- |
+| [`src/lib/connection-settings.ts`](../src/lib/connection-settings.ts) | Jellyfin/Whisparr draft initialization, change detection, field validation, and service-only save patches | `tests/connection-settings.test.ts` |
+| [`src/lib/provider-settings.ts`](../src/lib/provider-settings.ts) | TPDB/StashDB status, credential save/check/clear decisions, and the operation queue now used by both tabs | `tests/provider-settings.test.ts` |
+| [`src/lib/credential-card.ts`](../src/lib/credential-card.ts) | TPDB/StashDB editor state, save flow, and editor markup | `tests/provider-card.test.ts` |
+| [`src/lib/judgment-editor.ts`](../src/lib/judgment-editor.ts) | AI provider drafts, normalization, save/check outcomes, and available actions | `tests/judgment-editor.test.ts` |
+
+[`src/components/settings-service.tsx`](../src/components/settings-service.tsx)
+supplies both tabs with the same heading/actions layout, status indicator,
+editor focus return, and settings-wide save/check queue. Both tabs also use the
+same card, status, editor, and dropdown styles in `src/app/globals.css`.
+The browser suites exercise these shared components through each tab.
+
+The UI composition remains organized differently: Connections lives in
+`src/components/connection-settings.tsx`, while Metadata providers' existing
+cards remain in `src/components/settings.tsx`. Its existing metadata `.ts`
+modules provide the counterpart to `connection-settings.ts`. Service-specific
+differences remain intentional: Connections validates URLs and Whisparr delivery/mappings;
+metadata credentials support confirmed clearing with environment fallback;
+the AI editor supports backend selection and Ollama fields. The operator guides
+for [Connections](connections.md) and [Metadata providers](metadata-providers.md)
+describe these behaviors.
+
 ## Test files and their scope
 
 | File | Scope | Purpose |
