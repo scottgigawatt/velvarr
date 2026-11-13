@@ -29,7 +29,11 @@ import {
   saveConfig,
   updateAccount,
 } from "../../../../server/storage.ts";
-import { AppError, validateBaseUrl } from "../../../../server/http.ts";
+import {
+  AppError,
+  upstreamCheckError,
+  validateBaseUrl,
+} from "../../../../server/http.ts";
 import {
   getServer,
   getUserImage,
@@ -485,36 +489,23 @@ export async function adminUpdateIntegrations(
   return json(integrationsShape(config));
 }
 
-export async function adminWhisparr(ctx: AuthContext): Promise<Response> {
+/** Upstream rejections are connection diagnoses, never a dead Velvarr session.
+ * Local faults propagate instead of being mislabeled as configured services. */
+async function integrationCheck(
+  status: () => Promise<unknown>,
+): Promise<Response> {
   try {
-    return json(await getWhisparrStatus(ctx.config));
-  } catch (err) {
-    // Upstream rejection or outage is status information, never a dead
-    // Velvarr session: an HTTP 401 here would fire the client's global
-    // sign-out and bounce the admin off the settings page in a loop.
-    if (err instanceof AppError && err.status >= 400) {
-      return json({
-        configured: true,
-        error: { code: err.code, message: err.message },
-      });
-    }
-    throw err;
+    return json(await status());
+  } catch (error) {
+    return json({ configured: true, error: upstreamCheckError(error) });
   }
 }
-export async function adminJellyfin(ctx: AuthContext): Promise<Response> {
-  try {
-    return json(await getJellyfinStatus(ctx.config));
-  } catch (err) {
-    // Same as the Whisparr probe: upstream rejection is status information,
-    // not a dead Velvarr session.
-    if (err instanceof AppError && err.status >= 400) {
-      return json({
-        configured: true,
-        error: { code: err.code, message: err.message },
-      });
-    }
-    throw err;
-  }
+
+export function adminWhisparr(ctx: AuthContext): Promise<Response> {
+  return integrationCheck(() => getWhisparrStatus(ctx.config));
+}
+export function adminJellyfin(ctx: AuthContext): Promise<Response> {
+  return integrationCheck(() => getJellyfinStatus(ctx.config));
 }
 
 export async function adminProviders(_ctx: AuthContext): Promise<Response> {
@@ -531,21 +522,12 @@ export function providerCheckFailure(
   provider: CredentialProvider,
   error: unknown,
 ): ProviderCheck {
-  const upstreamCodes = new Set([
-    "upstream_auth",
-    "upstream_forbidden",
-    "upstream_not_found",
-    "upstream_unavailable",
-    "upstream_timeout",
-    "upstream_bad_response",
-  ]);
-  if (!(error instanceof AppError) || !upstreamCodes.has(error.code))
-    throw error;
+  const statusError = upstreamCheckError(error);
   return {
     provider,
     configured: true,
     verified: false,
-    error: { code: error.code, message: error.message },
+    error: statusError,
   };
 }
 

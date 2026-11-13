@@ -56,7 +56,7 @@ export function SettingsView() {
       </div>
       <div hidden={section !== "metadata"}>
         <div className="settings-content">
-          <MetadataSettings {...operations} />
+          <MetadataSettings onForbidden={forbid} {...operations} />
         </div>
       </div>
       <div hidden={section !== "system"}>

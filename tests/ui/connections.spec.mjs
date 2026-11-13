@@ -1,6 +1,10 @@
 import { expect } from "@playwright/test";
 import assert from "node:assert/strict";
-import { scenario, expectNoHorizontalOverflow } from "./settings-harness.mjs";
+import {
+  scenario,
+  expectNoHorizontalOverflow,
+  expectSaveFeedbackNearActions,
+} from "./settings-harness.mjs";
 
 scenario(
   "Compact cards share Metadata headings, actions and badge positions",
@@ -219,13 +223,7 @@ scenario(
     await expect(
       w.getByText("Saving Whisparr settings failed", { exact: true }),
     ).toBeVisible();
-    const feedback = w.locator("form").getByRole("alert");
-    await expect(feedback).toBeVisible();
-    const saveBox = await save(w).boundingBox(),
-      errorBox = await feedback.boundingBox(),
-      removeBox = await w.locator(".settings-destructive-row").boundingBox();
-    assert.ok(errorBox.y - (saveBox.y + saveBox.height) <= 20);
-    assert.ok(errorBox.y + errorBox.height < removeBox.y);
+    await expectSaveFeedbackNearActions(w);
     await expect(w.getByLabel("Whisparr API key")).toHaveValue(
       "synthetic-replacement",
     );
@@ -606,7 +604,17 @@ scenario(
     await fresh({ holdConfig: true });
     await expect(edit(jf)).toBeDisabled();
     await expect(check(jf)).toBeEnabled();
+    await page
+      .getByRole("button", { name: "Metadata providers", exact: true })
+      .click();
+    await expect(edit(provider)).toBeDisabled();
+    await expect(check(provider)).toBeEnabled();
+    await expect(badge(provider)).toHaveText("Connected");
     await control({ holdConfig: false });
+    await expect(edit(provider)).toBeEnabled();
+    await page
+      .getByRole("button", { name: "Connections", exact: true })
+      .click();
     await expect(edit(jf)).toBeEnabled();
     await expect(edit(w)).toBeEnabled();
     const data = await control({});

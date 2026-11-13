@@ -37,7 +37,7 @@ function harness(page) {
     save: (card) => card.getByRole("button", { name: "Save", exact: true }),
     cancel: (card) => card.getByRole("button", { name: "Cancel", exact: true }),
     check: (card) =>
-      card.getByRole("button", { name: "Check connection", exact: true }),
+      card.getByRole("button", { name: /^(Check connection|Checking…)$/ }),
     badge: (card) => card.locator(".connection-state"),
   };
 }
@@ -62,4 +62,20 @@ export function scenario(name, run) {
     await run(harness(page));
     expect(errors).toEqual([]);
   });
+}
+
+export async function expectSaveFeedbackNearActions(card) {
+  const alert = card.locator("form").getByRole("alert");
+  await expect(alert).toBeVisible();
+  const save = await card
+    .getByRole("button", { name: "Save", exact: true })
+    .boundingBox();
+  const feedback = await alert.boundingBox();
+  expect(feedback.y - (save.y + save.height)).toBeGreaterThanOrEqual(0);
+  expect(feedback.y - (save.y + save.height)).toBeLessThanOrEqual(20);
+  const destructive = card.locator(".settings-destructive-row");
+  if (await destructive.count()) {
+    const bounds = await destructive.boundingBox();
+    expect(feedback.y + feedback.height).toBeLessThan(bounds.y);
+  }
 }

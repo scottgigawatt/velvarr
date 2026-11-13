@@ -1,22 +1,6 @@
 import type { ProviderCheck } from "./contracts.ts";
 
-/** What one provider credential card shows about its connection. */
-export type ConnectionState =
-  | "unsaved"
-  | "checking"
-  | "connected"
-  | "failed"
-  | "not_configured"
-  | "unknown";
-
-export const CONNECTION_STATE_LABEL: Record<ConnectionState, string> = {
-  unsaved: "Unsaved changes",
-  checking: "Checking…",
-  connected: "Connected",
-  failed: "Failed",
-  not_configured: "Not configured",
-  unknown: "Unknown",
-};
+import type { ConnectionState } from "./settings-service.ts";
 
 /** Precedence, first match wins:
  * 1. a non-blank draft → "unsaved": the live result describes the saved key,
@@ -104,18 +88,4 @@ export function canClearCredential(input: {
   pending: boolean;
 }): boolean {
   return input.source === "stored" && !input.pending;
-}
-
-/** Saves and live probes share persisted configuration. Queue both kinds of
- * operation, including same-tick calls, and recover after a failed request. */
-export function createProviderSettingsQueue() {
-  let tail = Promise.resolve();
-  return function run<T>(operation: () => Promise<T>): Promise<T> {
-    const result = tail.then(operation);
-    tail = result.then(
-      () => undefined,
-      () => undefined,
-    );
-    return result;
-  };
 }

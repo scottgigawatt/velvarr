@@ -1,6 +1,7 @@
 // Jellyfin/Whisparr card lifecycle, used by connection-settings.tsx and tested
 // directly by connection-card.test.ts. Draft validation stays in
 // connection-settings.ts; this module coordinates editor and request outcomes.
+import type { SettingsFailureOf } from "./settings-service.ts";
 import {
   connectionDraft,
   connectionDraftChanged,
@@ -121,7 +122,7 @@ export function connectionCardBusy(
 
 type ConnectionFailure = {
   dispatch: (action: ConnectionCardAction) => void;
-  failureOf: (error: unknown) => { forbidden: boolean; message: string };
+  failureOf: SettingsFailureOf;
   onForbidden: () => void;
 };
 

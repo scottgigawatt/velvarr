@@ -6,7 +6,6 @@ import {
   useId,
   useRef,
   useReducer,
-  useState,
   type FormEvent,
 } from "react";
 import {
@@ -24,9 +23,14 @@ import {
   reduceConnectionCard,
   type ConnectionStatus,
 } from "../lib/connection-card.ts";
-import { ApiError, api, ErrorPanel, messageOf } from "./shared.tsx";
+import { api, ErrorPanel } from "./shared.tsx";
 import {
   ConnectionState,
+  SettingsCheckButton,
+  SettingsConfirmationDialog,
+  SettingsSaveFeedback,
+  settingsFailureOf,
+  useSettingsConfiguration,
   SettingsServiceHeading,
   useEditorFocusReturn,
   type ConnectionStateLabel,
@@ -34,42 +38,13 @@ import {
 } from "./settings-service.tsx";
 
 type SaveConnection = (body: ConnectionPatch) => Promise<ConnectionsInfo>;
-const failureOf = (error: unknown) => ({
-  forbidden: error instanceof ApiError && error.status === 403,
-  message: messageOf(error),
-});
-
 export function ConnectionsSettings({
   onForbidden,
   saving,
   runOperation,
 }: SettingsOperations & { onForbidden: () => void }) {
-  const [info, setInfo] = useState<ConnectionsInfo>();
-  const [loading, setLoading] = useState(true);
-  const [loadError, setLoadError] = useState<string | null>(null);
-  const load = useCallback(() => {
-    setLoading(true);
-    setLoadError(null);
-    api<ConnectionsInfo>("/api/admin/integrations")
-      .then(setInfo)
-      .catch((error) => {
-        if (error instanceof ApiError && error.status === 403) onForbidden();
-        else setLoadError(messageOf(error));
-      })
-      .finally(() => setLoading(false));
-  }, [onForbidden]);
-  useEffect(load, [load]);
-
-  const save: SaveConnection = (body) =>
-    runOperation(async () => {
-      const data = await api<ConnectionsInfo>("/api/admin/integrations", {
-        method: "PATCH",
-        body: JSON.stringify(body),
-      });
-      setInfo(data);
-      setLoadError(null);
-      return data;
-    });
+  const { info, loadError, load, save, unavailable } =
+    useSettingsConfiguration<ConnectionsInfo>({ runOperation, onForbidden });
 
   return (
     <>
@@ -85,7 +60,7 @@ export function ConnectionsSettings({
           key={service}
           service={service}
           info={info}
-          configurationUnavailable={loading || Boolean(loadError)}
+          configurationUnavailable={unavailable}
           saving={saving}
           runOperation={runOperation}
           onSave={save}
@@ -130,7 +105,6 @@ function ConnectionCard({
   const inputRef = useRef<HTMLInputElement>(null);
   const { editRef, noticeRef } = useEditorFocusReturn(editing);
   const removeRef = useRef<HTMLDialogElement>(null);
-  const removeTitleId = useId();
   const editorId = useId();
   const helpId = useId();
   const busy = connectionCardBusy(editor, saving);
@@ -149,7 +123,7 @@ function ConnectionCard({
         dispatch,
         performCheck: () =>
           runOperation(() => api<ConnectionStatus>("/api/admin/" + service)),
-        failureOf,
+        failureOf: settingsFailureOf,
         onForbidden,
       }),
     [service, runOperation, onForbidden],
@@ -180,7 +154,7 @@ function ConnectionCard({
       dispatch,
       performSave: onSave,
       verify,
-      failureOf,
+      failureOf: settingsFailureOf,
       onForbidden,
     });
   }
@@ -206,26 +180,12 @@ function ConnectionCard({
       : null;
   const current = info?.[service];
   const saveFeedback = (
-    <>
-      {saved && (
-        <p
-          ref={noticeRef}
-          className="mt-3 text-sm text-muted"
-          role="status"
-          tabIndex={-1}
-        >
-          {saved}
-        </p>
-      )}
-      {saveError && (
-        <div className="mt-3">
-          <ErrorPanel
-            title={"Saving " + name + " settings failed"}
-            message={saveError}
-          />
-        </div>
-      )}
-    </>
+    <SettingsSaveFeedback
+      notice={saved}
+      error={saveError}
+      errorTitle={"Saving " + name + " settings failed"}
+      noticeRef={noticeRef}
+    />
   );
 
   return (
@@ -239,15 +199,12 @@ function ConnectionCard({
             : "Your download connection, delivery settings, and library path mappings."
         }
       >
-        <button
-          type="button"
-          className="btn"
+        <SettingsCheckButton
+          checking={checking}
           disabled={busy || Boolean(disabledReason)}
-          aria-describedby={disabledReason ? helpId : undefined}
-          onClick={() => void verify()}
-        >
-          {checking ? "Checking…" : "Check connection"}
-        </button>
+          helpId={disabledReason ? helpId : undefined}
+          onCheck={() => void verify()}
+        />
         {!editing && (
           <button
             type="button"
@@ -394,42 +351,18 @@ function ConnectionCard({
               Remove connection
             </button>
           </div>
-          <dialog
-            ref={removeRef}
-            className="bulk-dialog"
-            aria-labelledby={removeTitleId}
+          <SettingsConfirmationDialog
+            dialogRef={removeRef}
+            title="Remove the Whisparr connection?"
+            cancelLabel="Keep connection"
+            confirmLabel="Remove connection"
+            disabled={busy}
+            onConfirm={() => void apply(true)}
           >
-            <div className="p-5">
-              <h3 id={removeTitleId} className="font-semibold">
-                Remove the Whisparr connection?
-              </h3>
-              <p className="mt-2 text-sm text-muted">
-                This removes the saved URL, credential, delivery settings, and
-                path mappings. Approved requests remain in Velvarr until
-                delivery is configured again.
-              </p>
-              <div className="mt-4 flex justify-end gap-2">
-                <button
-                  type="button"
-                  className="btn"
-                  onClick={() => removeRef.current?.close()}
-                >
-                  Keep connection
-                </button>
-                <button
-                  type="button"
-                  className="btn btn-danger"
-                  disabled={busy}
-                  onClick={() => {
-                    removeRef.current?.close();
-                    void apply(true);
-                  }}
-                >
-                  Remove connection
-                </button>
-              </div>
-            </div>
-          </dialog>
+            This removes the saved URL, credential, delivery settings, and path
+            mappings. Approved requests remain in Velvarr until delivery is
+            configured again.
+          </SettingsConfirmationDialog>
         </>
       )}
       {!editing && saveFeedback}

@@ -3,7 +3,6 @@
 import {
   useCallback,
   useEffect,
-  useId,
   useRef,
   useReducer,
   useState,
@@ -15,29 +14,29 @@ import type {
   IntegrationConfig,
   JudgmentProvider,
 } from "../lib/contracts.ts";
-import {
-  ApiError,
-  api,
-  ErrorPanel,
-  ForbiddenPanel,
-  messageOf,
-  useSession,
-} from "./shared.tsx";
+import { ApiError, api, ErrorPanel, messageOf, useSession } from "./shared.tsx";
 import {
   ConnectionState,
+  SettingsCheckButton,
+  SettingsConfirmationDialog,
+  SettingsSaveFeedback,
+  settingsFailureOf,
+  useSettingsConfiguration,
   SettingsServiceHeading,
   useEditorFocusReturn,
   type ConnectionStateLabel,
-  type RunSettingsOperation as RunProviderOperation,
+  type RunSettingsOperation,
   type SettingsOperations,
 } from "./settings-service.tsx";
 import {
+  type JudgmentConfig,
   initJudgmentEditor,
   judgmentCheckDisabledReason,
   judgmentEditorSettings,
   providerSettingsActions,
   reduceJudgmentEditor,
 } from "../lib/judgment-editor.ts";
+import { CONNECTION_STATE_LABEL } from "../lib/settings-service.ts";
 import {
   canClearCredential,
   canTestCredential,
@@ -55,14 +54,6 @@ import {
 type ProviderConfigRow = {
   configured: boolean;
   source: "stored" | "environment";
-};
-type JudgmentConfig = {
-  provider: JudgmentProvider;
-  url: string;
-  model: string;
-  configured: boolean;
-  stored: boolean;
-  error?: string;
 };
 type ProviderSettingsInfo = {
   providers: Record<CredentialProvider | "typesafe", ProviderConfigRow>;
@@ -96,39 +87,21 @@ const CREDENTIAL_ROWS = [
   },
 ] as const;
 
-export function MetadataSettings({ saving, runOperation }: SettingsOperations) {
+export function MetadataSettings({
+  saving,
+  runOperation,
+  onForbidden,
+}: SettingsOperations & { onForbidden: () => void }) {
   const { refreshSession } = useSession();
-  const [info, setInfo] = useState<ProviderSettingsInfo | null>(null);
-  const [loadError, setLoadError] = useState<string | null>(null);
-  const [forbidden, setForbidden] = useState(false);
-
-  const load = useCallback(() => {
-    setLoadError(null);
-    api<ProviderSettingsInfo>("/api/admin/integrations")
-      .then(setInfo)
-      .catch((error) => {
-        if (error instanceof ApiError && error.status === 403)
-          setForbidden(true);
-        else setLoadError(messageOf(error));
-      });
-  }, []);
-  useEffect(load, [load]);
-
-  const save: SaveProviderSettings = (body) =>
-    runOperation(async () => {
-      // All metadata/AI saves and probes use one queue. A probe always reads
-      // persisted settings, and a failed operation cannot block the next one.
-      const data = await api<ProviderSettingsInfo>("/api/admin/integrations", {
-        method: "PATCH",
-        body: JSON.stringify(body),
-      });
-      setInfo(data);
-      setLoadError(null);
-      refreshSession().catch(() => undefined);
-      return data;
+  const { info, loadError, load, save, unavailable } =
+    useSettingsConfiguration<ProviderSettingsInfo>({
+      runOperation,
+      onForbidden,
+      onSaved: () => {
+        refreshSession().catch(() => undefined);
+      },
     });
 
-  if (forbidden) return <ForbiddenPanel />;
   return (
     <>
       {loadError && (
@@ -143,6 +116,7 @@ export function MetadataSettings({ saving, runOperation }: SettingsOperations) {
           key={row.id}
           {...row}
           config={info?.providers[row.id]}
+          configurationUnavailable={unavailable}
           saving={saving}
           runOperation={runOperation}
           onSave={save}
@@ -150,6 +124,7 @@ export function MetadataSettings({ saving, runOperation }: SettingsOperations) {
       ))}
       <JudgmentCard
         config={info?.judgment}
+        configurationUnavailable={unavailable}
         keyConfig={info?.providers.typesafe}
         saving={saving}
         runOperation={runOperation}
@@ -167,14 +142,16 @@ function ProviderCredentialCard({
   maxLength,
   description,
   config,
+  configurationUnavailable,
   saving,
   onSave,
   runOperation,
 }: {
   config?: ProviderConfigRow;
+  configurationUnavailable: boolean;
   saving: boolean;
   onSave: SaveProviderSettings;
-  runOperation: RunProviderOperation;
+  runOperation: RunSettingsOperation;
 } & (typeof CREDENTIAL_ROWS)[number]) {
   const [editor, dispatch] = useReducer(
     reduceCredentialCard,
@@ -186,7 +163,6 @@ function ProviderCredentialCard({
   // Deleting a stored credential is destructive, so the click first opens this
   // confirmation; the id must be unique — this card renders once per provider.
   const clearRef = useRef<HTMLDialogElement>(null);
-  const clearTitleId = useId();
   useEffect(() => {
     if (editor.editing) inputRef.current?.focus();
   }, [editor.editing]);
@@ -223,10 +199,7 @@ function ProviderCredentialCard({
       label,
       performSave: (value) => onSave({ [field]: value }).then(() => undefined),
       dispatch,
-      failureOf: (error) => ({
-        forbidden: error instanceof ApiError && error.status === 403,
-        message: messageOf(error),
-      }),
+      failureOf: settingsFailureOf,
     });
     if (saved) await verify();
   }
@@ -246,8 +219,11 @@ function ProviderCredentialCard({
       checking: editor.checking,
       configured: config?.configured,
     }),
-    canEdit: !busy && Boolean(config),
-    canClear: canClearCredential({ source: config?.source, pending: busy }),
+    canEdit: !busy && !configurationUnavailable && Boolean(config),
+    canClear: canClearCredential({
+      source: config?.source,
+      pending: busy || configurationUnavailable,
+    }),
   };
   // Transient busy states are announced by the live status row instead.
   const checkDisabledReason = !actions.canCheck
@@ -263,15 +239,15 @@ function ProviderCredentialCard({
     check: editor.check,
     requestError: editor.checkError,
   });
-  const stateLabels = {
-    unsaved: "Unsaved changes",
-    checking: "Checking…",
-    connected: "Connected",
-    failed: "Connection failed",
-    not_configured: "Not configured",
-    unknown: "Not checked",
-  } as const;
-  const connectionStateLabel: ConnectionStateLabel = stateLabels[state];
+  const connectionStateLabel = CONNECTION_STATE_LABEL[state];
+  const saveFeedback = (
+    <SettingsSaveFeedback
+      notice={editor.saved}
+      error={editor.saveError}
+      errorTitle={"Saving " + name + " credential failed"}
+      noticeRef={noticeRef}
+    />
+  );
   return (
     <section className="panel p-5" aria-labelledby={"provider-heading-" + id}>
       <SettingsServiceHeading
@@ -279,17 +255,12 @@ function ProviderCredentialCard({
         title={name}
         description={description}
       >
-        <button
-          type="button"
-          className="btn"
+        <SettingsCheckButton
+          checking={editor.checking}
           disabled={!actions.canCheck}
-          aria-describedby={
-            checkDisabledReason ? "check-help-" + id : undefined
-          }
-          onClick={() => void verify()}
-        >
-          Check connection
-        </button>
+          helpId={checkDisabledReason ? "check-help-" + id : undefined}
+          onCheck={() => void verify()}
+        />
         {!editor.editing && (
           <button
             type="button"
@@ -330,12 +301,13 @@ function ProviderCredentialCard({
           state: editor,
           canEdit: actions.canEdit,
           busy,
+          feedback: saveFeedback,
           inputRef,
           onDraftChange: (value) => dispatch({ type: "draft", value }),
           onCancel: cancel,
           onSubmit: (event) => {
             event.preventDefault();
-            if (!busy && config) void apply();
+            if (!busy && !configurationUnavailable && config) void apply();
           },
         })}
       {editor.editing && config?.source === "stored" && (
@@ -352,62 +324,21 @@ function ProviderCredentialCard({
               Clear stored credential
             </button>
           </div>
-          <dialog
-            ref={clearRef}
-            className="bulk-dialog"
-            aria-labelledby={clearTitleId}
+          <SettingsConfirmationDialog
+            dialogRef={clearRef}
+            title={"Clear the stored " + name + " credential?"}
+            cancelLabel="Keep credential"
+            confirmLabel="Clear credential"
+            disabled={!actions.canClear}
+            onConfirm={() => void apply(true)}
           >
-            <div className="p-5">
-              <h3 id={clearTitleId} className="font-semibold">
-                Clear the stored {name} credential?
-              </h3>
-              <p className="mt-2 text-sm text-muted">
-                The encrypted credential is deleted from storage. {name} then
-                falls back to the environment settings, and connection checks
-                use that fallback.
-              </p>
-              <div className="mt-4 flex justify-end gap-2">
-                <button
-                  type="button"
-                  className="btn"
-                  onClick={() => clearRef.current?.close()}
-                >
-                  Keep credential
-                </button>
-                <button
-                  type="button"
-                  className="btn btn-danger"
-                  disabled={!actions.canClear}
-                  onClick={() => {
-                    clearRef.current?.close();
-                    void apply(true);
-                  }}
-                >
-                  Clear credential
-                </button>
-              </div>
-            </div>
-          </dialog>
+            The encrypted credential is deleted from storage. {name} then falls
+            back to the environment settings, and connection checks use that
+            fallback.
+          </SettingsConfirmationDialog>
         </>
       )}
-      {editor.saved && (
-        <p
-          ref={noticeRef}
-          className="mt-3 text-sm text-muted"
-          role="status"
-          tabIndex={-1}
-        >
-          {editor.saved}
-        </p>
-      )}
-      {editor.saveError && (
-        <div className="mt-3">
-          <ErrorPanel
-            title={"Saving " + name + " credential failed"}
-            message={editor.saveError}
-          />
-        </div>
-      )}
+      {!editor.editing && saveFeedback}
       {error && !unsaved && (
         <div className="mt-3">
           <ErrorPanel
@@ -430,15 +361,17 @@ function ProviderCredentialCard({
 function JudgmentCard({
   config,
   keyConfig,
+  configurationUnavailable,
   saving,
   onSave,
   runOperation,
 }: {
   config?: JudgmentConfig;
+  configurationUnavailable: boolean;
   keyConfig?: ProviderConfigRow;
   saving: boolean;
   onSave: SaveProviderSettings;
-  runOperation: RunProviderOperation;
+  runOperation: RunSettingsOperation;
 }) {
   const [editor, dispatch] = useReducer(
     reduceJudgmentEditor,
@@ -455,15 +388,13 @@ function JudgmentCard({
   // confirmation dialog (unique ids: dialogs resolve aria-labelledby by id).
   const clearKeyRef = useRef<HTMLDialogElement>(null);
   const useEnvRef = useRef<HTMLDialogElement>(null);
-  const clearKeyTitleId = useId();
-  const useEnvTitleId = useId();
   const { provider, url, model } = editor.draft;
   const checking = editor.check?.state === "checking";
   const connected = editor.check?.state === "connected";
-  const busy = saving || checking || forbidden;
+  const busy = saving || checking || forbidden || configurationUnavailable;
   const actions = providerSettingsActions(editor, {
     ready: Boolean(config),
-    pending: saving || forbidden,
+    pending: saving || forbidden || configurationUnavailable,
     configured: Boolean(config?.configured),
   });
   const savedProvider = config && judgmentEditorSettings(config).provider;
@@ -510,7 +441,7 @@ function JudgmentCard({
 
   function begin() {
     if (!config) return;
-    dispatch({ type: "cancel" });
+    dispatch({ type: "begin" });
     setApiKey("");
     setSaveError(null);
     setEditing(true);
@@ -529,6 +460,7 @@ function JudgmentCard({
     verify = false,
   ) {
     setSaveError(null);
+    dispatch({ type: "saveStarted" });
     try {
       const data = await onSave(body);
       setApiKey("");
@@ -651,16 +583,22 @@ function JudgmentCard({
     </>
   );
 
+  const saveFeedback = (
+    <SettingsSaveFeedback
+      notice={!unsaved ? editor.notice : null}
+      error={saveError}
+      errorTitle="Saving AI settings failed"
+      noticeRef={noticeRef}
+    />
+  );
+
   const checkButton = (
-    <button
-      type="button"
-      className="btn"
+    <SettingsCheckButton
+      checking={checking}
       disabled={busy || Boolean(checkDisabledReason)}
-      aria-describedby={checkDisabledReason ? "judgment-check-help" : undefined}
-      onClick={() => void check()}
-    >
-      {checking ? "Checking…" : "Check connection"}
-    </button>
+      helpId={checkDisabledReason ? "judgment-check-help" : undefined}
+      onCheck={() => void check()}
+    />
   );
 
   return (
@@ -745,7 +683,10 @@ function JudgmentCard({
                       maxLength={512}
                       disabled={busy}
                       value={apiKey}
-                      onChange={(event) => setApiKey(event.target.value)}
+                      onChange={(event) => {
+                        setApiKey(event.target.value);
+                        setSaveError(null);
+                      }}
                       placeholder={
                         keyConfig?.configured
                           ? "Leave blank to keep the current credential"
@@ -768,12 +709,13 @@ function JudgmentCard({
                       required
                       disabled={busy}
                       value={url}
-                      onChange={(event) =>
+                      onChange={(event) => {
                         dispatch({
                           type: "edit",
                           patch: { url: event.target.value },
-                        })
-                      }
+                        });
+                        setSaveError(null);
+                      }}
                     />
                     <label className="label" htmlFor="ollama-model">
                       Decision model
@@ -784,12 +726,13 @@ function JudgmentCard({
                       required
                       disabled={busy}
                       value={model}
-                      onChange={(event) =>
+                      onChange={(event) => {
                         dispatch({
                           type: "edit",
                           patch: { model: event.target.value },
-                        })
-                      }
+                        });
+                        setSaveError(null);
+                      }}
                     />
                     <p className="text-sm text-muted">
                       Use a reachable Ollama server with a decision model such
@@ -822,6 +765,7 @@ function JudgmentCard({
               {!standard && checkButton}
             </div>
           </div>
+          {saveFeedback}
         </form>
       )}
       {editing &&
@@ -852,99 +796,42 @@ function JudgmentCard({
                 </button>
               )}
             </div>
-            <dialog
-              ref={clearKeyRef}
-              className="bulk-dialog"
-              aria-labelledby={clearKeyTitleId}
+            <SettingsConfirmationDialog
+              dialogRef={clearKeyRef}
+              title="Clear the stored TypeSafe credential?"
+              cancelLabel="Keep credential"
+              confirmLabel="Clear credential"
+              disabled={busy}
+              onConfirm={() =>
+                void apply(
+                  { typesafeApiKey: "" },
+                  "Stored TypeSafe credential cleared. Environment settings apply.",
+                )
+              }
             >
-              <div className="p-5">
-                <h3 id={clearKeyTitleId} className="font-semibold">
-                  Clear the stored TypeSafe credential?
-                </h3>
-                <p className="mt-2 text-sm text-muted">
-                  The stored key is deleted from storage. Environment settings
-                  apply; without a key, standard matching remains active.
-                </p>
-                <div className="mt-4 flex justify-end gap-2">
-                  <button
-                    type="button"
-                    className="btn"
-                    onClick={() => clearKeyRef.current?.close()}
-                  >
-                    Keep credential
-                  </button>
-                  <button
-                    type="button"
-                    className="btn btn-danger"
-                    disabled={busy}
-                    onClick={() => {
-                      clearKeyRef.current?.close();
-                      void apply(
-                        { typesafeApiKey: "" },
-                        "Stored TypeSafe credential cleared. Environment settings apply.",
-                      );
-                    }}
-                  >
-                    Clear credential
-                  </button>
-                </div>
-              </div>
-            </dialog>
-            <dialog
-              ref={useEnvRef}
-              className="bulk-dialog"
-              aria-labelledby={useEnvTitleId}
+              The stored key is deleted from storage. Environment settings
+              apply; without a key, standard matching remains active.
+            </SettingsConfirmationDialog>
+            <SettingsConfirmationDialog
+              dialogRef={useEnvRef}
+              title="Use environment settings?"
+              cancelLabel="Keep AI settings"
+              confirmLabel="Use environment settings"
+              disabled={busy}
+              onConfirm={() =>
+                void apply(
+                  { judgmentProvider: "", ollamaUrl: "", ollamaModel: "" },
+                  "Using environment settings. Check the saved connection to verify the selected model.",
+                )
+              }
             >
-              <div className="p-5">
-                <h3 id={useEnvTitleId} className="font-semibold">
-                  Use environment settings?
-                </h3>
-                <p className="mt-2 text-sm text-muted">
-                  The stored AI settings are deleted. The provider, URL and
-                  model then come from the environment. Check the saved
-                  connection afterwards to verify the selected model.
-                </p>
-                <div className="mt-4 flex justify-end gap-2">
-                  <button
-                    type="button"
-                    className="btn"
-                    onClick={() => useEnvRef.current?.close()}
-                  >
-                    Keep AI settings
-                  </button>
-                  <button
-                    type="button"
-                    className="btn btn-danger"
-                    disabled={busy}
-                    onClick={() => {
-                      useEnvRef.current?.close();
-                      void apply(
-                        {
-                          judgmentProvider: "",
-                          ollamaUrl: "",
-                          ollamaModel: "",
-                        },
-                        "Using environment settings. Check the saved connection to verify the selected model.",
-                      );
-                    }}
-                  >
-                    Use environment settings
-                  </button>
-                </div>
-              </div>
-            </dialog>
+              The stored AI settings are deleted. The provider, URL and model
+              then come from the environment. Check the saved connection
+              afterwards to verify the selected model.
+            </SettingsConfirmationDialog>
           </>
         )}
-      {editor.notice && !unsaved && (
-        <p
-          ref={noticeRef}
-          className="mt-3 text-sm text-muted"
-          role="status"
-          tabIndex={-1}
-        >
-          {editor.notice}
-        </p>
-      )}
+      {!editing && saveFeedback}
       {editor.check && !unsaved && (
         <p
           className="judgment-check mt-2"
@@ -957,11 +844,6 @@ function JudgmentCard({
               ? `${editor.check.provider === "ollama" ? "Ollama" : "TypeSafe"} answered a decision successfully.`
               : editor.check.message}
         </p>
-      )}
-      {saveError && (
-        <div className="mt-3">
-          <ErrorPanel title="Saving AI settings failed" message={saveError} />
-        </div>
       )}
       {forbidden && (
         <p className="mt-3 text-sm text-muted">

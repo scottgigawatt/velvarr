@@ -1,5 +1,9 @@
 import { expect } from "@playwright/test";
-import { scenario, expectNoHorizontalOverflow } from "./settings-harness.mjs";
+import {
+  scenario,
+  expectNoHorizontalOverflow,
+  expectSaveFeedbackNearActions,
+} from "./settings-harness.mjs";
 
 const rows = [
   {
@@ -130,6 +134,7 @@ for (const row of rows) {
       await expect(own.getByLabel(row.label, { exact: true })).toHaveValue(
         "synthetic-retry",
       );
+      await expectSaveFeedbackNearActions(own);
       await control({ patchFail: false });
       await save(own).click();
       await expect(edit(own)).toBeEnabled();
@@ -246,6 +251,9 @@ scenario(
     await check(stash).click();
     await expect(badge(stash)).toHaveText("Checking…");
     await expect(check(stash)).toBeDisabled();
+    await expect(
+      stash.getByRole("button", { name: "Checking…", exact: true }),
+    ).toBeVisible();
     await expect(check(tpdb)).toBeDisabled();
     await expect(edit(tpdb)).toBeDisabled();
     await expect(
@@ -437,6 +445,17 @@ scenario(
     await expect(ai.getByLabel("Decision model", { exact: true })).toHaveValue(
       "saved-model",
     );
+    await expectSaveFeedbackNearActions(ai);
+    await ai
+      .getByLabel("Decision model", { exact: true })
+      .fill("corrected-model");
+    await expect(ai.locator("form").getByRole("alert")).toHaveCount(0);
+    await save(ai).click();
+    await expectSaveFeedbackNearActions(ai);
+    await ai
+      .getByLabel("Ollama URL", { exact: true })
+      .fill("http://corrected-ollama.test:11434");
+    await expect(ai.locator("form").getByRole("alert")).toHaveCount(0);
     await cancel(ai).click();
     await expect(edit(ai)).toBeFocused();
     await expect(badge(ai)).toHaveText("Connected");
@@ -614,5 +633,62 @@ scenario(
     expect(patches(state).map((request) => request.body)).toEqual([
       { tpdbApiToken: "synthetic-metadata-save" },
     ]);
+  },
+);
+
+scenario(
+  "Correcting a TypeSafe draft clears its save error beside the actions",
+  async (h) => {
+    const { page, edit, save, control } = h;
+    await openMetadata(h);
+    const ai = aiCard(page);
+    await edit(ai).click();
+    await ai
+      .getByLabel("TypeSafe API key", { exact: true })
+      .fill("synthetic-first-key");
+    await control({ patchFail: true });
+    await save(ai).click();
+    await expectSaveFeedbackNearActions(ai);
+    await ai
+      .getByLabel("TypeSafe API key", { exact: true })
+      .fill("synthetic-corrected-key");
+    await expect(ai.locator("form").getByRole("alert")).toHaveCount(0);
+    await control({ patchFail: false });
+    await save(ai).click();
+    await expect(edit(ai)).toBeEnabled();
+    await expect(
+      ai.getByText("Settings saved.", { exact: true }),
+    ).toBeVisible();
+  },
+);
+
+scenario(
+  "A failed AI save never reuses an earlier successful save notice",
+  async (h) => {
+    const { page, edit, save, control } = h;
+    await openMetadata(h);
+    const ai = aiCard(page);
+    await edit(ai).click();
+    await save(ai).click();
+    await expect(edit(ai)).toBeEnabled();
+    await expect(
+      ai.getByText("Settings saved.", { exact: true }),
+    ).toBeVisible();
+    await edit(ai).click();
+    await expect(ai.getByText("Settings saved.", { exact: true })).toHaveCount(
+      0,
+    );
+    await control({ patchFail: true });
+    await save(ai).click();
+    await expectSaveFeedbackNearActions(ai);
+    await expect(ai.getByText("Settings saved.", { exact: true })).toHaveCount(
+      0,
+    );
+    await control({ patchFail: false });
+    await save(ai).click();
+    await expect(edit(ai)).toBeEnabled();
+    await expect(
+      ai.getByText("Settings saved.", { exact: true }),
+    ).toBeVisible();
   },
 );
