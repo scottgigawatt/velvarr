@@ -1,4 +1,4 @@
-// Isolated API fixture for production-build browser regressions. The app
+// Shared Connections and Metadata providers API fixture. The app
 // serves its real UI/assets; these synthetic responses exercise UI behavior.
 // Server-side persistence, authorization and upstream calls are covered by
 // tests/api.test.ts and tests/integrations.test.ts, not by this mock server.

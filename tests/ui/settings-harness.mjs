@@ -1,5 +1,6 @@
 import { test, expect } from "@playwright/test";
 
+// Shared helpers for both Connections and Metadata providers browser tests.
 // One isolated fixture server is shared serially. Every test gets a new
 // browser context, resets synthetic data, and fails on page errors.
 function harness(page) {

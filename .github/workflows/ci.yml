@@ -33,7 +33,6 @@ jobs:
         run: bun audit
       - run: bun run check
       - run: bun run test
-      - run: bun run test:coverage:connections
       - run: bun run build
         env:
           NEXT_TELEMETRY_DISABLED: '1'

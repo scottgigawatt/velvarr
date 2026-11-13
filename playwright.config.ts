@@ -18,7 +18,7 @@ export default defineConfig({
     channel: process.env.PLAYWRIGHT_CHANNEL || undefined,
   },
   webServer: {
-    command: "node tests/ui/fixture.mjs",
+    command: "node tests/ui/settings-fixture.mjs",
     url: "http://127.0.0.1:16741/__settings_test/ready",
     reuseExistingServer: false,
     timeout: 60000,

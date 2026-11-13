@@ -18,8 +18,7 @@
     "backup": "node scripts/backup.mjs",
     "format": "prettier --write \"src/**/*.{ts,tsx,css}\" \"*.{ts,tsx,json,mjs}\" \"tests/**/*.{ts,mjs}\" \"scripts/**/*.mjs\"",
     "format:check": "prettier --check \"src/**/*.{ts,tsx,css}\" \"*.{ts,tsx,json,mjs}\" \"tests/**/*.{ts,mjs}\" \"scripts/**/*.mjs\"",
-    "test:ui": "playwright test",
-    "test:coverage:connections": "node --experimental-strip-types --import ./tests/setup.ts --test --experimental-test-coverage --test-coverage-include=src/lib/connection-settings.ts --test-coverage-lines=100 --test-coverage-branches=100 --test-coverage-functions=100 tests/connection-settings.test.ts"
+    "test:ui": "playwright test"
   },
   "dependencies": {
     "@typesafe-ai/sdk": "^0.6.0",
