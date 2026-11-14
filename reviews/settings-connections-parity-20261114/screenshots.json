@@ -1,0 +1,56 @@
+{
+  "source": "scottgigawatt/velvarr:main",
+  "target": "Skare69/velvarr:main",
+  "viewport": {
+    "width": 1440,
+    "height": 1200
+  },
+  "synthetic_services": true,
+  "real_credentials": false,
+  "note": "Before is latest upstream main. After is fork main with upstream merged. Editors opened with Edit in both versions. Temporary upstream copy is built without source modifications.",
+  "captures": [
+    {
+      "comparison": "before",
+      "view": "overview",
+      "file": "connections-before-desktop.jpg",
+      "source_commit": "bc77c90fb31c7885dff697e0c7f46edd71894652",
+      "captured_at": "2026-11-14T08:32:19.974Z"
+    },
+    {
+      "comparison": "before",
+      "view": "jellyfin expanded",
+      "file": "jellyfin-expanded-before.jpg",
+      "source_commit": "bc77c90fb31c7885dff697e0c7f46edd71894652",
+      "captured_at": "2026-11-14T08:32:20.186Z"
+    },
+    {
+      "comparison": "before",
+      "view": "whisparr expanded",
+      "file": "whisparr-expanded-before.jpg",
+      "source_commit": "bc77c90fb31c7885dff697e0c7f46edd71894652",
+      "captured_at": "2026-11-14T08:32:20.322Z"
+    },
+    {
+      "comparison": "after",
+      "view": "overview",
+      "file": "connections-after-desktop.jpg",
+      "source_commit": "ff83fba5714235cd5d2b34eca621b9255e412cf0",
+      "captured_at": "2026-11-14T08:32:20.544Z"
+    },
+    {
+      "comparison": "after",
+      "view": "jellyfin expanded",
+      "file": "jellyfin-expanded-after.jpg",
+      "source_commit": "ff83fba5714235cd5d2b34eca621b9255e412cf0",
+      "captured_at": "2026-11-14T08:32:20.757Z"
+    },
+    {
+      "comparison": "after",
+      "view": "whisparr expanded",
+      "file": "whisparr-expanded-after.jpg",
+      "source_commit": "ff83fba5714235cd5d2b34eca621b9255e412cf0",
+      "captured_at": "2026-11-14T08:32:20.893Z"
+    }
+  ],
+  "page_errors": []
+}
