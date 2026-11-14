@@ -1,7 +1,7 @@
 # Rebased settings comparison
 
-Source: scottgigawatt/velvarr main `d43244e9ea600d25201ec3172471ba2cf510a287`.
-Target: Skare69/velvarr main `fbe4db427d3d821a16a48d37d4c02e12d0f35a92`.
+Source: scottgigawatt/velvarr main `3a2c5a00f6a9fa967f589c9510c8dd2d0fc4c88e`.
+Target: Skare69/velvarr main `2a61c29959a25205ced4767eae7666befaae43fe`.
 
 Production builds, 1440 x 1200 viewport, synthetic configuration and service
 responses. No real credentials or live services. The expanded captures open
