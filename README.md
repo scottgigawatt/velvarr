@@ -4,6 +4,8 @@ One permanent, asset-only branch for screenshots and review provenance. Do not m
 
 ## Reviews
 
+- [Settings parity after upstream sync, November 16](reviews/settings-connections-parity-20261116/README.md).
+
 - [Settings parity after upstream sync, November 14](reviews/settings-connections-parity-20261114/README.md).
 
 - [Settings parity after upstream sync, November 13](reviews/settings-connections-parity-20261113/README.md).
