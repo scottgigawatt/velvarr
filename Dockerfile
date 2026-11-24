@@ -1,14 +1,14 @@
 # Velvarr container: multi-stage, reproducible, secrets only at runtime.
 # Build needs no VELVARR_* secrets; .dockerignore keeps .env* out of the context entirely.
 
-# Install stage: Bun 1.3.14 with the frozen lockfile produces node_modules for the Node build.
-FROM oven/bun:1.3.14@sha256:e10577f0db68676a7024391c6e5cb4b879ebd17188ab750cf10024a6d700e5c4 AS deps
+# Install stage: Bun 1.4.5 with the frozen lockfile produces node_modules for the Node build.
+FROM oven/bun:1.4.5@sha256:3aa040e5445efa09d75bb428a64ba50db13e2b3ac9b6b0c7f145615f62b2ee18 AS deps
 WORKDIR /app
 COPY package.json bun.lock ./
 RUN bun install --frozen-lockfile
 
-# Build stage: Next standalone output compiled by Node 24.21.0. No env secrets required.
-FROM node:24.21.0-slim@sha256:0e0ff40c39bc087845bfb27465a0df4ea419520094bc35842ff83dd8cbe6f9b6 AS build
+# Build stage: Next standalone output compiled by Node 26.13.1. No env secrets required.
+FROM node:26.13.1-slim@sha256:e6bedef217677b276c591795e169840edd9096dbf13f29df8ef8d1856b8820bc AS build
 WORKDIR /app
 ENV NEXT_TELEMETRY_DISABLED=1
 COPY --from=deps /app/node_modules ./node_modules
@@ -16,7 +16,7 @@ COPY . .
 RUN ./node_modules/.bin/next build
 
 # Runtime stage: non-root, writable /data only, loopback-published port via compose.
-FROM node:24.21.0-slim@sha256:0e0ff40c39bc087845bfb27465a0df4ea419520094bc35842ff83dd8cbe6f9b6
+FROM node:26.13.1-slim@sha256:e6bedef217677b276c591795e169840edd9096dbf13f29df8ef8d1856b8820bc
 WORKDIR /app
 ENV NODE_ENV=production \
     NEXT_TELEMETRY_DISABLED=1 \

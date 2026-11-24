@@ -160,13 +160,33 @@ export function ProseSearchField({
             aria-describedby={statusNote ? noteId : undefined}
             onChange={(e) => setText(e.target.value)}
           />
+          {/* Clears the typed text only, never the applied filters; the
+              focus stays in the field for the next description. */}
+          {text !== "" && !running && (
+            <button
+              type="button"
+              className="prose-clear"
+              aria-label="Clear the description"
+              title="Clear the description"
+              disabled={!ready}
+              onClick={() => {
+                setText("");
+                inputRef.current?.focus();
+              }}
+            >
+              <Icon name="close" />
+            </button>
+          )}
         </div>
+        {/* The house pending pattern (DESIGN.md Buttons): the action names
+            what it is doing, with aria-busy, until the answer lands. */}
         <button
           type="submit"
           className="btn btn-accent"
           disabled={!ready || running || trimmed.length < 2}
+          aria-busy={running || undefined}
         >
-          Search
+          {running ? "Searching…" : "Search"}
         </button>
       </form>
       <div className="prose-search-status">
@@ -188,17 +208,26 @@ export function ProseSearchField({
           </p>
         )}
         <div aria-live="polite">
-          {running && <p className="cat-note">Reading your search…</p>}
+          {running && (
+            <p className="cat-note">
+              Reading your search with the AI service. This can take up to 30
+              seconds.
+            </p>
+          )}
           {shown && (
             <>
               {!outcome.applied && <p className="cat-note">Nothing applied.</p>}
-              {outcome.notes.length > 0 && (
+              <ReadAsLine notes={outcome.notes} />
+              {outcome.notes.some((n) => n.read === undefined) && (
                 <ul className="prose-search-notes">
-                  {outcome.notes.map((n, i) => (
-                    <li key={`${n.code}:${i}`} className="cat-note">
-                      {n.message}
-                    </li>
-                  ))}
+                  {outcome.notes.map(
+                    (n, i) =>
+                      n.read === undefined && (
+                        <li key={`${n.code}:${i}`} className="cat-note">
+                          {n.message}
+                        </li>
+                      ),
+                  )}
                 </ul>
               )}
             </>
@@ -211,5 +240,35 @@ export function ProseSearchField({
         )}
       </div>
     </>
+  );
+}
+
+/** Every reading in one quiet line: "Read as  young guy → Twink · anal
+ * masturbation → Anal, Solo, Anal Toys". One phrase shows once, its
+ * readings joined, in note order; the reading is in ink, the member's own
+ * words stay muted. */
+function ReadAsLine({ notes }: { notes: ProseNote[] }) {
+  const byPhrase = new Map<string, string[]>();
+  for (const n of notes) {
+    if (n.read === undefined) continue;
+    const to = byPhrase.get(n.read.from) ?? [];
+    if (!to.includes(n.read.to)) to.push(n.read.to);
+    byPhrase.set(n.read.from, to);
+  }
+  if (byPhrase.size === 0) return null;
+  return (
+    <p className="cat-note prose-read-as">
+      <span className="prose-read-as-cap">Read as</span>
+      {[...byPhrase].map(([from, to], i) => (
+        <span key={from}>
+          {i > 0 && (
+            <span className="prose-read-as-sep" aria-hidden="true">
+              ·
+            </span>
+          )}
+          {from} → <b>{to.join(", ")}</b>
+        </span>
+      ))}
+    </p>
   );
 }

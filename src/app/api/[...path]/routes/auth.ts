@@ -31,7 +31,7 @@ import {
   recordLoginFailure,
   readKnownDevice,
   reserveLoginAttempt,
-  readSessionToken,
+  readSessionTokens,
   sessionCookie,
   isSecureRequest,
   verifySetupSecret,
@@ -96,7 +96,9 @@ function clientIp(request: Request): string {
 // budget. Callers that
 // authenticate an admitted Velvarr account pass admitted=true so a
 // rotating-name sprayer filling the global bucket cannot lock the
-// household out; setup paths keep the cap fully (no accounts exist before
+// household out; setup passes admitted=true too, but only after
+// guardedSetupSecret proved the setup secret, so the global cap still
+// guards every unproven setup attempt (no accounts exist before
 // initialization). A request with a valid known-device cookie for the name
 // passes `device`, so its attempts use that device's bucket, not the
 // name's shared one.
@@ -137,17 +139,73 @@ function signedIn(request: Request, grant: SessionGrant, name: string) {
   return response;
 }
 
+// The source address the setup limiter keys on. Next writes the socket
+// address into an ABSENT X-Forwarded-For, and a client or proxy can
+// supply a PRESENT one; the handler cannot tell the two apart, so there
+// is no trustworthy per-client key without configuration. Without
+// VELVARR_TRUSTED_PROXY every setup attempt therefore keys on the one
+// shared "unverified" bucket: spoofed-header rotation mints no keys, and
+// a flood can deny that shared source for at most one window (the
+// disclosed residual of direct exposure). VELVARR_TRUSTED_PROXY=1 marks
+// the nearest reverse proxy as one that appends to X-Forwarded-For
+// (nginx's proxy_add_x_forwarded_for): the last header entry is then the
+// client address the proxy vouched for, and that is the key.
+function limiterSource(request: Request): string {
+  const forwarded = request.headers.get("x-forwarded-for");
+  if (process.env.VELVARR_TRUSTED_PROXY === "1" && forwarded !== null)
+    return forwarded.split(",").at(-1)?.trim() || "unknown";
+  return "unverified";
+}
+
 // The setup secret is the only credential on a not-yet-bootstrapped
 // instance, so a wrong guess must cost what a wrong password costs: the
-// same login limiter, keyed by the reported source address instead of an
-// account name (no accounts exist before setup). The read-only gate
-// answers 429 when the per-source bucket is exhausted; the reservation
-// holds a per-source slot plus a global spray slot in the same synchronous
-// step, so parallel guesses cannot all pass uncounted. A wrong secret
-// keeps both charges; a correct one refunds them like any non-guess.
+// same login limiter, keyed by limiterSource instead of an account name
+// (no accounts exist before setup). The read-only gate answers 429 when
+// the per-source bucket is exhausted; the reservation holds a per-source
+// slot plus a global spray slot in the same synchronous step, so parallel
+// guesses cannot all pass uncounted. A wrong secret keeps both charges; a
+// correct one refunds them like any non-guess. A full window never
+// compares for free: the exempt compare pays this source's own bounded
+// budget (see the branch below), so a saturated window cannot turn
+// wrong-versus-right into an unbounded guessing oracle. With
+// VELVARR_TRUSTED_PROXY=1 every client owns its budget, so only the
+// owner's own wrong guesses can refuse its proof, and only until the
+// window rolls; without the flag all attempts share one bucket and a
+// flood can deny setup attempts for up to one window (the disclosed
+// residual of direct exposure, limiterSource below).
 function guardedSetupSecret(request: Request, check: () => void): void {
-  const ip = clientIp(request);
-  assertLoginAllowed(ip, false);
+  const ip = limiterSource(request);
+  let refused: AppError | null = null;
+  try {
+    assertLoginAllowed(ip, false);
+  } catch (e) {
+    if (e instanceof AppError && e.code === "too_many_attempts") refused = e;
+    else throw e;
+  }
+  if (refused) {
+    // The compare still runs - but never free: it pays this source's
+    // five-per-window compare budget. A source whose budget is spent by
+    // its own wrong guesses is refused without a compare until the
+    // window rolls; a correct secret refunds its slot. With a trusted
+    // proxy every client owns its budget, so no fleet of other sources
+    // can refuse the owner's browser; without the flag the budget is
+    // shared (limiterSource above).
+    const compareSource = `setup-compare:${ip}`;
+    assertLoginAllowed(compareSource, true);
+    const refundSource = reserveLoginAttempt(compareSource, true);
+    try {
+      check();
+      refundSource();
+      return;
+    } catch {
+      // verifySetupSecret only throws setup_secret_invalid: a wrong
+      // secret keeps the compare charge and rethrows the refusal.
+      console.warn(
+        `[auth] failed setup-secret attempt: ip=${JSON.stringify(ip)} (cap window saturated)`,
+      );
+      throw refused;
+    }
+  }
   const refund = reserveLoginAttempt(ip, false);
   try {
     check();
@@ -207,10 +265,13 @@ export async function setupInspect(request: Request): Promise<Response> {
   const body = await readJson(request);
   guardedSetupSecret(request, () => verifySetupSecret(body.setupSecret));
   const fields = setupFields(body);
+  // The setup secret is proven above, so the caller is the operator: like
+  // an admitted sign-in this skips the global spray cap a sprayer may
+  // have just filled; the per-account bucket still applies.
   const selection = await guardedAuthentication(
     fields.username,
     () => verifySetupSelection(fields),
-    false,
+    true,
     clientIp(request),
   );
   return json({
@@ -244,10 +305,13 @@ export async function setupCommit(request: Request): Promise<Response> {
       );
     whisparr = { url: validateBaseUrl(whisparrUrl), apiKey: whisparrApiKey };
   }
+  // The setup secret is proven above, so the caller is the operator: like
+  // an admitted sign-in this skips the global spray cap a sprayer may
+  // have just filled; the per-account bucket still applies.
   const selection = await guardedAuthentication(
     fields.username,
     () => verifySetupSelection(fields),
-    false,
+    true,
     clientIp(request),
   );
   if (
@@ -319,8 +383,11 @@ export async function login(request: Request): Promise<Response> {
 
 export async function logout(request: Request): Promise<Response> {
   await readJson(request);
-  const raw = readSessionToken(request);
-  if (raw) revokeSession(raw);
+  // Revoke every copy: a planted duplicate must not leave the real session
+  // live behind a 200 {ok:true}. readSessionToken reads an ambiguous header
+  // as absent on purpose; the admission path keeps that strict rule, so
+  // logout gathers all values itself.
+  for (const raw of readSessionTokens(request)) revokeSession(raw);
   return json({ ok: true }, 200, {
     "set-cookie": sessionCookie(undefined, isSecureRequest(request)),
   });

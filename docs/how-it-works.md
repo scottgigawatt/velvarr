@@ -67,8 +67,8 @@ flowchart LR
   `requests.ts`, `follows.ts`, `catalog.ts`, `browse.ts`, `library.ts`,
   `admin.ts`, `discover.ts`); each exports `RouteDef[]`.
 - **Metadata adapters** — `src/server/providers.ts` (TPDB REST, StashDB
-  GraphQL) and `src/server/browse.ts` (grid filters); strictly read-only,
-  pass-through, nothing persisted.
+  GraphQL) and `src/server/browse.ts` (grid filters); read-only provider
+  access, with metadata in memory and resized artwork on disk.
 - **Store (SQLite)** — `src/server/storage.ts`; migrations and prepared
   statements. Tables: `config`, `accounts`, `sessions`,
   `catalog_identities`, `requests`, `acquisitions`,
@@ -91,6 +91,32 @@ flowchart LR
 - **Whisparr (Eros)** — the acquisition manager at the operator's host.
 - **Jellyfin** — the media server; also the identity provider (sign-in
   validates each user against Jellyfin).
+
+Artwork originals stay in memory, while resized variants persist under the
+data directory. After URL validation, the source cache, in-flight requests,
+and disk index share the canonical `origin + pathname` identity. The disk
+budget counts allocated space, with a 4096-byte minimum per non-empty file,
+including each URL index entry.
+
+A fresh index entry with the same source hash causes no rewrite or sweep.
+This leaves its expiry time unchanged. Each actual write runs a synchronous
+full-tree sweep for expiry and budget eviction. The newest file stays
+protected, so it can exceed the budget alone. Large cache trees can delay a
+request during this sweep.
+
+## Metadata provider request rules
+
+Velvarr sends its name, version, and project URL in `User-Agent` for TPDB and
+StashDB API and artwork requests.
+
+Each Velvarr process sends at most 60 requests to `stashdb.org` in any
+60-second window. API and artwork share this budget across API keys. Failed
+dispatch attempts also count. When the budget is full, Velvarr returns
+`503 upstream_rate_limited` before the request leaves the server.
+Private Stash-Box hosts and TPDB do not share this budget.
+
+The [StashDB API rules](https://discourse.stashapp.cc/t/rules-for-api-access/21336)
+warn that violations cause immediate loss of access.
 
 ## From request to playback
 
@@ -149,8 +175,11 @@ sequenceDiagram
   at once when the account holds the auto-approve grant or when an admin
   requests their own title (201, `autoApproved: true`). A pending
   request waits for the PATCH decision of an admin or moderator. An
-  account can hold at most 500 pending requests (`OPEN_REQUEST_CAP`);
-  the next POST gets 429 `request_limit`. `GET /api/requests` returns
+  account can hold at most 500 pending requests (`OPEN_REQUEST_CAP`).
+  A single-title POST then returns 429 `request_limit`. The bulk POST stops
+  at its first `request_limit` and returns 200 with `error: { code, message }`.
+  It omits `capped`, and the UI shows the cap message instead of the repeat
+  hint. `GET /api/requests` returns
   one keyset page (50 rows by default) with the server-side filters,
   sort and the pending-approvals count.
 - **Store (SQLite)** — `src/server/storage.ts` (`createRequest`,
@@ -194,6 +223,7 @@ stateDiagram-v2
   downloading --> failed_permanent: proven absence upstream
   failed --> failed_permanent: proven absence upstream
   failed --> imported: file observed
+  failed_permanent --> unsent: approved again
   imported --> [*]: playable in Jellyfin
 ```
 
@@ -225,8 +255,10 @@ stateDiagram-v2
   pass only observes a `failed` row. A later observation moves it to the
   state Whisparr reports (for example `imported` when the file is
   there), and a proven absence ends it `failed_permanent`.
-- **failed_permanent** — terminal: an invalid reference, an identity
-  mismatch, or a proven upstream absence (`recordAbsence`).
+- **failed_permanent** — terminal for the worker: an invalid reference, an
+  identity mismatch, or a proven upstream absence (`recordAbsence`). No pass
+  revisits it; approving the title again is the recovery and reschedules the
+  row as `unsent`.
 
 The diagram shows the main path. Re-observation moves any sent row
 (`monitoring`, `downloading`, `failed`) to the state Whisparr reports,

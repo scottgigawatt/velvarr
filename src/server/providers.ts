@@ -148,6 +148,37 @@ const artworkInFlight = new Map<
   Promise<{ bytes: Uint8Array; contentType: string }>
 >();
 
+// Artwork fetches also share one global concurrency cap (VELV-215, v0.44.0
+// audit lead). The artwork lane bounds misses per account (ARTWORK_BURST =
+// 800), but one member can spend the whole burst on 800 distinct URLs at
+// once, and every in-flight fetch buffers up to IMAGE_BYTE_CAP twice (stream
+// chunks plus the concat copy in readBounded). Measured on the lead's
+// loopback load test: 798 concurrent 8 MiB bodies pushed the server 1.7 GiB
+// past baseline before most bodies finished streaming; realistic 1 MiB
+// bodies alone cost ~0.3 GiB. Sixteen slots cap the transient worst case at
+// ~2 × 16 × IMAGE_BYTE_CAP while a cold household page still fills in a
+// wave. Joins (same URL) coalesce before they would queue, and the upstream
+// deadline of a queued fetch starts only when its slot opens, so a slow host
+// delays its own request, not unrelated lanes. ponytail: honor upstream
+// concurrency hints per host instead of one global number if a real
+// deployment shows a host starving another.
+export const ARTWORK_FETCH_CONCURRENCY = 16;
+const artworkSlots = { active: 0, waiters: [] as (() => void)[] };
+async function withArtworkSlot<T>(run: () => Promise<T>): Promise<T> {
+  while (artworkSlots.active >= ARTWORK_FETCH_CONCURRENCY) {
+    const { promise, resolve } = Promise.withResolvers<void>();
+    artworkSlots.waiters.push(resolve);
+    await promise;
+  }
+  artworkSlots.active += 1;
+  try {
+    return await run();
+  } finally {
+    artworkSlots.active -= 1;
+    artworkSlots.waiters.shift()?.();
+  }
+}
+
 /** Test seam: the suite reuses one fixture upstream per file; tests reset
  * between phases so cached reads never mask a scripted outage. */
 export function resetMetaCache(): void {
@@ -381,7 +412,7 @@ function envBaseUrl(
   return typeof value === "string" && value.trim() !== "" ? value : fallback;
 }
 
-function tpdbGet<T>(
+export function tpdbGet<T>(
   path: string,
   bypassCache = false,
   tokenOverride?: string,
@@ -548,6 +579,8 @@ export async function fetchProviderArtwork(
       `Rejected artwork URL: ${check.reason}.`,
     );
   }
+  const u = new URL(url);
+  const key = u.origin + u.pathname;
   // An off-ladder width is a caller bug, not an upstream condition: reject
   // before any fetch, exactly like the URL gate above.
   const width = options.width;
@@ -562,7 +595,7 @@ export async function fetchProviderArtwork(
   // fresh variant file serve a restart without an upstream fetch. sizeLimit
   // callers bypass the caches deliberately for exactness, so they skip it.
   if (width !== undefined && options.sizeLimit === undefined) {
-    const stored = lookupArtworkVariant(url, width);
+    const stored = lookupArtworkVariant(key, width);
     if (stored) return stored;
   }
   // A custom sizeLimit narrows what this caller accepts; a cached entry
@@ -572,10 +605,6 @@ export async function fetchProviderArtwork(
     bytes: Uint8Array;
     contentType: string;
   }> => {
-    const u = new URL(url);
-    // The gate rejects query strings and fragments, so origin+pathname is
-    // the whole URL: the raw-URL cache key can never diverge from what is
-    // fetched here.
     const { bytes, contentType } = await requestBytes(
       u.origin,
       u.pathname,
@@ -623,33 +652,34 @@ export async function fetchProviderArtwork(
   }> => {
     if (width === undefined) return source;
     const variant = await artworkVariantFor(source, width);
-    rememberArtworkVariant(url, variant.hash);
+    rememberArtworkVariant(key, variant.hash);
     return variant;
   };
 
   if (options.sizeLimit !== undefined) return derive(await fetchOnce());
 
-  const hit = artworkCache.get(url);
+  const hit = artworkCache.get(key);
   if (hit && Date.now() - hit.at < ARTWORK_CACHE_TTL_MS) {
     return derive(hit);
   }
   if (hit) {
     artworkCacheBytes -= hit.bytes.length;
-    artworkCache.delete(url);
+    artworkCache.delete(key);
   }
-  const inFlight = artworkInFlight.get(url);
+  const inFlight = artworkInFlight.get(key);
   if (inFlight) return derive(await inFlight);
   // Exactly one caller per coalesced burst reaches this synchronous window,
   // so onMiss charges once per upstream fetch; hits and joins never do.
   options.onMiss?.();
-  const pending = fetchOnce()
+  // The fetch itself then queues on the global artwork slot cap; every
+  // joiner of the same URL awaits the one pending promise below.
+  const pending = withArtworkSlot(fetchOnce)
     .then((entry) => {
-      artworkCache.set(url, { at: Date.now(), ...entry });
+      artworkCache.set(key, { at: Date.now(), ...entry });
       artworkCacheBytes += entry.bytes.length;
       // ponytail: fixed TTL (Seerr's no-max-age default) and FIFO eviction of
       // oldest entries until the new one fits; honor upstream max-age if
-      // images go stale. Cache is memory-only and resets on restart — a disk
-      // cache (Seerr's config/cache/images) is the upgrade if restarts hurt.
+      // images go stale. Originals stay memory-only and reset on restart.
       while (
         artworkCacheBytes > ARTWORK_CACHE_MAX_BYTES &&
         artworkCache.size > 1
@@ -660,8 +690,8 @@ export async function fetchProviderArtwork(
       }
       return entry;
     })
-    .finally(() => artworkInFlight.delete(url));
-  artworkInFlight.set(url, pending);
+    .finally(() => artworkInFlight.delete(key));
+  artworkInFlight.set(key, pending);
   if (width !== undefined) {
     // One upstream fetch feeds every width: joins share the source promise
     // above, then each caller reads or generates its own disk variant.
@@ -1341,7 +1371,7 @@ export async function searchCatalog(
       );
     }
     const res = (await stashQuery(
-      "query($t: String!) { searchPerformers(term: $t) { count performers { id name deleted aliases images { url } } } }",
+      "query($t: String!) { searchPerformers(term: $t) { count performers { id name deleted aliases images { url width height } } } }",
       { t: q },
       "searchPerformers",
     )) as { count?: unknown; performers?: unknown } | null;
@@ -1398,7 +1428,7 @@ export async function searchCatalog(
       );
     }
     const res = await stashQuery(
-      "query($t: String!) { searchStudio(term: $t, limit: 25) { id name deleted parent { id name } images { url } urls { url type } } }",
+      "query($t: String!) { searchStudio(term: $t, limit: 25) { id name deleted parent { id name } images { url width height } urls { url type } } }",
       { t: q },
       "searchStudio",
     );
@@ -1669,7 +1699,7 @@ export async function searchCatalog(
     );
   }
   const res = (await stashQuery(
-    "query($f: SceneQueryInput!) { queryScenes(input: $f) { count scenes { id title code details date duration images { url } urls { url type } studio { id name } tags { id name } performers { as performer { id name deleted images { url } } } } } }",
+    "query($f: SceneQueryInput!) { queryScenes(input: $f) { count scenes { id title code details date duration images { url width height } urls { url type } studio { id name } tags { id name } performers { as performer { id name deleted images { url width height } } } } } }",
     { f: input },
     "queryScenes",
   )) as { count?: unknown; scenes?: unknown } | null;
@@ -1773,7 +1803,7 @@ export async function getCatalogDetail(
 
   if (kind === "scene") {
     const row = await stashQuery(
-      "query($id: ID!) { findScene(id: $id) { id title code details date duration images { url } urls { url type } studio { id name } tags { id name } performers { as performer { id name deleted aliases images { url } urls { url type } } } } }",
+      "query($id: ID!) { findScene(id: $id) { id title code details date duration images { url width height } urls { url type } studio { id name } tags { id name } performers { as performer { id name deleted aliases images { url width height } urls { url type } } } } }",
       { id },
       "findScene",
     );
@@ -1792,7 +1822,7 @@ export async function getCatalogDetail(
     // death_date (a plain "YYYY[-MM[-DD]]" string) exists on stashdb.org;
     // verified with a read-only query on 2026-11-13.
     const row = await stashQuery(
-      "query($id: ID!) { findPerformer(id: $id) { id name deleted aliases urls { url type } images { url } gender birthdate { date accuracy } death_date ethnicity country eye_color hair_color height cup_size band_size waist_size hip_size breast_type career_start_year career_end_year tattoos { location description } piercings { location description } } }",
+      "query($id: ID!) { findPerformer(id: $id) { id name deleted aliases urls { url type } images { url width height } gender birthdate { date accuracy } death_date ethnicity country eye_color hair_color height cup_size band_size waist_size hip_size breast_type career_start_year career_end_year tattoos { location description } piercings { location description } } }",
       { id },
       "findPerformer",
     );
@@ -1812,7 +1842,7 @@ export async function getCatalogDetail(
   }
   if (kind === "studio") {
     const row = await stashQuery(
-      "query($id: ID!) { findStudio(id: $id) { id name deleted urls { url type } images { url } parent { id name } child_studios { id } } }",
+      "query($id: ID!) { findStudio(id: $id) { id name deleted urls { url type } images { url width height } parent { id name } child_studios { id } } }",
       { id },
       "findStudio",
     );

@@ -29,7 +29,7 @@ scenario(
         .getByRole("navigation", { name: "Settings sections" })
         .getByRole("button")
         .allTextContents(),
-    ).toEqual(["Connections", "Metadata providers"]);
+    ).toEqual(["Connections", "Metadata providers", "AI"]);
     await expect(edit(jf)).toBeEnabled();
     await expect(edit(w)).toBeEnabled();
     assert.equal(
@@ -60,14 +60,18 @@ scenario(
       await provider.locator(".settings-service-summary").count(),
       1,
     );
+    // Contract move: the two AI cards left Metadata providers for their own
+    // AI tab (operator request, 2026-11-19).
     expect(
       await page.getByRole("heading", { level: 2 }).allTextContents(),
-    ).toEqual([
-      "TPDB",
-      "StashDB",
-      "AI-assisted matching",
-      "Natural-language search",
-    ]);
+    ).toEqual(["TPDB", "StashDB"]);
+    await page.getByRole("button", { name: "AI", exact: true }).click();
+    expect(
+      await page.getByRole("heading", { level: 2 }).allTextContents(),
+    ).toEqual(["Smarter library matching", "Natural-language search"]);
+    await page
+      .getByRole("button", { name: "Metadata providers", exact: true })
+      .click();
     await expect(badge(provider)).toHaveText("Connected");
   },
 );
@@ -101,6 +105,8 @@ scenario(
     await expect(badge(w)).toHaveText("Unsaved changes");
     await expect(check(jf)).toBeEnabled();
     await expect(check(w)).toBeEnabled();
+    // A save must retain its result when a later configuration read fails.
+    await control({ configFail: true });
     await save(jf).click();
     await expect(edit(jf)).toBeEnabled();
     await expect(badge(jf)).toHaveText("Connected");
@@ -117,13 +123,9 @@ scenario(
       1,
       "unrelated card must not remount after Save",
     );
-    assert.equal(
-      data.requests.filter(
-        (r) => r.path === "/api/admin/integrations" && r.method === "GET",
-      ).length,
-      2,
-      "Save uses its response, without a failure-prone config reload",
-    );
+    await expect(
+      page.getByText("Connection configuration read failed", { exact: true }),
+    ).toHaveCount(0);
     assert.deepEqual(
       patches.map((r) => r.body),
       [
@@ -135,6 +137,10 @@ scenario(
     );
     await cancel(w).click();
     await expect(edit(w)).toBeFocused();
+    await edit(jf).click();
+    await expect(jf.getByLabel("Jellyfin external URL")).toHaveValue(
+      "https://watch.example.test/new",
+    );
     await edit(w).click();
     await expect(w.getByLabel("Root folder", { exact: true })).toHaveValue(
       "/data/media",
@@ -494,11 +500,52 @@ scenario(
         r.path === "/api/admin/whisparr" ||
         r.path.startsWith("/api/admin/providers/"),
     );
-    for (let i = 1; i < operations.length; i++)
+    // On-load probes run in parallel now (VELV-181); saves and the probes
+    // that verify them still serialize. The pin covers the save phase:
+    // everything from the first PATCH on.
+    const firstSave = operations.findIndex((r) => r.method === "PATCH");
+    const queued = operations.slice(firstSave);
+    for (let i = 1; i < queued.length; i++)
       assert.ok(
-        operations[i].started >= operations[i - 1].finished,
+        queued[i].started >= queued[i - 1].finished,
         "overlapping settings operations",
       );
+  },
+);
+scenario(
+  "Saved-settings probes run in parallel and leave peer cards editable",
+  async ({ page, jf, w, provider, control, edit, badge }) => {
+    // Jellyfin's probe stays pending while the other three settle: a serial
+    // queue would leave them unstarted and the peer Edit buttons disabled
+    // until it finished (VELV-181).
+    await control({ reset: true, holdProbe: "/api/admin/jellyfin" });
+    await page.goto("/?view=settings");
+    await expect(badge(w)).toHaveText("Connected");
+    await expect(badge(provider)).toHaveText("Connected");
+    await expect(
+      page.locator(
+        'section[aria-labelledby="provider-heading-stashdb"] .connection-state',
+      ),
+    ).toHaveText("Connected");
+    await expect(badge(jf)).toHaveText("Checking…");
+    const state = await control({});
+    const probePaths = [
+      "/api/admin/jellyfin",
+      "/api/admin/whisparr",
+      "/api/admin/providers/tpdb",
+      "/api/admin/providers/stashdb",
+    ];
+    for (const path of probePaths)
+      assert.ok(
+        state.requests.some((request) => request.path === path),
+        "the load probe never started: " + path,
+      );
+    await page
+      .getByRole("button", { name: "Metadata providers", exact: true })
+      .click();
+    await expect(edit(provider)).toBeEnabled();
+    await control({ holdProbe: false });
+    await expect(badge(jf)).toHaveText("Connected");
   },
 );
 scenario(
@@ -521,7 +568,8 @@ scenario(
     await edit(w).click();
     assert.deepEqual(
       await page.getByRole("heading", { level: 2 }).allTextContents(),
-      ["Jellyfin", "Whisparr"],
+      // Discord is a connection card, beside Jellyfin and Whisparr.
+      ["Jellyfin", "Whisparr", "Discord"],
     );
     assert.equal(
       await page.locator(".settings-page div[aria-label]:not([role])").count(),
@@ -571,20 +619,19 @@ scenario(
     await edit(w).click();
     for (const label of ["Root folder", "Quality profile"]) {
       const select = w.getByLabel(label, { exact: true });
+      // Contract move: every select.input draws the house chevron as a
+      // background image (no .settings-select wrapper or ::after any more),
+      // with the same 40px end padding.
       const metrics = await select.evaluate((node) => ({
         appearance: getComputedStyle(node).appearance,
         padding: getComputedStyle(node).paddingRight,
-        wrapper: node.parentElement.classList.contains("settings-select"),
-        arrowInset: getComputedStyle(node.parentElement, "::after").right,
-        pointerEvents: getComputedStyle(node.parentElement, "::after")
-          .pointerEvents,
+        chevron:
+          getComputedStyle(node).backgroundImage.startsWith("linear-gradient"),
       }));
       assert.deepEqual(metrics, {
         appearance: "none",
         padding: "40px",
-        wrapper: true,
-        arrowInset: "14px",
-        pointerEvents: "none",
+        chevron: true,
       });
     }
     const profile = w.getByLabel("Quality profile", { exact: true });
@@ -671,9 +718,8 @@ scenario(
     };
     await control({ config: data.config });
     await page.reload();
-    await page
-      .getByRole("button", { name: "Metadata providers", exact: true })
-      .click();
+    // Contract move: the AI cards live on their own AI tab.
+    await page.getByRole("button", { name: "AI", exact: true }).click();
     const ai = page.locator('section[aria-labelledby="judgment-heading"]');
     await edit(ai).click();
     await expect(aiOption(ai, "none")).toBeFocused();
@@ -708,9 +754,7 @@ scenario(
     check,
   }) => {
     await fresh();
-    await page
-      .getByRole("button", { name: "Metadata providers", exact: true })
-      .click();
+    await page.getByRole("button", { name: "AI", exact: true }).click();
     const ai = page.locator('section[aria-labelledby="judgment-heading"]');
     await edit(ai).click();
     await selectAi(ai, "ollama");
@@ -939,7 +983,8 @@ scenario(
       w.getByRole("button", { name: "Checking…", exact: true }),
     ).toBeDisabled();
     await expect(edit(w)).toBeDisabled();
-    await expect(edit(jf)).toBeDisabled();
+    // A probe holds only its own card (VELV-181); Jellyfin stays editable.
+    await expect(edit(jf)).toBeEnabled();
     await expect(check(jf)).toHaveCount(0);
     expect(
       await w.locator(".settings-service-status .text-muted").count(),
@@ -969,20 +1014,25 @@ for (const service of ["jellyfin", "whisparr"]) {
       await check(own).click();
       await expect(check(own)).toBeDisabled();
       await expect(cancel(own)).toBeDisabled();
-      await expect(edit(peer)).toBeDisabled();
+      // A draft test holds only its own card (VELV-181); the peer's editor
+      // stays available.
+      await expect(edit(peer)).toBeEnabled();
       await expect(badge(own)).toHaveText("Unsaved changes");
       await control({ holdProbe: false, [service + "DraftFail"]: true });
-      await expect(own.getByRole("alert")).toContainText(
-        "draft credential was rejected",
-      );
+      // Contract move: the editor's check result now sits in one status line
+      // under the Check button (red on failure), not in an alert panel.
+      const line = own.locator(".settings-check-line");
+      await expect(line).toContainText("draft credential was rejected");
+      await expect(line).toHaveClass(/is-failed/);
       expect((await control({})).config).toEqual(before);
       await own.locator('input[type="password"]').fill("synthetic-corrected");
-      await expect(own.getByRole("alert")).toHaveCount(0);
+      // An edit clears the last result.
+      await expect(line).toHaveText("");
       await control({ [service + "DraftFail"]: false });
       await check(own).click();
-      await expect(
-        own.getByText("Connection works: draft-version", { exact: true }),
-      ).toBeVisible();
+      await expect(line).toHaveText(
+        /draft-version answered with these settings\.$/,
+      );
       const state = await control({});
       const probes = state.requests.filter(
         (r) => r.path === `/api/admin/${service}/test`,

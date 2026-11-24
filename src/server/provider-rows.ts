@@ -109,7 +109,7 @@ export function dedupeBy<T>(
   return out;
 }
 
-// --- artwork gate: provider-hosted images only, pass-through, never persisted ---
+// --- artwork gate: provider-hosted images only ---
 
 // Allowlist derived from live records 2026-09-10: every provider-normalized
 // artwork URL observed (TPDB posters/background/image/thumbnail/face, StashDB
@@ -145,12 +145,20 @@ export function isProviderImageUrl(url: string): ImageUrlCheck {
   if (u.protocol !== "https:" && !loopbackFixture) {
     return { ok: false, reason: "artwork URLs must be https" };
   }
+  // An explicit port turns an allowlisted host into a different origin, and
+  // the artwork proxy would fetch whatever listens there (VELV-216). WHATWG
+  // normalization drops default ports, so https on 443 keeps passing.
+  if (u.port !== "" && !loopbackFixture) {
+    return {
+      ok: false,
+      reason: "artwork URLs must not carry an explicit port",
+    };
+  }
   if (u.username || u.password || u.hash) {
     return { ok: false, reason: "artwork URLs must not carry credentials" };
   }
-  // The artwork cache keys on the raw URL while the fetch requests
-  // origin+pathname only, so a query string would multiply cache entries for
-  // one upstream path: ?n=1, ?n=2, ... each refetch (VELV-23 flood).
+  // Query strings do not belong to the upstream origin+pathname identity.
+  // Reject them instead of silently dropping provider parameters.
   if (u.search !== "") {
     return { ok: false, reason: "artwork URLs must not carry a query string" };
   }
@@ -184,6 +192,7 @@ interface TpdbPerson {
   image?: unknown;
   thumbnail?: unknown;
   face?: unknown;
+  posters?: unknown;
   parent?: TpdbPerson | null;
 }
 
@@ -193,9 +202,31 @@ export interface CatalogCreditAcc {
   imageUrl?: string;
 }
 
+/** Largest servable poster by finite positive byte size. Equal sizes keep
+ * the first array entry, regardless of `order`. No usable entry preserves
+ * each caller's image fallback. */
+function tpdbPerformerPoster(posters: unknown): string | undefined {
+  if (!Array.isArray(posters)) return undefined;
+  let best: string | undefined;
+  let bestSize = 0;
+  for (const entry of posters) {
+    const media = entry as { url?: unknown; size?: unknown } | null;
+    const size = media?.size;
+    if (typeof size !== "number" || !Number.isFinite(size) || size <= bestSize)
+      continue;
+    const url = servableImage(media?.url);
+    if (url !== undefined) {
+      best = url;
+      bestSize = size;
+    }
+  }
+  return best;
+}
+
 /** Credits resolve canonical identity through performers[].parent.id (the
  * canonical performer UUID), falling back to the row id itself. Deduplicated
- * by provider id, never by name. */
+ * by provider id, never by name. Canonical posters precede row posters,
+ * then the existing image fallback applies. */
 function tpdbCredits(rows: unknown): CatalogCreditAcc[] {
   if (!Array.isArray(rows)) return [];
   const mapped: CatalogCreditAcc[] = [];
@@ -212,7 +243,10 @@ function tpdbCredits(rows: unknown): CatalogCreditAcc[] {
       cleanString(canonical.name, MAX.name);
     if (id === undefined || name === undefined) continue;
     const imageUrl =
-      servableImage(canonical.image) ?? servableImage(person.image);
+      tpdbPerformerPoster(person.parent?.posters) ??
+      tpdbPerformerPoster(person.posters) ??
+      servableImage(canonical.image) ??
+      servableImage(person.image);
     mapped.push({
       reference: { provider: "tpdb", kind: "performer", id },
       name,
@@ -349,6 +383,7 @@ export function tpdbPerformerDetail(row: unknown): CatalogDetail | undefined {
     }
   }
   const imageUrl =
+    tpdbPerformerPoster(r.posters) ??
     servableImage(r.image) ??
     servableImage(r.thumbnail) ??
     servableImage(r.face);
@@ -488,17 +523,33 @@ interface StashScenePerformer {
     id?: unknown;
     name?: unknown;
     deleted?: unknown;
-    images?: { url?: unknown }[] | null;
+    images?: { url?: unknown; width?: unknown; height?: unknown }[] | null;
   } | null;
 }
 
 function stashImageUrl(images: unknown): string | undefined {
   if (!Array.isArray(images)) return undefined;
-  for (const img of images.slice(0, 5)) {
-    const url = servableImage((img as { url?: unknown } | null)?.url);
-    if (url !== undefined) return url;
+  let fallback: string | undefined;
+  let largest: string | undefined;
+  let largestArea = 0;
+  for (const img of images) {
+    const image = img as {
+      url?: unknown;
+      width?: unknown;
+      height?: unknown;
+    } | null;
+    const url = servableImage(image?.url);
+    if (url === undefined) continue;
+    fallback ??= url;
+    const width = cleanInt(image?.width, 1, Number.MAX_SAFE_INTEGER);
+    const height = cleanInt(image?.height, 1, Number.MAX_SAFE_INTEGER);
+    if (width === undefined || height === undefined) continue;
+    const area = width * height;
+    if (!Number.isSafeInteger(area) || area <= largestArea) continue;
+    largest = url;
+    largestArea = area;
   }
-  return undefined;
+  return largest ?? fallback;
 }
 
 function stashLinks(rows: unknown): { url: string; label?: string }[] {

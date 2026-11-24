@@ -31,6 +31,7 @@ import {
   getAccount,
   getAcquisitionByReference,
   acquisitionView,
+  intentKey,
   listAccounts,
   listActiveIntentKeys,
   listRequestPage,
@@ -180,7 +181,7 @@ export const BULK_SCAN_PAGE = 24;
 export const BULK_SCAN_PAGES = 10;
 
 type BulkScanStop = {
-  code: "scan_ceiling" | "unreadable_page";
+  code: "scan_ceiling" | "unreadable_page" | "request_limit";
   message: string;
 };
 
@@ -211,8 +212,10 @@ export async function bulkRequestRoute(
   // Titles the account already holds an active intent for never count
   // toward the cap — they are pre-skipped below (and still surface in
   // `skipped`), so a re-run reaches the unfiled backlog past them instead
-  // of re-collecting the same first 100 rows. The key format matches
-  // listActiveIntentKeys ("<provider>:<kind>:<id>"); the set also dedupes
+  // of re-collecting the same first 100 rows. Item keys come from the same
+  // intentKey builder as listActiveIntentKeys ("<provider>:<kind>:<id>",
+  // ids folded to lowercase), so a mixed-case provider row matches the
+  // spelling createRequest stored; the set also dedupes
   // rows the provider repeats within one pass.
   const activeKeys = listActiveIntentKeys(ctx.account.id);
   const items: CatalogDetail[] = [];
@@ -248,7 +251,7 @@ export async function bulkRequestRoute(
     scanned += result.items.length;
     more = result.hasMore;
     for (const item of result.items) {
-      const key = `${performer.provider}:${kind}:${item.reference.id}`;
+      const key = intentKey(performer.provider, kind, item.reference.id);
       if (activeKeys.has(key)) {
         skipped += 1;
         continue;
@@ -298,6 +301,10 @@ export async function bulkRequestRoute(
     } catch (err) {
       if (err instanceof AppError && err.code === "request_exists") {
         skipped += 1;
+      } else if (err instanceof AppError && err.code === "request_limit") {
+        // The pending cap blocks every remaining title, not just this one.
+        stopped = { code: "request_limit", message: err.message };
+        break;
       } else if (err instanceof AppError) {
         failed.push({ id: media.id, code: err.code });
       } else {
@@ -311,7 +318,8 @@ export async function bulkRequestRoute(
     autoApproved,
     failed,
     scanned,
-    capped,
+    // A capacity stop must not invite another pass.
+    ...(stopped?.code === "request_limit" ? {} : { capped }),
     ...(stopped !== undefined ? { error: stopped } : {}),
   });
 }

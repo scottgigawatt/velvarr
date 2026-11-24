@@ -14,6 +14,7 @@ import type {
   CatalogDetailResponse,
 } from "../../../../lib/contracts.ts";
 import {
+  ARTWORK_VARIANT,
   CATALOG_YEAR_MAX,
   CATALOG_YEAR_MIN,
 } from "../../../../lib/contracts.ts";
@@ -61,6 +62,29 @@ import {
   relatedTitles,
 } from "../../../../server/related.ts";
 
+import { duplicateMovies } from "../../../../server/duplicates.ts";
+
+export async function duplicatesRoute(
+  ctx: AuthContext,
+  provider: string,
+  kind: string,
+  id: string,
+): Promise<Response> {
+  const reference = parseCatalogReference(provider, kind, id);
+  if (reference.provider !== "tpdb" || reference.kind !== "movie") {
+    throw new AppError(
+      400,
+      "invalid_reference",
+      "Duplicate checks support TPDB movies only.",
+    );
+  }
+  return json(
+    await duplicateMovies(
+      reference.id,
+      getContentPreferences(ctx.account.id).hiddenTags,
+    ),
+  );
+}
 function isTpdbDateOperation(v: string): v is ReleaseDateOperation {
   return ["<", "<=", "=", ">", ">="].includes(v);
 }
@@ -644,12 +668,13 @@ export async function catalogImage(
       onMiss: () => chargeRateBudget(ctx.account.id, "artwork"),
     },
   );
-  // A stored variant is content-addressed (<hash>-<w>.webp): its name is the
-  // ETag and the bytes never change, so the copy is immutable. A no-upscale
+  // A stored variant is content-addressed
+  // (<hash>-<w><marker>.webp): its name is the ETag and the marker moves
+  // with the bytes (VELV-207), so the copy is immutable. A no-upscale
   // passthrough keeps today's per-fetch revalidation.
   const variantEtag =
     isVariant === true && hash !== undefined && width !== undefined
-      ? `"${hash}-${width}"`
+      ? `"${hash}-${width}${ARTWORK_VARIANT}"`
       : undefined;
   const response = imageResponse(
     { bytes, contentType },
@@ -699,6 +724,13 @@ export const routes: RouteDef[] = [
     auth: "session",
     run: async (ctx, request, p) =>
       relatedRoute(ctx, p.provider!, p.kind!, p.id!, new URL(request.url)),
+  },
+  {
+    method: "GET",
+    segments: ["catalog", ":provider", ":kind", ":id", "duplicates"],
+    auth: "session",
+    run: async (ctx, _request, p) =>
+      duplicatesRoute(ctx, p.provider!, p.kind!, p.id!),
   },
   {
     method: "GET",

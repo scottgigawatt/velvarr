@@ -2,7 +2,7 @@
 
 /* Library Shell view: LibraryView grid plus the ItemDetail overlay page. */
 
-import { useCallback, useEffect, useRef } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useSearchParams } from "next/navigation";
 import Link from "next/link";
 import type {
@@ -13,22 +13,108 @@ import type {
   MediaReference,
 } from "../lib/contracts.ts";
 import {
+  api,
   CardStatusBadge,
   CardTypeBadge,
+  EnlargeableImage,
   ErrorPanel,
+  duration,
   FileFacts,
+  ClampedText,
   Icon,
   ItemImage,
   detailParams,
-  intOr,
+  messageOf,
+  ToolbarGroup,
   useApiGet,
+  useGridColumns,
+  useNearEnd,
+  useCatalogSummary,
   useParamsSetter,
+  useSession,
+  wholeRows,
+  type CatalogSummary,
 } from "./shared.tsx";
-import { DetailSections, type DetailTarget } from "./catalog-detail.tsx";
+import { DetailBody, type DetailTarget } from "./catalog-detail.tsx";
 import { useBrowseTo, useSyncedInput } from "./catalog.tsx";
 
 const runtime = (ticks?: number) =>
   ticks && ticks > 0 ? `${Math.round(ticks / 600_000_000)} min` : null;
+
+/** A matched item reads its catalog summary once (shared cache), so the tile
+ * shows the same facts as a Browse tile. */
+function CatalogLibraryTile({
+  item,
+  catalog,
+  onOpen,
+}: {
+  item: LibraryItem;
+  catalog: MediaReference;
+  onOpen: () => void;
+}) {
+  const summary = useCatalogSummary(catalog);
+  return <LibraryTile item={item} summary={summary} onOpen={onOpen} />;
+}
+
+/** One grid tile: catalog facts once a match loaded (Browse's order: scene =
+ * studio · date + performers, movie = year · studio), otherwise only what
+ * Jellyfin reports. A failed or pending catalog read never fakes a fact. */
+function LibraryTile({
+  item,
+  summary,
+  onOpen,
+}: {
+  item: LibraryItem;
+  summary?: CatalogSummary | null;
+  onOpen: () => void;
+}) {
+  const scene = item.kind === "scene";
+  const seconds =
+    summary?.durationSeconds ??
+    (item.durationTicks ? Math.round(item.durationTicks / 1e7) : undefined);
+  const year = summary?.releaseDate?.slice(0, 4) ?? item.year;
+  const subtitle = (
+    summary
+      ? scene
+        ? [summary.studio, summary.releaseDate]
+        : [year, summary.studio]
+      : [item.year, item.kind]
+  )
+    .filter(Boolean)
+    .join(" · ");
+  const performers = scene ? summary?.performers?.join(", ") : undefined;
+  const description = summary?.description ?? item.overview;
+  return (
+    <button type="button" className="media-card" onClick={onOpen}>
+      <div className="media-art aspect-[2/3]">
+        <ItemImage
+          name={item.name}
+          src={item.image}
+          className="absolute inset-0 h-full w-full object-cover"
+        />
+        <CardTypeBadge kind={item.kind} />
+        {item.canPlay && (
+          <CardStatusBadge status="available" title={item.name} />
+        )}
+        {scene && duration(seconds) && (
+          <span className="media-runtime">{duration(seconds)}</span>
+        )}
+        <div className="media-quick-overlay">
+          <div className="media-quick-summary" aria-hidden="true">
+            {year && <span>{year}</span>}
+            <strong>{item.name}</strong>
+            {description && <p>{description}</p>}
+          </div>
+        </div>
+      </div>
+      <div className="media-meta">
+        <div className="media-title">{item.name}</div>
+        {subtitle && <div className="media-subtitle">{subtitle}</div>}
+        {performers && <div className="media-subtitle">{performers}</div>}
+      </div>
+    </button>
+  );
+}
 
 /* ---------- Library ---------- */
 
@@ -37,12 +123,9 @@ export function LibraryView() {
   const setP = useParamsSetter();
   const search = params.get("search") ?? "";
   const libraryId = params.get("libraryId") ?? "";
-  // Only the Recently added entry point sets this today; the grid has no
-  // sort control, so the value rides the URL and dies with it.
+  // The URL holds the order; the grid's own Sort control and the Recently
+  // added entry point both write it.
   const sort = params.get("sort") === "dateAdded" ? "dateAdded" : null;
-  const start = Math.max(0, intOr(params.get("start"), 0));
-  const limitRaw = intOr(params.get("limit"), 24);
-  const limit = limitRaw >= 1 && limitRaw <= 60 ? limitRaw : 24;
   const itemId = params.get("item");
 
   const {
@@ -64,38 +147,85 @@ export function LibraryView() {
     if (searchInput === search) return;
     const t = setTimeout(() => {
       mark(searchInput);
-      setP({ search: searchInput || null, start: null });
+      setP({ search: searchInput || null });
     }, 400);
     return () => clearTimeout(t);
   }, [searchInput, search, setP, mark]);
 
-  const gridQs = new URLSearchParams({
-    start: String(start),
-    limit: String(limit),
-    search,
-  });
-  if (libraryId) gridQs.set("libraryId", libraryId);
-  if (sort) gridQs.set("sort", sort);
-  const {
-    data: pageData,
-    error: gridError,
-    loading,
-    reload,
-  } = useApiGet<LibraryPage>(`/api/library?${gridQs}`, [
-    start,
-    limit,
-    search,
-    libraryId,
-    sort,
-  ]);
-
-  const items = pageData?.items ?? [];
-  const end = pageData
-    ? Math.min(pageData.start + pageData.items.length, pageData.total)
-    : 0;
-  const hasNext = pageData
-    ? pageData.start + pageData.items.length < pageData.total
-    : false;
+  // Endless scroll, the Browse pattern: a page is whole grid rows (nine
+  // columns load 27, not 24), sized once from the first column count so a
+  // later change (sidebar collapse, resize) never refetches; the display
+  // trims to whole rows instead (wholeRows).
+  const [gridRef, cols] = useGridColumns();
+  const [limit, setLimit] = useState(0);
+  useEffect(() => {
+    if (limit === 0 && cols > 0)
+      setLimit(Math.min(60, cols * Math.ceil(24 / cols)));
+  }, [cols, limit]);
+  const [acc, setAcc] = useState<{
+    items: LibraryItem[];
+    total: number;
+    stalled: boolean;
+  } | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [gridError, setGridError] = useState<string | null>(null);
+  const [reloadTick, setReloadTick] = useState(0);
+  const seqRef = useRef(0);
+  const load = useCallback(
+    async (start: number, mode: "reset" | "more") => {
+      if (limit === 0) return;
+      const seq = ++seqRef.current;
+      if (mode === "reset") setAcc(null);
+      setLoading(true);
+      setGridError(null);
+      const qs = new URLSearchParams({
+        start: String(start),
+        limit: String(limit),
+        search,
+      });
+      if (libraryId) qs.set("libraryId", libraryId);
+      if (sort) qs.set("sort", sort);
+      try {
+        const page = await api<LibraryPage>(`/api/library?${qs}`);
+        if (seqRef.current !== seq) return;
+        setAcc((prev) => {
+          if (mode === "reset" || prev === null)
+            return { items: page.items, total: page.total, stalled: false };
+          const added = page.items.filter(
+            (it) => !prev.items.some((p) => p.id === it.id),
+          );
+          return {
+            items: [...prev.items, ...added],
+            total: page.total,
+            // The server merge never repeats an item across pages, but a
+            // library that changed between two reads could: drop repeats.
+            // A page that then adds no items cannot progress — end automatic
+            // pagination, or the sentinel re-fires forever (same guard as
+            // the browse grid).
+            stalled: added.length === 0,
+          };
+        });
+      } catch (e) {
+        if (seqRef.current !== seq) return;
+        setGridError(messageOf(e));
+      } finally {
+        if (seqRef.current === seq) setLoading(false);
+      }
+    },
+    [limit, search, libraryId, sort],
+  );
+  // Any filter, order or reload change restarts the grid at the top.
+  useEffect(() => {
+    void load(0, "reset");
+  }, [load, reloadTick]);
+  const items = acc?.items ?? [];
+  const hasMore = acc !== null && !acc.stalled && acc.items.length < acc.total;
+  const [sentinelRef, nearEnd] = useNearEnd(items.length > 0);
+  useEffect(() => {
+    if (!nearEnd || !hasMore || loading || gridError !== null) return;
+    void load(items.length, "more");
+  }, [nearEnd, hasMore, loading, gridError, items.length, load]);
+  const retry = () => setReloadTick((n) => n + 1);
 
   return (
     <section aria-label="Library">
@@ -113,14 +243,15 @@ export function LibraryView() {
           <span className="chip">Jellyfin</span>
         </div>
         <div className="page-toolbar">
-          <div className="sm:max-w-xs sm:flex-1">
-            <label className="label" htmlFor="lib-search">
-              Search your library
-            </label>
+          <ToolbarGroup
+            caption="Search"
+            htmlFor="lib-search"
+            className="sm:max-w-md sm:flex-1"
+          >
             <input
               id="lib-search"
               type="search"
-              className="input"
+              className="input min-w-0 flex-1"
               placeholder="Search titles…"
               maxLength={200}
               value={searchInput}
@@ -128,25 +259,20 @@ export function LibraryView() {
               onKeyDown={(e) => {
                 if (e.key === "Enter") {
                   mark(searchInput);
-                  setP({ search: searchInput || null, start: null });
+                  setP({ search: searchInput || null });
                 }
               }}
             />
-          </div>
-          <div className="sm:w-64">
-            <label className="label" htmlFor="lib-filter">
-              Library
-            </label>
-            {libsError ? (
-              <ErrorPanel message={libsError} onRetry={reloadLibs} />
-            ) : (
+          </ToolbarGroup>
+          {libsError ? (
+            <ErrorPanel message={libsError} onRetry={reloadLibs} />
+          ) : (
+            <ToolbarGroup caption="Library" htmlFor="lib-filter">
               <select
                 id="lib-filter"
                 className="input"
                 value={libraryId}
-                onChange={(e) =>
-                  setP({ libraryId: e.target.value || null, start: null })
-                }
+                onChange={(e) => setP({ libraryId: e.target.value || null })}
               >
                 <option value="">All libraries</option>
                 {(libs ?? []).map((l) => (
@@ -155,19 +281,51 @@ export function LibraryView() {
                   </option>
                 ))}
               </select>
-            )}
-          </div>
+            </ToolbarGroup>
+          )}
+          {/* Two orders the library route serves (title, date added); two
+              exclusive choices read at once as segments (rule 39). */}
+          <ToolbarGroup caption="Sort" captionId="lib-sort-label">
+            <div
+              role="group"
+              aria-labelledby="lib-sort-label"
+              className="segmented"
+            >
+              <button
+                type="button"
+                aria-pressed={sort === null}
+                onClick={() => setP({ sort: null })}
+              >
+                Title
+              </button>
+              <button
+                type="button"
+                aria-pressed={sort === "dateAdded"}
+                onClick={() => setP({ sort: "dateAdded" })}
+              >
+                Recently added
+              </button>
+            </div>
+          </ToolbarGroup>
         </div>
+        {/* Invisible zero-height probe with the grid's class: its column
+            count sizes pages in whole rows before the first fetch. */}
+        <div
+          ref={gridRef}
+          className="poster-grid"
+          aria-hidden="true"
+          style={{ height: 0, overflow: "hidden", visibility: "hidden" }}
+        />
 
-        {gridError ? (
+        {gridError !== null && acc === null ? (
           <ErrorPanel
             title="Library unavailable"
             message={gridError}
-            onRetry={reload}
+            onRetry={retry}
           />
-        ) : loading ? (
+        ) : acc === null ? (
           <div className="poster-grid" aria-label="Loading library">
-            {Array.from({ length: 8 }, (_, i) => (
+            {Array.from({ length: limit || 24 }, (_, i) => (
               <div key={i} className="skel aspect-[2/3]" />
             ))}
           </div>
@@ -199,71 +357,57 @@ export function LibraryView() {
               Jellyfin still is centre-cropped to about the middle third of
               its width by object-fit: cover. Upgrade path: per-item aspect
               detection from the Jellyfin image tags. */}
+            {/* The count leads the grid; Jellyfin's total is exact. */}
+            <p className="mb-3 text-sm text-muted" role="status">
+              {new Intl.NumberFormat().format(acc.total)}{" "}
+              {acc.total === 1 ? "item" : "items"}
+            </p>
             <div className="poster-grid">
-              {items.map((it) => (
-                <button
-                  key={it.id}
-                  type="button"
-                  className="media-card"
-                  onClick={() => setP({ item: it.id }, { push: true })}
-                >
-                  <div className="media-art aspect-[2/3]">
-                    <ItemImage
-                      name={it.name}
-                      src={it.image}
-                      className="absolute inset-0 h-full w-full object-cover"
-                    />
-                    <CardTypeBadge kind={it.kind} />
-                    {it.canPlay && (
-                      <CardStatusBadge status="available" title={it.name} />
-                    )}
-                    <div className="media-quick-overlay">
-                      <div className="media-quick-summary" aria-hidden="true">
-                        {it.year && <span>{it.year}</span>}
-                        <strong>{it.name}</strong>
-                      </div>
-                    </div>
-                  </div>
-                  <div className="media-meta">
-                    <div className="media-title">{it.name}</div>
-                    <div className="media-subtitle">
-                      {[it.year, it.kind].filter(Boolean).join(" · ")}
-                    </div>
-                  </div>
-                </button>
-              ))}
+              {wholeRows(items, cols, hasMore).map((it) => {
+                const open = () => setP({ item: it.id }, { push: true });
+                return it.catalog ? (
+                  <CatalogLibraryTile
+                    key={it.id}
+                    item={it}
+                    catalog={it.catalog}
+                    onOpen={open}
+                  />
+                ) : (
+                  <LibraryTile key={it.id} item={it} onOpen={open} />
+                );
+              })}
             </div>
-            <div className="mt-6 flex items-center justify-between gap-3">
-              <div className="text-sm text-muted">
-                {pageData && pageData.total > 0
-                  ? `Items ${pageData.start + 1}–${end} of ${pageData.total}`
-                  : "No items"}
-              </div>
-              <div className="flex gap-2">
+            {loading && (
+              <p className="mt-6 text-center text-sm text-muted" role="status">
+                Loading more…
+              </p>
+            )}
+            {!loading && gridError !== null && (
+              <div className="mt-6 flex items-center justify-center gap-3 text-sm text-muted">
+                <span>Couldn&rsquo;t load more items: {gridError}</span>
                 <button
                   type="button"
                   className="btn"
-                  disabled={start === 0}
-                  onClick={() => {
-                    setP({ start: String(Math.max(0, start - limit)) });
-                    window.scrollTo({ top: 0 });
-                  }}
+                  onClick={() => void load(items.length, "more")}
                 >
-                  Previous
-                </button>
-                <button
-                  type="button"
-                  className="btn"
-                  disabled={!hasNext}
-                  onClick={() => {
-                    setP({ start: String(start + limit) });
-                    window.scrollTo({ top: 0 });
-                  }}
-                >
-                  Next
+                  Retry
                 </button>
               </div>
-            </div>
+            )}
+            {!loading && gridError === null && acc?.stalled && (
+              <div className="mt-6 flex items-center justify-center gap-3 text-sm text-muted">
+                {/* The stall means the read window moved (items arrived
+                    above it between two reads), so resuming at the same
+                    offset would repeat it: Retry reloads from the top. */}
+                <span>
+                  More items exist, but the library changed while paging.
+                </span>
+                <button type="button" className="btn" onClick={retry}>
+                  Retry
+                </button>
+              </div>
+            )}
+            <div ref={sentinelRef} aria-hidden="true" />
           </>
         )}
       </div>
@@ -293,10 +437,13 @@ function ItemDetail({ id, onClose }: { id: string; onClose: () => void }) {
     item: LibraryItem;
     catalog?: MediaReference;
     catalogNote?: string;
+    catalogIssue?: "not_connected" | "ambiguous" | "failed";
   }>(`/api/library/${encodeURIComponent(id)}`, [id]);
   const item = data?.item ?? null;
   const catalog = data?.catalog;
   const catalogNote = data?.catalogNote;
+  const catalogIssue = data?.catalogIssue;
+  const isAdmin = useSession().account.role === "admin";
   const target: DetailTarget | undefined = catalog
     ? { provider: catalog.provider, kind: catalog.kind, id: catalog.id }
     : undefined;
@@ -352,15 +499,15 @@ function ItemDetail({ id, onClose }: { id: string; onClose: () => void }) {
     <div
       ref={panelRef}
       tabIndex={-1}
-      className="library-detail"
+      className="cat-detail"
       aria-label="Item details"
     >
-      <div className="page-heading">
+      {/* Same frame as the title page (CatalogDetailView): width, back row
+          and spacing come from .cat-detail / .cat-topline. */}
+      <div className="cat-topline">
         <button type="button" className="btn" onClick={onClose}>
-          <Icon name="chevron-left" />
-          Back to library
+          <Icon name="chevron-left" /> Back to library
         </button>
-        <span className="chip">In your library</span>
       </div>
       {error ? (
         <ErrorPanel title="Item unavailable" message={error} onRetry={reload} />
@@ -370,86 +517,173 @@ function ItemDetail({ id, onClose }: { id: string; onClose: () => void }) {
           aria-label="Loading details"
           aria-busy="true"
         />
+      ) : catalog && catDetail && target ? (
+        // A matched item is its catalog title: the same hero (Play on
+        // Jellyfin and the file facts come from the availability check),
+        // tags, cast, aside and similar titles.
+        <DetailBody
+          payload={catDetail}
+          target={target}
+          onNavigate={(r) => setP(detailParams(r), { push: true })}
+          onBrowse={browseTo}
+          onRefetch={reloadCat}
+          libraryItem={item}
+        />
       ) : (
         <>
-          <div className="library-detail-hero">
-            {item.image && (
-              <img src={item.image} alt="" className="library-backdrop" />
-            )}
-            <div className="library-detail-poster">
-              <ItemImage
+          {/* Unmatched (or the catalog read pending or failed): the same
+              hero layout from what Jellyfin knows, facts in the side panel. */}
+          <header
+            className="cat-hero"
+            style={
+              item.image
+                ? { backgroundImage: `url("${item.image}")` }
+                : undefined
+            }
+          >
+            <div className="cat-hero-scrim" aria-hidden="true" />
+            <div className="cat-hero-inner">
+              <EnlargeableImage
                 name={item.name}
-                src={item.image}
-                className="h-full w-full object-cover"
+                imageUrl={item.image}
+                frameClass="cat-poster block p-0"
+                imgClass="cat-poster-img"
               />
-            </div>
-            <div className="library-detail-copy">
-              <div className="flex flex-wrap gap-2">
-                <span className="chip">{item.kind}</span>
-                {item.year != null && <span className="chip">{item.year}</span>}
-                {runtime(item.durationTicks) && (
-                  <span className="chip">{runtime(item.durationTicks)}</span>
-                )}
+              <div className="cat-hero-copy">
+                {/* Every item here comes from Jellyfin, so the fact always
+                    holds; same badge as a title page's availability. */}
+                <span className="cat-badge cat-badge-available">
+                  <Icon name="check" />
+                  In your library
+                </span>
+                <h1 className="cat-hero-title">
+                  {item.name}
+                  {item.year != null && (
+                    <>
+                      {" "}
+                      <span className="cat-hero-year">({item.year})</span>
+                    </>
+                  )}
+                </h1>
+                <div className="cat-hero-facts">
+                  <FileFacts item={item} />
+                </div>
+                <div className="cat-hero-actions">
+                  {item.canPlay && item.watchUrl ? (
+                    <a
+                      className="btn btn-accent"
+                      href={item.watchUrl}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                    >
+                      <Icon name="play" />
+                      Play on Jellyfin
+                    </a>
+                  ) : (
+                    <p className="text-sm text-muted">
+                      Playback is not available for this item or your account.
+                    </p>
+                  )}
+                </div>
               </div>
-              <h2>{item.name}</h2>
-              {item.canPlay && item.watchUrl ? (
-                <a
-                  className="btn btn-accent"
-                  href={item.watchUrl}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                >
-                  <Icon name="play" />
-                  Watch in Jellyfin
-                </a>
-              ) : (
-                <p className="text-sm text-muted">
-                  Playback is not available for this item or your account.
-                </p>
-              )}
-              <FileFacts item={item} />
+              <section aria-label="Details" className="hero-facts">
+                <dl>
+                  <dt>Source</dt>
+                  <dd>Jellyfin {item.kind}</dd>
+                  {item.year != null && (
+                    <>
+                      <dt>Year</dt>
+                      <dd>{item.year}</dd>
+                    </>
+                  )}
+                  {runtime(item.durationTicks) && (
+                    <>
+                      <dt>Duration</dt>
+                      <dd>{runtime(item.durationTicks)}</dd>
+                    </>
+                  )}
+                </dl>
+              </section>
             </div>
-          </div>
-          {(!catalog || catError) && (
-            <section className="library-overview" aria-label="Overview">
-              <h3 className="mb-3 text-xl font-semibold text-ink">Overview</h3>
-              <p>{item.overview || "No synopsis available."}</p>
-            </section>
-          )}
+          </header>
+          <section className="cat-section" aria-label="Overview">
+            <h2 className="cat-section-title">Overview</h2>
+            <ClampedText
+              text={item.overview || "No synopsis available."}
+              lines={5}
+              className="mt-2"
+              textClassName="cat-overview text-sm leading-relaxed text-muted"
+            />
+          </section>
           {/* ponytail: identity is Whisparr path correspondence only; the
               upgrade path is mapping Jellyfin ProviderIds. */}
+          {/* Why there are no catalog details: one panel with a headline, a
+              danger tone only for a failed lookup, and a next step only when
+              one exists. */}
           {!catalog && (
-            <p className="text-sm text-muted">
-              Catalog details unavailable
-              {catalogNote
-                ? `: ${catalogNote}`
-                : " — no provider match was found for this item's file paths."}
-            </p>
+            <div
+              className={
+                catalogIssue === "failed"
+                  ? "catalog-note is-failed"
+                  : "catalog-note"
+              }
+              role={catalogIssue === "failed" ? "alert" : "status"}
+            >
+              <strong>
+                {catalogIssue === "not_connected"
+                  ? "Catalog details are off"
+                  : catalogIssue === "ambiguous"
+                    ? "Match needs review"
+                    : catalogIssue === "failed"
+                      ? "Catalog lookup failed"
+                      : "No catalog match"}
+              </strong>
+              <p>
+                {catalogIssue === "not_connected"
+                  ? "Velvarr matches library files to TPDB or StashDB through Whisparr, and Whisparr is not connected."
+                  : catalogIssue === "ambiguous"
+                    ? "More than one Whisparr title uses this file's folder. Velvarr does not guess which one."
+                    : (catalogNote ??
+                      "Whisparr has no title at this file's folder.")}
+                {catalogIssue === "not_connected" &&
+                  !isAdmin &&
+                  " Ask an administrator to connect it."}
+              </p>
+              {catalogIssue === "not_connected" && isAdmin && (
+                <Link
+                  className="btn mt-3"
+                  href="/?view=settings#whisparr-heading"
+                  prefetch={false}
+                >
+                  <Icon name="settings" />
+                  Open Whisparr settings
+                </Link>
+              )}
+              {catalogIssue === "failed" && (
+                <button type="button" className="btn mt-3" onClick={reload}>
+                  <Icon name="refresh" />
+                  Retry
+                </button>
+              )}
+            </div>
           )}
           {catalog && catError ? (
             catErr?.status === 404 ? (
               // Authoritative absence, not an outage: stated, no retry.
-              <p className="text-sm text-muted">
+              <p className="mt-4 text-sm text-muted">
                 Catalog details unavailable — this item is not in the provider
                 catalog.
               </p>
             ) : (
-              <ErrorPanel
-                title="Catalog details unavailable"
-                message={catError}
-                onRetry={reloadCat}
-              />
+              <div className="mt-4">
+                <ErrorPanel
+                  title="Catalog details unavailable"
+                  message={catError}
+                  onRetry={reloadCat}
+                />
+              </div>
             )
           ) : null}
-          {catalog && catDetail && target && (
-            <DetailSections
-              payload={catDetail}
-              target={target}
-              onNavigate={(r) => setP(detailParams(r), { push: true })}
-              onBrowse={browseTo}
-              onRetryLink={reloadCat}
-            />
-          )}
         </>
       )}
     </div>

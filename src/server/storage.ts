@@ -58,10 +58,11 @@ import type {
   RequestStatusFilter,
   RequestTypeFilter,
 } from "../lib/decisions.ts";
+import { parseDiscordWebhook } from "../lib/discord-settings.ts";
 
 // Schema identity: application_id spells 'VLVR', user_version is the schema version.
 const APP_ID = 0x564c5652;
-const SCHEMA_VERSION = 15;
+const SCHEMA_VERSION = 16;
 // ponytail: fixed 7-day session TTL; make it an env knob only if an operator asks.
 const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const BUSY_TIMEOUT_MS = 5000;
@@ -179,6 +180,7 @@ type Statements = {
   getSession: StatementSync;
   deleteSession: StatementSync;
   deleteAccountSessions: StatementSync;
+  deleteExpiredSessions: StatementSync;
   insertCatalog: StatementSync;
   updateCatalogTitle: StatementSync;
   getCatalogById: StatementSync;
@@ -211,6 +213,7 @@ type Statements = {
   completeSubmissionFailed: StatementSync;
   completeSubmissionFailedPermanent: StatementSync;
   requeueBlocked: StatementSync;
+  reactivateFailedPermanent: StatementSync;
   recordObservation: StatementSync;
   recordObservationError: StatementSync;
   recordAbsence: StatementSync;
@@ -221,6 +224,7 @@ type Statements = {
   insertPerformerFollow: StatementSync;
   getPerformerFollow: StatementSync;
   listPerformerFollows: StatementSync;
+  countPerformerFollows: StatementSync;
   listPerformerFollowsByProvider: StatementSync;
   getPerformerFollowByRef: StatementSync;
   updatePerformerFollowLink: StatementSync;
@@ -468,6 +472,46 @@ const MIGRATIONS: Record<number, string> = {
     ALTER TABLE accounts ADD COLUMN prose_search INTEGER NOT NULL DEFAULT 0
       CHECK (prose_search IN (0, 1));
   `,
+  16: `
+    -- Fold provider ids to lowercase at rest, deleting nothing. Ids are
+    -- hex UUIDs and before the write path normalized them, one title could
+    -- hold two rows differing only in case: requests_active_intent and
+    -- acquisitions_identity compare case-sensitively, so both spellings
+    -- cannot fold at once. Cancellation and the eligibility checks match
+    -- ids exactly across accounts and instances, so a partial fold would
+    -- break the links: the fold decides per identity
+    -- (provider, kind, lower(external_id)) over both tables together.
+    -- One spelling across every request and acquisition row of the
+    -- identity: every row folds. Two or more spellings: every row keeps
+    -- its spelling for a manual repair, and the migration logs them at
+    -- startup (warnLeftMixedIds). The snapshot below fixes the pre-fold
+    -- picture so both updates read the same spellings. The operator chose
+    -- this over cancelling requests and deleting acquisition rows
+    -- (VELV-233, 2026-11-20): an upgrade must not lose history.
+    CREATE TEMP TABLE migration16_spellings AS
+      SELECT provider, kind, external_id FROM requests
+      UNION ALL
+      SELECT provider, kind, external_id FROM acquisitions;
+    UPDATE requests SET external_id = lower(external_id)
+    WHERE external_id != lower(external_id)
+      AND NOT EXISTS (
+        SELECT 1 FROM migration16_spellings m
+        WHERE m.provider = requests.provider
+          AND m.kind = requests.kind
+          AND lower(m.external_id) = lower(requests.external_id)
+          AND m.external_id != requests.external_id
+      );
+    UPDATE acquisitions SET external_id = lower(external_id)
+    WHERE external_id != lower(external_id)
+      AND NOT EXISTS (
+        SELECT 1 FROM migration16_spellings m
+        WHERE m.provider = acquisitions.provider
+          AND m.kind = acquisitions.kind
+          AND lower(m.external_id) = lower(acquisitions.external_id)
+          AND m.external_id != acquisitions.external_id
+      );
+    DROP TABLE migration16_spellings;
+  `,
 };
 
 let db: DatabaseSync | null = null;
@@ -522,6 +566,33 @@ function hasUserTables(d: DatabaseSync): boolean {
     )
     .get() as { n: number };
   return row.n > 0;
+}
+
+/** Migration 16 keeps rows whose folded id collides with another row, so a
+ * legacy database can hold one title under two spellings. Name them at
+ * migration time: those identities are degraded until repaired by hand. */
+function warnLeftMixedIds(d: DatabaseSync): void {
+  const rows = d
+    .prepare(
+      `SELECT 'request' AS origin, provider, kind, external_id
+         FROM requests WHERE external_id != lower(external_id)
+       UNION ALL
+       SELECT 'acquisition' AS origin, provider, kind, external_id
+         FROM acquisitions WHERE external_id != lower(external_id)`,
+    )
+    .all() as {
+    origin: string;
+    provider: string;
+    kind: string;
+    external_id: string;
+  }[];
+  if (rows.length === 0) return;
+  const listed = rows
+    .map((r) => `${r.origin} ${r.provider}/${r.kind} ${r.external_id}`)
+    .join(", ");
+  console.warn(
+    `velvarr: migration 16 left ${rows.length} row(s) with a case-duplicate provider id untouched for manual repair: ${listed}`,
+  );
 }
 
 function validateAndMigrate(d: DatabaseSync): void {
@@ -586,6 +657,7 @@ function validateAndMigrate(d: DatabaseSync): void {
       failure.cause = e;
       throw failure;
     }
+    if (v === 16) warnLeftMixedIds(d);
   }
 }
 
@@ -623,6 +695,9 @@ function S(): Statements {
       deleteSession: d.prepare("DELETE FROM sessions WHERE token_hash = ?"),
       deleteAccountSessions: d.prepare(
         "DELETE FROM sessions WHERE account_id = ?",
+      ),
+      deleteExpiredSessions: d.prepare(
+        "DELETE FROM sessions WHERE expires_at <= ?",
       ),
       insertCatalog: d.prepare(
         "INSERT INTO catalog_identities (id, provider, kind, external_id, title, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -759,6 +834,19 @@ function S(): Statements {
       requeueBlocked: d.prepare(
         "UPDATE acquisitions SET state = 'unsent', due_at = ?, updated_at = ? WHERE instance_id = ? AND state = 'blocked' AND claim_token IS NULL",
       ),
+      // VELV-210: a terminal failed row is never revisited by a pass (due_at
+      // NULL), so a fresh approval of the same identity is the recovery. Only
+      // the terminal state is rescheduled; live work is never touched.
+      // VELV-234: a row that reached failed_permanent via recordAbsence may
+      // still carry submitted_at from an earlier accepted submission. A
+      // proven absence means Whisparr no longer holds the item, so the
+      // reactivated row is undispatched work again: the stale submission
+      // must be cleared with the dispatch residue, or withdrawUndispatched
+      // (which requires submitted_at IS NULL) can never remove it and the
+      // row wedges as unsent forever.
+      reactivateFailedPermanent: d.prepare(
+        "UPDATE acquisitions SET state = ?, due_at = ?, submitted_at = NULL, attempt_token = NULL, last_error = NULL, last_error_at = NULL, updated_at = ? WHERE id = ? AND state = 'failed_permanent' AND claim_token IS NULL",
+      ),
       recordObservation: d.prepare(
         `UPDATE acquisitions SET state = ?, last_observed_at = ?, due_at = ?,
            whisparr_id = COALESCE(?, whisparr_id),
@@ -803,6 +891,9 @@ function S(): Statements {
       ),
       listPerformerFollows: d.prepare(
         "SELECT * FROM performer_follows WHERE account_id = ? ORDER BY created_at DESC, id DESC",
+      ),
+      countPerformerFollows: d.prepare(
+        "SELECT COUNT(*) AS n FROM performer_follows WHERE account_id = ?",
       ),
       listPerformerFollowsByProvider: d.prepare(
         "SELECT * FROM performer_follows WHERE account_id = ? AND provider = ? ORDER BY created_at DESC, id DESC LIMIT ?",
@@ -1085,6 +1176,24 @@ function assertConfigShape(config: IntegrationConfig): void {
       );
     }
   }
+  if (config.discord !== undefined) {
+    const d = config.discord;
+    if (
+      typeof d !== "object" ||
+      d === null ||
+      Array.isArray(d) ||
+      (d.webhookUrl !== undefined &&
+        (typeof d.webhookUrl !== "string" ||
+          !parseDiscordWebhook(d.webhookUrl))) ||
+      (d.includeTitles !== undefined && typeof d.includeTitles !== "boolean")
+    ) {
+      throw new AppError(
+        400,
+        "invalid_config",
+        "Discord configuration is invalid",
+      );
+    }
+  }
   if (config.providers !== undefined) {
     const p = config.providers;
     const credentialOk = (v: unknown, max: number) =>
@@ -1152,6 +1261,9 @@ function issueSession(account: Account, jellyfinToken: string): SessionGrant {
   open();
   const raw = randomBytes(32).toString("base64url");
   const now = Date.now();
+  // Sweep before the insert so lost-device rows die without their token ever
+  // coming back; the new row's expires_at is always in the future.
+  S().deleteExpiredSessions.run(now);
   const expiresAt = now + SESSION_TTL_MS;
   S().insertSession.run(
     hashToken(raw),
@@ -1644,6 +1756,9 @@ function isUniqueConflict(e: unknown, columns: readonly string[]): boolean {
  * shared work. Call from the server-start hook, never from a request path. */
 export function initializeStorage(): void {
   const d = open();
+  // Runs before the config early-returns: expired rows must not outlive a
+  // boot that touches no Whisparr or approval repair work.
+  S().deleteExpiredSessions.run(Date.now());
   const config = getConfig();
   const whisparr = config?.whisparr;
   if (!config || !whisparr) return;
@@ -1719,6 +1834,10 @@ export function createRequest(
   media: MediaReference,
 ): RequestRecord {
   assertMediaReference(media);
+  // Provider ids are hex UUIDs and arrive in either case (the bulk route
+  // passes provider rows unchanged): fold once here so the case-sensitive
+  // active-intent and acquisition identity keys see one spelling.
+  const externalId = media.id.toLowerCase();
   const d = open();
   return inTransaction(d, () => {
     const account = S().getAccount.get(accountId) as AccountRow | undefined;
@@ -1745,7 +1864,7 @@ export function createRequest(
         accountId,
         media.provider,
         media.kind,
-        media.id,
+        externalId,
         now,
       );
     } catch (e) {
@@ -1764,10 +1883,18 @@ export function createRequest(
   });
 }
 
+/** The active-intent key: "<provider>:<kind>:<external_id>", ids folded to
+ * lowercase. One builder for listActiveIntentKeys and the bulk route's
+ * pre-skip, so a mixed-case provider row matches the lowercase spelling
+ * createRequest stores. */
+export function intentKey(provider: string, kind: string, id: string): string {
+  return `${provider}:${kind}:${id.toLowerCase()}`;
+}
+
 /** The account's own active intents — the requests_active_intent predicate
- * (decision 'pending' or 'approved') — as "<provider>:<kind>:<external_id>"
- * keys, so a caller can pre-skip exactly what createRequest would refuse
- * without re-deriving the index's rule. */
+ * (decision 'pending' or 'approved') — as intentKey keys, so a caller can
+ * pre-skip exactly what createRequest would refuse without re-deriving the
+ * index's rule. */
 export function listActiveIntentKeys(accountId: string): Set<string> {
   // Reads only the active rows, through the requests_active_intent index.
   const rows = S().listActiveIntents.all(accountId) as Pick<
@@ -1775,11 +1902,22 @@ export function listActiveIntentKeys(accountId: string): Set<string> {
     "provider" | "kind" | "external_id"
   >[];
   return new Set(
-    rows.map((row) => `${row.provider}:${row.kind}:${row.external_id}`),
+    rows.map((row) => intentKey(row.provider, row.kind, row.external_id)),
   );
 }
 
 // --- performer follows ---
+
+/** One account may hold at most this many performer-follow rows. A linked
+ * pair is two rows, so a pair press refuses whole when either side would
+ * pass the cap — the transaction rolls both back, never a half-recorded
+ * pair. ponytail: a real household never needs more; the upgrade path is a
+ * raised constant plus a cursor page on the list. */
+export const FOLLOW_CAP_PER_ACCOUNT = 500;
+/** Snapshot image urls never exceed this. The provider row parsers already
+ * slice artwork to 2048 (httpsUrl), so only a request body can offer more;
+ * the storage guard is the shared root every writer answers to. */
+export const FOLLOW_IMAGE_URL_MAX = 2048;
 
 /** Inserts a validated follow row inside the caller's transaction. */
 function insertFollowRow(
@@ -1800,6 +1938,34 @@ function insertFollowRow(
       "account_not_admitted",
       "only admitted accounts may follow performers",
     );
+  }
+  // Shared write root: the follow route, its pair press, and the merge
+  // auto-follow all funnel through here, so the bound holds for all of them.
+  if (imageUrl !== null && imageUrl.length > FOLLOW_IMAGE_URL_MAX) {
+    throw new AppError(400, "invalid_field", "image url is too long");
+  }
+  // A row that already exists adds nothing, so the cap must not refuse a
+  // re-follow: the insert's unique conflict answers already_following
+  // instead. This is the precedence the pair press relies on — its
+  // counterpart may already be followed, and the press must land.
+  const duplicate =
+    S().getPerformerFollowByRef.get(
+      accountId,
+      reference.provider,
+      reference.id,
+    ) !== undefined;
+  if (!duplicate) {
+    // The cap reads the live row count inside the caller's transaction, so
+    // a pair press refuses whole when its genuinely-new counterpart row
+    // would pass the cap: the rollback leaves no half-recorded pair.
+    const counted = S().countPerformerFollows.get(accountId) as { n: number };
+    if (Number(counted.n) >= FOLLOW_CAP_PER_ACCOUNT) {
+      throw new AppError(
+        409,
+        "follow_cap_reached",
+        "follow cap reached: unfollow one to follow another",
+      );
+    }
   }
   const id = randomUUID();
   try {
@@ -2668,6 +2834,32 @@ export function hasEligibleRequester(media: MediaReference): boolean {
   return row.eligible === 1;
 }
 
+/** Last-withdrawal suppression, shared by cancelRequest and the decline
+ * branch of decideRequest: only undispatched work — state 'unsent' or
+ * 'blocked', no claim, no attempt, no submission — and only when no other
+ * active intent remains for this identity. Runs inside the caller's
+ * transaction; a later approval re-inserts the row through INSERT OR
+ * IGNORE. */
+function withdrawIfLastIntent(row: RequestRow): void {
+  const instance = getConfig()?.whisparr?.instanceId;
+  if (instance === undefined) return;
+  const active = S().countActiveRequestsExcept.get(
+    row.provider,
+    row.kind,
+    row.external_id,
+    row.id,
+  ) as { n: number };
+  if (active.n === 0) {
+    const shared = S().getAcquisitionByIdentity.get(
+      instance,
+      row.provider,
+      row.kind,
+      row.external_id,
+    ) as AcquisitionRow | undefined;
+    if (shared !== undefined) S().withdrawUndispatched.run(shared.id);
+  }
+}
+
 /** Approval is transactional with the shared-acquisition attachment: two
  * approvers converge on one acquisition row per instance+identity. The actor
  * is re-read inside the transaction: the session snapshot can predate a
@@ -2716,6 +2908,7 @@ export function decideRequest(
     }
     const now = Date.now();
     S().decideRequest.run(decision, now, requestId);
+    if (decision === "declined") withdrawIfLastIntent(row);
     if (decision === "approved") {
       const whisparr = getConfig()?.whisparr;
       if (whisparr && !whisparr.instanceId) {
@@ -2731,7 +2924,7 @@ export function decideRequest(
         // Delivery disabled or unset leaves actionable blocked work, never a
         // pretend success. No Whisparr at all means nothing to deliver to yet.
         const state = whisparr.delivery?.enabled ? "unsent" : "blocked";
-        S().insertAcquisition.run(
+        const inserted = S().insertAcquisition.run(
           randomUUID(),
           whisparr.instanceId,
           row.provider,
@@ -2742,6 +2935,26 @@ export function decideRequest(
           now,
           now,
         );
+        if (inserted.changes === 0) {
+          // The identity already has the shared row. A terminal failed row
+          // wedges it — no pass revisits it and no cancel withdraws it — so
+          // a fresh approval is the deliberate recovery: reschedule the same
+          // row like new work (VELV-210). Any live state stays untouched.
+          const existing = S().getAcquisitionByIdentity.get(
+            whisparr.instanceId,
+            row.provider,
+            row.kind,
+            row.external_id,
+          ) as AcquisitionRow | undefined;
+          if (existing?.state === "failed_permanent") {
+            S().reactivateFailedPermanent.run(
+              state,
+              state === "unsent" ? now : null,
+              now,
+              existing.id,
+            );
+          }
+        }
       }
     }
     return rowToRequest(S().getRequest.get(requestId) as RequestRow);
@@ -2777,26 +2990,7 @@ export function cancelRequest(
       );
     }
     S().cancelOwnRequest.run(Date.now(), requestId);
-    // Last-withdrawal suppression: only undispatched work, only when no
-    // other active intent remains for this identity.
-    const instance = getConfig()?.whisparr?.instanceId;
-    if (instance !== undefined) {
-      const active = S().countActiveRequestsExcept.get(
-        row.provider,
-        row.kind,
-        row.external_id,
-        requestId,
-      ) as { n: number };
-      if (active.n === 0) {
-        const shared = S().getAcquisitionByIdentity.get(
-          instance,
-          row.provider,
-          row.kind,
-          row.external_id,
-        ) as AcquisitionRow | undefined;
-        if (shared !== undefined) S().withdrawUndispatched.run(shared.id);
-      }
-    }
+    withdrawIfLastIntent(row);
     return rowToRequest(S().getRequest.get(requestId) as RequestRow);
   });
 }
@@ -2810,11 +3004,14 @@ export function getAcquisitionByReference(
   assertMediaReference(media);
   const instance = instanceId ?? getConfig()?.whisparr?.instanceId;
   if (!instance) return null;
+  // Active ids are lowercase (createRequest folds; migration 16 folded old
+  // rows, except an active case-collision pair): fold the lookup so a
+  // mixed-case reference still resolves the row.
   const row = S().getAcquisitionByIdentity.get(
     instance,
     media.provider,
     media.kind,
-    media.id,
+    media.id.toLowerCase(),
   ) as AcquisitionRow | undefined;
   return row ? rowToAcquisition(row) : null;
 }
@@ -2960,12 +3157,14 @@ export function completeSubmission(
 /** A successful observation updates recorded state and the last-observed
  * fact; a proven absence clears the recorded facts while keeping state and
  * the last observation; an unavailable/error check never touches state, the
- * last observation, or the facts. */
+ * last observation, or the facts. Returns null when no row matched: the
+ * row was withdrawn between listing and gating, and the caller skips it
+ * instead of failing. */
 export function recordAcquisitionObservation(
   id: string,
   observation: AcquisitionObservation,
   claimToken?: string,
-): AcquisitionRecord {
+): AcquisitionRecord | null {
   open();
   const now = Date.now();
   const claim = claimToken ?? null;
@@ -3042,6 +3241,12 @@ export function recordAcquisitionObservation(
       claim,
     );
   }
+  const row = S().getAcquisition.get(id) as AcquisitionRow | undefined;
+  if (row === undefined) {
+    // Withdrawn between listing and gating: no row matched, so there is
+    // nothing left to observe.
+    return null;
+  }
   if (claim !== null && res.changes === 0) {
     throw new AppError(
       409,
@@ -3049,7 +3254,7 @@ export function recordAcquisitionObservation(
       "claim changed; this worker is stale",
     );
   }
-  return rowToAcquisition(S().getAcquisition.get(id) as AcquisitionRow);
+  return rowToAcquisition(row);
 }
 
 /** True when the recorded item facts have aged past the staleness ceiling

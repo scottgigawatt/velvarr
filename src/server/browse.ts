@@ -11,9 +11,12 @@
 // duration). A TPDB performer filmography has no upstream order at all, so
 // any query it qualifies runs as stable concatenation and claims no order.
 //
-// ponytail: upstream scan ceiling is 40 provider pages per stream per
-// request. Hitting it before a page fills is a visible 422 "query_too_broad",
-// never a fake empty page or fake end — narrow the filters. One exception:
+// ponytail: upstream scan ceiling is 40 provider pages per stream, and —
+// since VELV-240 — 40 per provider per request: every stream of one browse
+// draws from one shared pool (createScanBudget), so entity seeds x fan-out
+// ids cannot multiply a request's reads past the ceiling. Hitting it
+// before a page fills is a visible 422 "query_too_broad", never a fake
+// empty page or fake end — narrow the filters. One exception:
 // a multi-term free-text AND split between a native tag criterion and the
 // local re-check degrades to a named partial page instead
 // (Stream.softCeiling). A second: a side whose free-text expansion is
@@ -48,6 +51,7 @@ import {
 } from "./providers.ts";
 import {
   resolveIncludeCriteria,
+  scanCeilingError,
   scanCeilingOutcome,
   softCeilingFor,
   type TagExpansion,
@@ -93,6 +97,26 @@ import type {
 
 const MAX_SCAN_PAGES = 40;
 
+/** One pool of MAX_SCAN_PAGES upstream page reads per provider, shared by
+ * every stream of one browse request (VELV-240): fan-out multiplies the
+ * streams a browse opens (ids x entity seeds), so the per-stream ceiling
+ * alone let one request read seeds x ids x 40 pages on the shared
+ * operator keys. Takes are synchronous, so concurrent streams cannot
+ * oversubscribe the pool; a stream refused a page ends soft with the
+ * named scan_ceiling error (scanCeilingError) — the hard query_too_broad
+ * stays a stream's own "40 broad pages" verdict, which is why the
+ * per-stream check runs first in Stream.fetch and a lone stream can never
+ * see the pool refuse it (its own ceiling fires at the same fetch). */
+function createScanBudget(): (provider: CatalogProvider) => boolean {
+  const left = new Map<CatalogProvider, number>();
+  return (provider) => {
+    const have = left.get(provider) ?? MAX_SCAN_PAGES;
+    if (have <= 0) return false;
+    left.set(provider, have - 1);
+    return true;
+  };
+}
+
 // --- pinned public shapes ---
 
 export type BrowseType = "all" | "movie" | "scene";
@@ -111,14 +135,15 @@ export type BrowseQuery = {
   performerMode: PerformerMode;
   performerStarred?: true;
   studioMode: "exact" | "withChildren";
-  /** Release-year window: `year` stays native on TPDB and exact-match on
-   * StashDB; `yearTo` adds the local upper bound on both. */
+  /** Inclusive release-year window. A lone year stays exact.
+   * With release-date order, a range sends one bound upstream and checks
+   * both bounds locally. */
   year?: number;
   yearTo?: number;
   date?: string;
   dateOperation?: ReleaseDateOperation;
-  /** Inclusive release-date upper bound (`YYYY-MM-DD`), valid only beside
-   * `date` + `>=`; checks locally on both providers, like `yearTo`. */
+  /** Inclusive release-date upper bound (`YYYY-MM-DD`). Requires `date` + `>=`.
+   * Release-date order selects the native bound. Both bounds also check locally. */
   dateTo?: string;
   sort?: CatalogSortKey;
   direction?: CatalogSortDirection;
@@ -516,6 +541,7 @@ function visiblePredicate(
   years: { from?: number; to?: number } | undefined,
   creditsAllOf: string[],
   dateTo?: string,
+  dateFrom?: string,
 ): (d: CatalogDetail) => boolean {
   // Exclusions win over includes: a hidden or excluded match blocks the item
   // regardless of any include criterion. Selections fold once here, per
@@ -562,6 +588,12 @@ function visiblePredicate(
       const released = d.releaseDate?.slice(0, 10);
       if (released === undefined || released > dateTo) return false;
     }
+    if (dateFrom !== undefined) {
+      // ISO dates compare as strings; a missing release date can never
+      // prove the window, so it excludes — same rule as the year check.
+      const released = d.releaseDate?.slice(0, 10);
+      if (released === undefined || released < dateFrom) return false;
+    }
     return true;
   };
 }
@@ -593,6 +625,15 @@ type ResolvedIncludes = {
    * ceiling such a stream degrades softly — its pages were productive and
    * the matches found are a real partial answer. */
   freeTextNative: boolean;
+  /** The planned fan-out group: one native all-of stream per id, each
+   * carrying `allOf ∪ {id}`, when anchored ids sit beside a small complete
+   * free-text group — neither provider can express all-of plus any-of in
+   * one query, so the group fans out instead of starving into the 422
+   * ceiling. Empty on every other plan: a group above the fan-out cap,
+   * one that misses the native id cap, or an incomplete expansion keeps
+   * the local re-check, and with no anchored ids the any-of pre-filter
+   * runs as before. */
+  fanoutIds: string[];
 };
 
 /** Resolves the native include criteria for one provider side. Anchored
@@ -626,7 +667,7 @@ type ResolvedIncludes = {
  * while the other terms keep filtering locally. A lookup that fails
  * throws; browseTitles records the side as a failed source instead of
  * reading the outage as absence. */
-async function includeIdsForSide(
+export async function includeIdsForSide(
   selections: IncludeTerm[],
   side: "tpdb" | "stashdb",
   expandFree: boolean,
@@ -643,13 +684,27 @@ async function includeIdsForSide(
     if (Array.isArray(sel)) {
       // "or" group: build one TagExpansion from the members' native ids.
       const union: string[] = [];
+      // Membership Set in lockstep with the ordered array: expansion bursts
+      // push thousands of ids (the walk caps at 5000), and the old
+      // Array.includes dedupe scanned the whole union on every push —
+      // validation #VELV-247 timed this group shape at a 565 ms loop block
+      // on a 1-vCPU sandbox; the dev box timed the same warm call at
+      // ~50 ms. The Set keeps the deduped set and push order identical.
+      const unionIds = new Set<string>();
       let complete = true;
       let dropped = false;
       let allNative = true;
+      // Members whose label does not exist on this side: an OR group only
+      // proves the side can never match when EVERY member is absent; one
+      // absent member just adds nothing (TPDB "Anal" or StashDB "Anal Sex").
+      let absent = 0;
       for (const member of sel) {
         const direct = side === "tpdb" ? member.tpdb : member.stashdb;
         if (direct !== undefined) {
-          if (!union.includes(direct)) union.push(direct);
+          if (!unionIds.has(direct)) {
+            unionIds.add(direct);
+            union.push(direct);
+          }
           continue;
         }
         if (isFreeTextSelection(member)) {
@@ -662,7 +717,10 @@ async function includeIdsForSide(
           }
           const expansion = await expandCatalogTagTerm(side, member.name);
           for (const id of expansion.ids) {
-            if (!union.includes(id)) union.push(id);
+            if (!unionIds.has(id)) {
+              unionIds.add(id);
+              union.push(id);
+            }
           }
           complete = complete && expansion.complete;
           dropped = dropped || expansion.dropped;
@@ -674,9 +732,15 @@ async function includeIdsForSide(
           side === "tpdb" ? "stashdb" : "tpdb",
           member.name,
         );
-        if (counterpart === undefined) return undefined;
+        if (counterpart === undefined) {
+          absent += 1;
+          continue;
+        }
         if (counterpart.native) {
-          if (!union.includes(counterpart.id)) union.push(counterpart.id);
+          if (!unionIds.has(counterpart.id)) {
+            unionIds.add(counterpart.id);
+            union.push(counterpart.id);
+          }
         } else {
           // This member can only match locally, which makes the whole
           // group local: a partial union would silently drop titles.
@@ -684,6 +748,7 @@ async function includeIdsForSide(
           complete = false;
         }
       }
+      if (absent === sel.length) return undefined;
       terms.push({
         term: sel,
         expansion: { complete: complete && allNative, dropped, ids: union },
@@ -727,6 +792,7 @@ async function includeIdsForSide(
       localInclude: [...local],
       localFree: [],
       freeTextNative: false,
+      fanoutIds: [],
     };
   }
   if (!expandFree) {
@@ -739,6 +805,7 @@ async function includeIdsForSide(
       localInclude: [...localTerms, ...local],
       localFree: localTerms,
       freeTextNative: false,
+      fanoutIds: [],
     };
   }
   // Every term expands before the decision: the tag listing behind
@@ -763,6 +830,7 @@ async function includeIdsForSide(
     ],
     localFree: criteria.localTermIndexes.map((i) => terms[i]!.term),
     freeTextNative: criteria.freeTextNative,
+    fanoutIds: criteria.fanoutIds,
   };
 }
 
@@ -807,6 +875,39 @@ function before(
   return a.reference.id < b.reference.id;
 }
 
+/** One in-flight upstream catalog page read per provider per browse: fan-out
+ * multiplies the streams a single browse opens per side, and the providers'
+ * rate limits for concurrent page reads are unmeasured, so the gate bounds
+ * the browse's fan-out reads at today's per-side level. The gate is created
+ * per browseTitles call and gates ONLY that browse's fan-out streams — every
+ * other read (non-fan-out streams of multi-seed browses, other requests,
+ * other users) keeps today's parallelism and never queues behind this
+ * browse. Ordered merges stay correct: the gate delays a stream's read,
+ * never its merge order — the merge already waits for every live stream's
+ * next row before picking a head. ponytail: measure and parallelize if
+ * fan-out latency shows up. */
+function createReadGate() {
+  const turns = new Map<CatalogProvider, Promise<unknown>>();
+  return function gateRead<T>(
+    provider: CatalogProvider,
+    read: () => Promise<T>,
+  ): Promise<T> {
+    // Queues `read` behind the provider's last queued turn. The chain is
+    // `prev.then(read, read)` so a prior read's failure cannot block the
+    // queue — the rejection handler runs the next read too. The stored tail
+    // is the settled form of `next` (rejections swallowed), so the chain
+    // never poisons a later reader; the caller's own promise still carries
+    // the error.
+    const prev = turns.get(provider) ?? Promise.resolve();
+    const next = prev.then(read, read);
+    turns.set(
+      provider,
+      next.catch(() => undefined),
+    );
+    return next;
+  };
+}
+
 /** One provider stream: consecutive native pages, visibility-filtered on
  * arrival. Provider errors are captured as SourceError instead of aborting a
  * merged page; a lone failing stream surfaces through allSourcesFailed. */
@@ -829,11 +930,29 @@ class Stream {
    * because the native pre-filter kept the scanned pages productive and
    * the matches found are a real partial answer. */
   readonly softCeiling: boolean;
+  /** Ends the ordered scan once a fetched page's last mapped row (provider
+   * order, not yet visibility-filtered) passes the local bound of a range
+   * whose far side rides native (resolveDateBound): the provider's order
+   * means later pages hold only rows further past it. */
+  private readonly dateStop?: (d: CatalogDetail) => boolean;
   private page = 0;
   private fetches = 0;
   private readonly base: CatalogSearchQuery;
   private readonly visible: (d: CatalogDetail) => boolean;
   private readonly perPage: number;
+  /** This browse's fan-out read gate (createReadGate), set on fan-out
+   * streams only: their upstream page reads queue per provider inside the
+   * one browse. Undefined on every other stream — those reads run exactly
+   * as before, in parallel, never behind this browse's fan-out. */
+  private readonly gate?: <T>(
+    provider: CatalogProvider,
+    read: () => Promise<T>,
+  ) => Promise<T>;
+  /** This browse's per-provider page-read pool (createScanBudget), shared
+   * by every stream of the request: a take that fails ends the stream
+   * soft with the named scan_ceiling error. Undefined outside
+   * browseTitles — searchVisibleCatalog keeps its single-stream bound. */
+  private readonly budget?: (provider: CatalogProvider) => boolean;
 
   constructor(
     base: CatalogSearchQuery,
@@ -841,12 +960,18 @@ class Stream {
     perPage: number,
     localFiltered: boolean,
     softCeiling = false,
+    dateStop?: (d: CatalogDetail) => boolean,
+    gate?: <T>(provider: CatalogProvider, read: () => Promise<T>) => Promise<T>,
+    budget?: (provider: CatalogProvider) => boolean,
   ) {
     this.base = base;
     this.visible = visible;
     this.perPage = perPage;
     this.localFiltered = localFiltered;
     this.softCeiling = softCeiling;
+    this.dateStop = dateStop;
+    this.gate = gate;
+    this.budget = budget;
   }
 
   get live(): boolean {
@@ -859,9 +984,12 @@ class Stream {
   }
 
   /** One more upstream page into the buffer. Throws query_too_broad when the
-   * documented ceiling is hit while upstream continuation still exists —
-   * except a softCeiling stream, which degrades to a named scan_ceiling
-   * error instead of throwing. */
+   * documented per-stream ceiling is hit while upstream continuation still
+   * exists — except a softCeiling stream, which degrades to a named
+   * scan_ceiling error instead of throwing. The browse's per-provider page
+   * pool (budget, VELV-240) ends the stream the same soft way when the
+   * request's shared reads are spent — never the hard throw, which is one
+   * stream's own too-broad verdict, not the browse's spent pool. */
   async fetch(): Promise<void> {
     if (!this.live) return;
     this.fetches += 1;
@@ -890,23 +1018,47 @@ class Stream {
       this.error = ceiling.error;
       return;
     }
+    if (this.budget !== undefined && !this.budget(this.base.provider)) {
+      this.exhausted = true;
+      this.error = scanCeilingError(this.base.provider);
+      return;
+    }
     this.page += 1;
     // A cached page resolves as a microtask chain, so a deep scan over
     // cached pages would hold the event loop for the whole walk: yield one
     // macrotask per page so other members' requests interleave.
     await nextMacrotask();
     try {
-      const result = await searchCatalog({
-        ...this.base,
-        page: this.page,
-        perPage: this.perPage,
-      } as CatalogSearchQuery);
+      // A fan-out stream queues its read behind its browse's per-provider
+      // turn; every other stream reads directly, in parallel, as before.
+      const read = () =>
+        searchCatalog({
+          ...this.base,
+          page: this.page,
+          perPage: this.perPage,
+        } as CatalogSearchQuery);
+      const result =
+        this.gate === undefined
+          ? await read()
+          : await this.gate(this.base.provider, read);
       this.buffer.push(...result.items.filter(this.visible));
       this.nativeHasMore = result.hasMore;
       this.total = result.total;
       this.totalKnown = result.totalCountKnown;
       this.sort = result.sort;
       if (!result.hasMore) this.exhausted = true;
+      else if (
+        this.dateStop !== undefined &&
+        result.items.length > 0 &&
+        this.dateStop(result.items[result.items.length - 1]!)
+      ) {
+        // The page's last row sits past the local bound of a range whose
+        // far side rides native: the release-date order guarantees later
+        // pages hold only rows further past it, so the scan ends here
+        // instead of walking into the ceiling. Strict comparisons keep
+        // ties scanning (equal dates never prove the bound).
+        this.exhausted = true;
+      }
     } catch (err) {
       // The request's own input fault keeps its status: capture would bury
       // an impossible date or unsupported order (raised before any upstream
@@ -1094,6 +1246,92 @@ async function mergeStreams(
 
 // --- native query assembly ---
 
+/** The far-side release-date bound of a year/date range: the one criterion
+ * riding the native releaseDate slot, and where the ordered local scan may
+ * stop. */
+type DateBound = {
+  /** The native releaseDate criterion: the far side of a range, or the
+   * caller's own single-sided pair. */
+  ride?: { cutoff: string; operation: ReleaseDateOperation };
+  /** Present only beside a range under a release-date order: rows past
+   * this local bound prove the ordered stream exhausted. */
+  stop?: { bound: string; side: "lower" | "upper" };
+};
+
+/** Resolves the far side of a year/date range against the effective sort
+ * (release recency desc by default; "date" is StashDB's own key). A range's
+ * FAR side rides the native release-date criterion, so a newest-first
+ * upstream scan never reads every newer title; the NEAR side stays local
+ * (visiblePredicate) and comes back as a stop bound that ends the ordered
+ * stream once a fetched page passes it. Strict comparisons in the stop keep
+ * ties safe: equal dates never prove the bound, so a tie spanning pages
+ * keeps scanning. A single-sided date pair keeps today's native wire
+ * byte-for-byte, and a lone TPDB `year` keeps the native exact-year param. */
+function resolveDateBound(
+  query: BrowseQuery,
+  sort: SortOrder | undefined,
+  provider: CatalogProvider,
+): DateBound {
+  const dateOrder =
+    sort !== undefined &&
+    (sort.key === "recency" || (provider === "stashdb" && sort.key === "date"));
+  const direction = sort?.direction ?? "desc";
+  // A date+dateOperation pair always owns the releaseDate slot first
+  // (today's precedence: `year` beside a single-sided `date` stays legal),
+  // so date handling branches before the year window.
+  if (query.date !== undefined && query.dateOperation !== undefined) {
+    if (query.dateTo !== undefined && query.dateOperation === ">=") {
+      if (!dateOrder) {
+        // No date order: only the lower bound rides, as before.
+        return { ride: { cutoff: query.date, operation: ">=" } };
+      }
+      return direction === "asc"
+        ? {
+            ride: { cutoff: query.date, operation: ">=" },
+            stop: { bound: query.dateTo, side: "upper" },
+          }
+        : {
+            ride: { cutoff: query.dateTo, operation: "<=" },
+            stop: { bound: query.date, side: "lower" },
+          };
+    }
+    // Single-sided pair: byte-for-byte today's wire, no stop.
+    return { ride: { cutoff: query.date, operation: query.dateOperation } };
+  }
+  if (provider === "tpdb") {
+    if (query.year === undefined || query.yearTo === undefined) {
+      // A lone year keeps the native exact-year param, so it needs no ride.
+      return {};
+    }
+    if (!dateOrder) {
+      return { ride: { cutoff: `${query.year}-01-01`, operation: ">=" } };
+    }
+    return direction === "asc"
+      ? {
+          ride: { cutoff: `${query.year}-01-01`, operation: ">=" },
+          stop: { bound: `${query.yearTo}-12-31`, side: "upper" },
+        }
+      : {
+          ride: { cutoff: `${query.yearTo}-12-31`, operation: "<=" },
+          stop: { bound: `${query.year}-01-01`, side: "lower" },
+        };
+  }
+  if (query.year === undefined && query.yearTo === undefined) return {};
+  if (!dateOrder) return {}; // no date order: nothing rides on StashDB, as before
+  return direction === "asc"
+    ? {
+        ride: { cutoff: `${query.year}-01-01`, operation: ">=" },
+        stop: { bound: `${query.yearTo ?? query.year}-12-31`, side: "upper" },
+      }
+    : {
+        ride: {
+          cutoff: `${query.yearTo ?? query.year}-12-31`,
+          operation: "<=",
+        },
+        stop: { bound: `${query.year}-01-01`, side: "lower" },
+      };
+}
+
 /** One planned stream's native query. The seed carries the provider, the
  * kind and the entity criteria; the caller adds its side's resolved include
  * criteria and the resolved TPDB studio site id. */
@@ -1116,10 +1354,7 @@ function nativeQuery(
   perPage: number,
 ): CatalogSearchQuery {
   const seed = plan.seed;
-  const date =
-    query.date !== undefined && query.dateOperation !== undefined
-      ? { cutoff: query.date, operation: query.dateOperation }
-      : undefined;
+  const ride = resolveDateBound(query, sort, seed.provider).ride;
   if (seed.provider === "tpdb") {
     if (seed.filmographyPerformer !== undefined) {
       // Filmography route: paging-only. Query, year, date, studio, tags and
@@ -1134,27 +1369,20 @@ function nativeQuery(
       };
     }
     // Every other movie query passes the AND-of-includes natively. A year
-    // range's LOWER bound rides the native date pair: TPDB `year` is an
-    // exact one-year filter, so it would clip the range to its first year
-    // and hide every later one. `yearTo` never rides native (TPDB has no
-    // upper-bound param); the visible predicate bounds it (localYearRange),
-    // which keeps range totals approximate. A single year (no yearTo) keeps
-    // the native exact-year filter, exactly as before.
+    // range's FAR side rides the native date pair (resolveDateBound): TPDB
+    // `year` alone is an exact one-year filter, so the range must ride
+    // dates, and under a release-date order the ordered scan then stops at
+    // the range's near edge instead of reading every newer title into the
+    // ceiling. A single year (no yearTo) keeps the native exact-year
+    // filter, exactly as before.
     return {
       provider: "tpdb",
       kind: "movie",
       ...(query.q !== undefined ? { query: query.q } : {}),
-      ...(query.yearTo !== undefined && query.year !== undefined
-        ? {
-            releaseDate: {
-              cutoff: `${query.year}-01-01`,
-              operation: ">=" as const,
-            },
-          }
-        : query.year !== undefined
-          ? { year: query.year }
-          : {}),
-      ...(date !== undefined ? { releaseDate: date } : {}),
+      ...(query.year !== undefined && query.yearTo === undefined
+        ? { year: query.year }
+        : {}),
+      ...(ride !== undefined ? { releaseDate: ride } : {}),
       ...(plan.resolvedStudio !== undefined
         ? { studio: plan.resolvedStudio }
         : {}),
@@ -1205,7 +1433,7 @@ function nativeQuery(
       : plan.excludeIds.length > 0
         ? { tagsExclude: plan.excludeIds }
         : {}),
-    ...(date !== undefined ? { releaseDate: date } : {}),
+    ...(ride !== undefined ? { releaseDate: ride } : {}),
     ...(sort !== undefined
       ? {
           // "recency" is the browse vocabulary for release recency;
@@ -1517,6 +1745,10 @@ export async function browseTitles(
     includeIds: string[];
     includeAny: boolean;
     freeTextNative: boolean;
+    /** The side's planned fan-out group (ResolvedIncludes.fanoutIds): when
+     * non-empty, this seedPlan opens one all-of stream per id instead of
+     * its single stream. */
+    fanoutIds: string[];
     excludeIds: string[];
     localFiltered: boolean;
     localInclude: IncludeTerm[];
@@ -1554,6 +1786,7 @@ export async function browseTitles(
           includeIds: [],
           includeAny: false,
           freeTextNative: false,
+          fanoutIds: [],
           excludeIds: [],
           localFiltered:
             hiddenTags.length > 0 ||
@@ -1589,6 +1822,7 @@ export async function browseTitles(
           includeAny:
             tpdbIncludes.allOf.length === 0 && tpdbIncludes.anyOf.length > 0,
           freeTextNative: tpdbIncludes.freeTextNative,
+          fanoutIds: tpdbIncludes.fanoutIds,
           excludeIds: [], // TPDB has no native exclude criterion
           localFiltered:
             hiddenTags.length > 0 ||
@@ -1598,9 +1832,12 @@ export async function browseTitles(
             query.dateTo !== undefined,
           localInclude: tpdbIncludes.localInclude,
           localFree: tpdbIncludes.localFree,
-          // year stays native upstream; only the upper bound is local here.
+          // Under a release-date order the range's far side rides native
+          // (resolveDateBound); both ends still check locally here.
           localYearRange:
-            query.yearTo !== undefined ? { to: query.yearTo } : undefined,
+            query.yearTo !== undefined
+              ? { from: query.year, to: query.yearTo }
+              : undefined,
           creditsAllOf: [],
           resolvedStudio: siteId,
         });
@@ -1616,6 +1853,7 @@ export async function browseTitles(
         includeAny:
           tpdbIncludes.allOf.length === 0 && tpdbIncludes.anyOf.length > 0,
         freeTextNative: tpdbIncludes.freeTextNative,
+        fanoutIds: tpdbIncludes.fanoutIds,
         excludeIds: [], // TPDB has no native exclude criterion
         localFiltered:
           hiddenTags.length > 0 ||
@@ -1625,8 +1863,12 @@ export async function browseTitles(
           query.dateTo !== undefined,
         localInclude: tpdbIncludes.localInclude,
         localFree: tpdbIncludes.localFree,
+        // Under a release-date order the range's far side rides native
+        // (resolveDateBound); both ends still check locally here.
         localYearRange:
-          query.yearTo !== undefined ? { to: query.yearTo } : undefined,
+          query.yearTo !== undefined
+            ? { from: query.year, to: query.yearTo }
+            : undefined,
         creditsAllOf: [],
       });
       continue;
@@ -1643,6 +1885,7 @@ export async function browseTitles(
       includeAny:
         stashIncludes.allOf.length === 0 && stashIncludes.anyOf.length > 0,
       freeTextNative: stashIncludes.freeTextNative,
+      fanoutIds: stashIncludes.fanoutIds,
       // One upstream tag criterion: native excludes only when no include is
       // native. Selections without a StashDB id stay local-only below.
       excludeIds: includesNative
@@ -1659,8 +1902,10 @@ export async function browseTitles(
         query.dateTo !== undefined,
       localInclude: stashIncludes.localInclude,
       localFree: stashIncludes.localFree,
-      // Both year bounds check locally on StashDB; `yearTo` defaults the
-      // upper end so `year` alone stays an exact-year filter, as before.
+      // Under a release-date order the range's far side rides native
+      // (resolveDateBound); the year window still checks locally here, and
+      // `yearTo` defaults the upper end so `year` alone stays an exact-year
+      // filter, as before.
       localYearRange:
         query.year !== undefined || query.yearTo !== undefined
           ? { from: query.year, to: query.yearTo ?? query.year }
@@ -1704,8 +1949,13 @@ export async function browseTitles(
 
   // Fast path: a single fully-native stream passes straight through with the
   // provider's own totals, continuation, and error semantics — one upstream
-  // request for any page depth.
-  const single = seedPlans.length === 1 ? seedPlans[0]! : undefined;
+  // request for any page depth. A fan-out plan is several streams with a
+  // shared dedupe set, so it never takes this path even when no term
+  // re-checks locally.
+  const single =
+    seedPlans.length === 1 && seedPlans[0]!.fanoutIds.length === 0
+      ? seedPlans[0]!
+      : undefined;
   if (
     single !== undefined &&
     !single.localFiltered &&
@@ -1728,7 +1978,33 @@ export async function browseTitles(
 
   const streams: Stream[] = [];
   const dedupeSets = new Map<string, Set<string>>();
-  for (const seedPlan of seedPlans) {
+  // One gate per browse: it serializes only this browse's fan-out streams,
+  // per provider, so a fan-out's worst-case upstream reads stay at today's
+  // one-in-flight-per-side level without touching any other browse or read.
+  const gateRead = createReadGate();
+  // One page pool per provider per browse (VELV-240): every stream of this
+  // request draws from it, so the product of entity seeds and fan-out ids
+  // cannot multiply the request's upstream reads past MAX_SCAN_PAGES.
+  const budgetRead = createScanBudget();
+  for (const [seedIndex, seedPlan] of seedPlans.entries()) {
+    const dateBound = resolveDateBound(
+      query,
+      nativeSort,
+      seedPlan.seed.provider,
+    );
+    // Tie-safe: strict comparisons mean equal dates never prove the bound,
+    // so a tie spanning pages keeps scanning instead of stopping early.
+    let dateStop: ((d: CatalogDetail) => boolean) | undefined;
+    if (dateBound.stop !== undefined) {
+      const stop = dateBound.stop;
+      dateStop = (d: CatalogDetail) => {
+        const released = d.releaseDate?.slice(0, 10);
+        if (released === undefined) return false;
+        return stop.side === "lower"
+          ? released < stop.bound
+          : released > stop.bound;
+      };
+    }
     const base = visiblePredicate(
       hiddenTags,
       query.exclude,
@@ -1736,20 +2012,29 @@ export async function browseTitles(
       seedPlan.localYearRange,
       seedPlan.creditsAllOf,
       query.dateTo,
+      query.dateTo !== undefined ? query.date : undefined,
     );
     let visible = base;
     let localFiltered = seedPlan.localFiltered;
-    if (seedPlan.seed.dedupeKey !== undefined) {
-      // Streams sharing a dedupeKey may surface the same title (overlapping
-      // filmographies, parent/child studios): the merge keeps only its
-      // first occurrence across the group. The set records only rows the
-      // base predicate passed, so an excluded row never poisons its twin's
-      // verdict; totals degrade to exhaustion-exact because the native
-      // lists overlap.
-      let set = dedupeSets.get(seedPlan.seed.dedupeKey);
+    if (
+      seedPlan.fanoutIds.length > 0 ||
+      seedPlan.seed.dedupeKey !== undefined
+    ) {
+      // Streams sharing one dedupe set may surface the same title (fan-out
+      // streams of one seedPlan, overlapping filmographies, parent/child
+      // studios): the merge keeps only its first occurrence across the
+      // group. The set records only rows the base predicate passed, so an
+      // excluded row never poisons its twin's verdict; totals degrade to
+      // exhaustion-exact because the native lists overlap. A seedPlan
+      // without its own dedupeKey gets a synthetic one, so all of its
+      // fan-out streams share exactly one set.
+      const dedupeKey =
+        seedPlan.seed.dedupeKey ??
+        `fanout:${seedPlan.seed.provider}:${seedIndex}`;
+      let set = dedupeSets.get(dedupeKey);
       if (set === undefined) {
         set = new Set();
-        dedupeSets.set(seedPlan.seed.dedupeKey, set);
+        dedupeSets.set(dedupeKey, set);
       }
       visible = (d) => {
         const dedupeId = `${d.reference.provider}:${d.reference.id}`;
@@ -1759,6 +2044,44 @@ export async function browseTitles(
         return true;
       };
       localFiltered = true;
+    }
+    if (seedPlan.fanoutIds.length > 0) {
+      // Fan-out: one native stream per id g of the planned free-text
+      // group, each carrying allOf ∪ {id} (includeAny stays false —
+      // includeIds is allOf there), replacing the single stream at this
+      // seedPlan's position; seed order and group id order stay intact.
+      // The streams share the dedupe set above, so a title carrying two
+      // ids of the group arrives in two streams and shows once.
+      const fanoutPlan = {
+        localInclude: seedPlan.localFree,
+        freeTextNative: seedPlan.freeTextNative,
+        // Soft ceiling: every scanned page of a fan-out stream carries
+        // allOf ∧ g, so the pages stay productive even when no term
+        // re-checks locally — a ceiling hit is a named partial answer,
+        // never the hard 422.
+        fanoutNative: true,
+      };
+      for (const fanoutId of seedPlan.fanoutIds) {
+        streams.push(
+          new Stream(
+            nativeQuery(
+              query,
+              { ...seedPlan, includeIds: [...seedPlan.includeIds, fanoutId] },
+              nativeSort,
+              1,
+              query.perPage,
+            ),
+            visible,
+            query.perPage,
+            localFiltered,
+            softCeilingFor(fanoutPlan),
+            dateStop,
+            gateRead,
+            budgetRead,
+          ),
+        );
+      }
+      continue;
     }
     streams.push(
       new Stream(
@@ -1770,6 +2093,9 @@ export async function browseTitles(
           localInclude: seedPlan.localFree,
           freeTextNative: seedPlan.freeTextNative,
         }),
+        dateStop,
+        undefined,
+        budgetRead,
       ),
     );
   }

@@ -36,16 +36,20 @@ export function ConnectionState({ state }: { state: ConnectionStateLabel }) {
   );
 }
 
+/** A service card's heading. `action` is the closed card's Edit button: it
+ * sits at the top right, and the open editor holds its own action row. */
 export function SettingsServiceHeading({
   id,
   title,
   description,
   status,
+  action,
 }: {
   id: string;
   title: string;
   description?: string;
   status?: ReactNode;
+  action?: ReactNode;
 }) {
   return (
     <div className="settings-service-summary">
@@ -62,6 +66,7 @@ export function SettingsServiceHeading({
         </div>
         {description && <p>{description}</p>}
       </div>
+      {action && <div className="settings-service-action">{action}</div>}
     </div>
   );
 }
@@ -74,9 +79,11 @@ export type SettingsOperations = {
   runOperation: RunSettingsOperation;
 };
 
-/** All settings writes and probes share a queue, including across hidden tabs.
- * A probe sees the saved settings; concurrent PATCH snapshots cannot undo one
- * another. A rejected operation releases the queue for the next request. */
+/** Settings writes and the probes that verify a save share a queue, including
+ * across hidden tabs. Concurrent PATCH snapshots cannot undo one another, and
+ * a rejected operation releases the queue for the next request. On-load and
+ * button-triggered probes run through runProbe instead: they only read, so
+ * they never hold other cards' controls disabled while they wait. */
 export function useSettingsOperations(): SettingsOperations {
   const [saving, setSaving] = useState(false);
   const [runQueued] = useState(createSettingsOperationQueue);
@@ -256,23 +263,48 @@ export function SettingsCheckButton({
   checking,
   disabled,
   helpId,
+  outcome,
   onCheck,
 }: {
   checking: boolean;
   disabled: boolean;
   helpId?: string;
+  /** The last check of the values on screen. The button carries it in its
+   * icon, word and tone (never color alone); an edit clears it. */
+  outcome?: "connected" | "failed" | null;
   onCheck: () => void;
 }) {
+  const shown = checking ? null : outcome;
   return (
     <button
       type="button"
-      className="btn"
+      className={
+        shown === "connected"
+          ? "btn check-connected"
+          : shown === "failed"
+            ? "btn check-failed"
+            : "btn"
+      }
       disabled={disabled}
       aria-describedby={helpId}
       onClick={onCheck}
     >
-      <Icon name="refresh" />
-      {checking ? "Checking…" : "Check connection"}
+      <Icon
+        name={
+          shown === "connected"
+            ? "check"
+            : shown === "failed"
+              ? "info"
+              : "refresh"
+        }
+      />
+      {checking
+        ? "Checking…"
+        : shown === "connected"
+          ? "Connected"
+          : shown === "failed"
+            ? "Check again"
+            : "Check connection"}
     </button>
   );
 }

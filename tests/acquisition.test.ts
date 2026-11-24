@@ -11,10 +11,10 @@ import {
   type ServerResponse,
 } from "node:http";
 import type { AddressInfo } from "node:net";
-import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { rmSync } from "node:fs";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import { testTempDir } from "./setup.ts";
 // No top-level side effects: hoisting this above the env setup is safe.
 import { register } from "../src/instrumentation.ts";
 import type {
@@ -30,7 +30,7 @@ process.env.VELVARR_SECRET_KEY = "33".repeat(32);
 // storage opens lazily but reads VELVARR_DATA_DIR at each open: pin even the
 // pre-freshDb window to a throwaway dir so no code path can fall back to the
 // repo's ./data default while tests run in parallel with other files.
-const bootDir = mkdtempSync(join(tmpdir(), "velvarr-acq-boot-"));
+const bootDir = testTempDir("velvarr-acq-boot-");
 process.env.VELVARR_DATA_DIR = bootDir;
 
 const storage = await import("../src/server/storage.ts");
@@ -192,7 +192,7 @@ function freshDb(): void {
       maxRetries: 10,
       retryDelay: 50,
     });
-  dir = mkdtempSync(join(tmpdir(), "velvarr-acquisition-"));
+  dir = testTempDir("velvarr-acquisition-");
   process.env.VELVARR_DATA_DIR = dir;
   knobs = {
     hasFile: false,
@@ -294,18 +294,6 @@ async function until(cond: () => boolean): Promise<void> {
   for (let i = 0; i < 500 && !cond(); i++) {
     const { promise, resolve } = Promise.withResolvers<void>();
     setImmediate(resolve);
-    await promise;
-  }
-}
-
-/** Waits for cond() with a wall-clock ceiling. Needed for real network I/O
- * (a loopback webhook POST): fake timers cannot drive undici sockets, and a
- * fixed spin budget flakes under load. Kept to the notifier tests. */
-async function eventually(cond: () => boolean): Promise<void> {
-  const deadline = Date.now() + 2_000;
-  while (!cond() && Date.now() < deadline) {
-    const { promise, resolve } = Promise.withResolvers<void>();
-    setTimeout(resolve, 5);
     await promise;
   }
 }
@@ -443,6 +431,98 @@ test("a rejected add is failed once and never blind-retried", async () => {
   // And after that the row is never listed again.
   const third = await acquisition.runDueWork(later());
   assert.equal(third.considered, 0);
+});
+
+test("approving again recovers a terminal failed row and resubmits it", async () => {
+  const owner = boot();
+
+  // One delivery-settings mistake: every add is rejected with a proven 400.
+  const first = storage.createRequest(owner.id, MOVIE_A);
+  storage.decideRequest(owner, first.id, "approved");
+  const id = workId(MOVIE_A);
+  knobs.addStatus = 400;
+  const pass1 = await acquisition.runDueWork();
+  assert.equal(pass1.failed, 1);
+  assert.equal(postCount(), 1);
+  // The next pass observes the rejected identity away: terminal, due NULL.
+  const pass2 = await acquisition.runDueWork(later());
+  assert.equal(pass2.absent, 1);
+  const wedged = probe(id);
+  assert.equal(wedged.state, "failed_permanent");
+  assert.equal(wedged.dueAt, null);
+
+  // A cancel does not recover the row: withdrawUndispatched only removes
+  // undispatched states, and this one never left the building only in the
+  // sense that Whisparr refused it.
+  storage.cancelRequest(owner, first.id);
+  assert.equal(probe(id).state, "failed_permanent");
+
+  // The settings are fixed; the operator approves the title again. That
+  // fresh approval is the recovery: the wedged row reschedules as unsent.
+  const second = storage.createRequest(owner.id, MOVIE_A);
+  storage.decideRequest(owner, second.id, "approved");
+  const recovered = probe(id);
+  assert.equal(recovered.state, "unsent");
+  assert.equal(recovered.lastError, null);
+  assert.ok(recovered.dueAt !== null, "a recovered row is due again");
+  const due = storage
+    .listDueAcquisitions(later(), 100)
+    .filter((a) => a.media.id === MOVIE_A.id);
+  assert.equal(due.length, 1, "re-approval reschedules the one shared row");
+
+  // And the next pass submits the add again.
+  knobs.addStatus = 201;
+  const pass3 = await acquisition.runDueWork();
+  assert.equal(pass3.delivered, 1);
+  assert.equal(postCount(), 2, "the recovered identity is POSTed once more");
+  assert.equal(probe(id).state, "monitoring");
+});
+
+test("re-approving a proven absence lets the last cancel withdraw the row", async () => {
+  const owner = boot();
+
+  // Delivered once: Whisparr accepted the add, so the row records a
+  // submission (submittedAt).
+  const first = storage.createRequest(owner.id, MOVIE_A);
+  storage.decideRequest(owner, first.id, "approved");
+  const id = workId(MOVIE_A);
+  const delivered = await acquisition.runDueWork();
+  assert.equal(delivered.delivered, 1);
+  assert.ok(
+    probe(id).submittedAt,
+    "an accepted submission records submittedAt",
+  );
+
+  // The item then disappears upstream: a proven absence is terminal.
+  storedItems.delete(EXT_A);
+  const absent = await acquisition.runDueWork(later());
+  assert.equal(absent.absent, 1);
+  assert.equal(probe(id).state, "failed_permanent");
+
+  // The cancel of a terminal row survives: it is not undispatched state.
+  storage.cancelRequest(owner, first.id);
+  assert.equal(probe(id).state, "failed_permanent");
+
+  // Re-approval is the recovery (VELV-210): the row reschedules as unsent.
+  // A proven absence means Whisparr no longer holds the item, so the
+  // reactivated row is undispatched work again. reactivateFailedPermanent
+  // must therefore clear the stale submittedAt (and attemptToken) with the
+  // rest of the dispatch residue — withdrawUndispatched requires
+  // submitted_at IS NULL, so a surviving timestamp makes the last cancel
+  // below a no-op and the row stays unsent forever, reporting "no eligible
+  // requester" on every worker pass.
+  const second = storage.createRequest(owner.id, MOVIE_A);
+  storage.decideRequest(owner, second.id, "approved");
+  const recovered = probe(id);
+  assert.equal(recovered.state, "unsent", "re-approval reschedules the row");
+  assert.equal(recovered.attemptToken, null);
+
+  storage.cancelRequest(owner, second.id);
+  assert.equal(
+    storage.getAcquisition(id),
+    null,
+    "the last cancel removes the reactivated row",
+  );
 });
 
 test("an identity the lookup cannot resolve fails with a reason instead of looping as uncertain", async () => {
@@ -618,40 +698,34 @@ test("an adopted item that already has a file is imported at once", async () => 
 test("an adopted-with-file item notifies available exactly once", async () => {
   const owner = boot();
   const webhookBodies: string[] = [];
-  const webhook = createServer((req, res) => {
-    let raw = "";
-    req.setEncoding("utf8");
-    req.on("data", (chunk: string) => {
-      raw += chunk;
-    });
-    req.on("end", () => {
-      webhookBodies.push(raw);
-      res.writeHead(200);
-      res.end();
-    });
-  });
-  const listening = Promise.withResolvers<void>();
-  webhook.listen(0, "127.0.0.1", listening.resolve);
-  await listening.promise;
-  process.env.VELVARR_DISCORD_WEBHOOK_URL = `http://127.0.0.1:${
-    (webhook.address() as AddressInfo).port
-  }/api/webhooks/1/fixture-token`;
+  const originalFetch = globalThis.fetch;
+  const originalWebhook = process.env.VELVARR_DISCORD_WEBHOOK_URL;
+  const webhookUrl =
+    "https://discord.com/api/webhooks/1/synthetic-acquisition-token";
+  process.env.VELVARR_DISCORD_WEBHOOK_URL = webhookUrl;
+  globalThis.fetch = async (input, init) => {
+    if (String(input) !== webhookUrl) return originalFetch(input, init);
+    assert.equal(init?.method, "POST");
+    assert.equal(init.redirect, "error");
+    webhookBodies.push(String(init.body));
+    return new Response(null, { status: 204 });
+  };
   try {
     storedItems.set(EXT_A, 1);
     knobs.hasFile = true;
     approve(owner.id, MOVIE_A);
     await acquisition.runDueWork();
-    await eventually(() => webhookBodies.length >= 1);
+    // The intercept records each POST before the asynchronous fetch resolves.
     assert.equal(webhookBodies.length, 1);
     assert.ok(webhookBodies[0]!.includes("available"));
 
     await acquisition.runDueWork(later());
-    await eventually(() => false); // drain any wrongful straggler
     assert.equal(webhookBodies.length, 1, "no second available notification");
   } finally {
-    delete process.env.VELVARR_DISCORD_WEBHOOK_URL;
-    webhook.closeAllConnections();
-    webhook.close();
+    globalThis.fetch = originalFetch;
+    if (originalWebhook === undefined)
+      delete process.env.VELVARR_DISCORD_WEBHOOK_URL;
+    else process.env.VELVARR_DISCORD_WEBHOOK_URL = originalWebhook;
   }
 });
 
@@ -1099,6 +1173,73 @@ test("cancellation suppresses only undispatched work; sent and in-flight work su
   assert.equal(probe(freshId).state, "monitoring");
 });
 
+test("declining the last pending request withdraws the undispatched row", async () => {
+  const owner = boot();
+
+  // A's request is approved: the shared acquisition row exists, undispatched.
+  const requestA = storage.createRequest(owner.id, MOVIE_A);
+  storage.decideRequest(owner, requestA.id, "approved");
+  const idA = workId(MOVIE_A);
+
+  // B's pending request keeps the row when A withdraws: B's intent is active.
+  const requestB = storage.createRequest(FRIEND_ID, MOVIE_A);
+  storage.cancelRequest(owner, requestA.id);
+  assert.equal(
+    storage.getAcquisitionByReference(MOVIE_A)?.state,
+    "unsent",
+    "B's pending intent keeps the undispatched row",
+  );
+
+  // Declining B leaves no active intent: the row must go, or every pass
+  // retries it with "no eligible requester remains".
+  storage.decideRequest(owner, requestB.id, "declined");
+  assert.equal(
+    storage.getAcquisitionByReference(MOVIE_A),
+    null,
+    "declining the last pending intent withdraws the undispatched row",
+  );
+  assert.equal(
+    storage.listDueAcquisitions(later(), 100).some((a) => a.id === idA),
+    false,
+    "the withdrawn row is never scheduled again",
+  );
+});
+
+test("a cancel landing between listing and gating skips the row instead of erroring", async (t) => {
+  const owner = boot();
+  approve(owner.id, MOVIE_A);
+  const requestB = storage.createRequest(owner.id, MOVIE_B);
+  storage.decideRequest(owner, requestB.id, "approved");
+  const idA = workId(MOVIE_A);
+  const idB = workId(MOVIE_B);
+
+  // Deterministic dispatch order: A is strictly the oldest due work, so its
+  // add POST is always first (see the contention test).
+  probeDb ??= new DatabaseSync(join(dir, "velvarr.sqlite"));
+  probeDb
+    .prepare("UPDATE acquisitions SET due_at = due_at - 1000 WHERE id = ?")
+    .run(idA);
+
+  // The cancel lands while A's add is in flight: B's request is withdrawn
+  // and its unsent row is deleted before the pass reaches B.
+  const logged: string[] = [];
+  const logError = t.mock.method(console, "error", (...args: unknown[]) => {
+    logged.push(args.map(String).join(" "));
+  });
+  onAdd = () => {
+    storage.cancelRequest(owner, requestB.id);
+  };
+
+  const summary = await acquisition.runDueWork();
+  assert.deepEqual(logged, [], "the pass logs nothing for a withdrawn row");
+  assert.equal(summary.errors, 0, "a withdrawn row is a skip, not an error");
+  assert.equal(summary.blocked, 0, "a withdrawn row is not counted blocked");
+  assert.equal(summary.delivered, 1);
+  assert.equal(storage.getAcquisition(idB), null, "the row stays withdrawn");
+  assert.equal(probe(idA).state, "monitoring");
+  logError.mock.restore();
+});
+
 test("changed facts persist; a proven absence is authoritative while an outage is not", async () => {
   const owner = boot();
   approve(owner.id, MOVIE_A);
@@ -1294,30 +1435,23 @@ test("the installed SIGTERM handler shuts the loop down and exits 0", async (t) 
 test("notifier fires exactly once per real transition and carries no credential", async () => {
   const owner = boot();
   const webhookBodies: string[] = [];
-  const webhook = createServer((req, res) => {
-    let raw = "";
-    req.setEncoding("utf8");
-    req.on("data", (chunk: string) => {
-      raw += chunk;
-    });
-    req.on("end", () => {
-      webhookBodies.push(raw);
-      res.writeHead(200);
-      res.end();
-    });
-  });
-  const listening = Promise.withResolvers<void>();
-  webhook.listen(0, "127.0.0.1", listening.resolve);
-  await listening.promise;
-  process.env.VELVARR_DISCORD_WEBHOOK_URL = `http://127.0.0.1:${
-    (webhook.address() as AddressInfo).port
-  }/api/webhooks/1/fixture-token`;
+  const originalFetch = globalThis.fetch;
+  const originalWebhook = process.env.VELVARR_DISCORD_WEBHOOK_URL;
+  const webhookUrl =
+    "https://discord.com/api/webhooks/1/synthetic-acquisition-token";
+  process.env.VELVARR_DISCORD_WEBHOOK_URL = webhookUrl;
+  globalThis.fetch = async (input, init) => {
+    if (String(input) !== webhookUrl) return originalFetch(input, init);
+    assert.equal(init?.method, "POST");
+    assert.equal(init.redirect, "error");
+    webhookBodies.push(String(init.body));
+    return new Response(null, { status: 204 });
+  };
   try {
     approve(owner.id, MOVIE_A);
     const delivered = await acquisition.runDueWork();
     assert.equal(delivered.delivered, 1);
-    // Notification is fire-and-forget: let the POST land before counting.
-    await eventually(() => webhookBodies.length >= 1);
+    // The intercept records each POST before the asynchronous fetch resolves.
     assert.equal(webhookBodies.length, 1, "one notification for the add");
 
     const steady = await acquisition.runDueWork(later());
@@ -1328,10 +1462,6 @@ test("notifier fires exactly once per real transition and carries no credential"
 
     knobs.hasFile = true;
     await acquisition.runDueWork(later());
-    await eventually(() => webhookBodies.length >= 2);
-    // Drain any slow stragglers: a wrongful notification fired during the
-    // steady/downloading passes would have landed by now.
-    await eventually(() => false);
     assert.equal(
       webhookBodies.length,
       2,
@@ -1346,26 +1476,31 @@ test("notifier fires exactly once per real transition and carries no credential"
       "webhook body carries no session token",
     );
   } finally {
-    delete process.env.VELVARR_DISCORD_WEBHOOK_URL;
-    webhook.closeAllConnections();
-    webhook.close();
+    globalThis.fetch = originalFetch;
+    if (originalWebhook === undefined)
+      delete process.env.VELVARR_DISCORD_WEBHOOK_URL;
+    else process.env.VELVARR_DISCORD_WEBHOOK_URL = originalWebhook;
   }
 });
 
 test("a hanging or rejecting notifier neither fails nor delays the pass", async () => {
   const owner = boot();
   let mode: "hang" | "reject" = "hang";
-  const webhook = createServer((_req, res) => {
-    if (mode === "hang") return; // never respond
-    res.writeHead(500);
-    res.end("{}");
-  });
-  const listening = Promise.withResolvers<void>();
-  webhook.listen(0, "127.0.0.1", listening.resolve);
-  await listening.promise;
-  process.env.VELVARR_DISCORD_WEBHOOK_URL = `http://127.0.0.1:${
-    (webhook.address() as AddressInfo).port
-  }/api/webhooks/1/fixture-token`;
+  const originalFetch = globalThis.fetch;
+  const originalWebhook = process.env.VELVARR_DISCORD_WEBHOOK_URL;
+  const webhookUrl =
+    "https://discord.com/api/webhooks/1/synthetic-acquisition-token";
+  const attempts: ("hang" | "reject")[] = [];
+  const hanging = Promise.withResolvers<Response>();
+  process.env.VELVARR_DISCORD_WEBHOOK_URL = webhookUrl;
+  globalThis.fetch = async (input, init) => {
+    if (String(input) !== webhookUrl) return originalFetch(input, init);
+    assert.equal(init?.method, "POST");
+    assert.equal(init.redirect, "error");
+    attempts.push(mode);
+    if (mode === "hang") return hanging.promise;
+    return new Response("{}", { status: 500 });
+  };
   try {
     approve(owner.id, MOVIE_A);
     const start = Date.now();
@@ -1376,6 +1511,11 @@ test("a hanging or rejecting notifier neither fails nor delays the pass", async 
       elapsed < 2_000,
       `hung notifier must not delay the pass (${elapsed}ms)`,
     );
+    assert.deepEqual(
+      attempts,
+      ["hang"],
+      "the hung webhook receives a real attempt",
+    );
 
     mode = "reject";
     approve(owner.id, MOVIE_B);
@@ -1385,9 +1525,16 @@ test("a hanging or rejecting notifier neither fails nor delays the pass", async 
       1,
       "rejecting notifier never fails the work",
     );
+    assert.deepEqual(
+      attempts,
+      ["hang", "reject"],
+      "both webhook paths receive an attempt",
+    );
   } finally {
-    delete process.env.VELVARR_DISCORD_WEBHOOK_URL;
-    webhook.closeAllConnections();
-    webhook.close();
+    hanging.resolve(new Response(null, { status: 204 }));
+    globalThis.fetch = originalFetch;
+    if (originalWebhook === undefined)
+      delete process.env.VELVARR_DISCORD_WEBHOOK_URL;
+    else process.env.VELVARR_DISCORD_WEBHOOK_URL = originalWebhook;
   }
 });

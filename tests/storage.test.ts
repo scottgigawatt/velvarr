@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test, { after } from "node:test";
+import fc from "fast-check";
 import {
   createCipheriv,
   createHash,
@@ -11,19 +12,18 @@ import {
   chmodSync,
   copyFileSync,
   existsSync,
-  mkdtempSync,
   readdirSync,
   readFileSync,
   rmSync,
   statSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { rmTempDir } from "./setup.ts";
+import { rmTempDir, testTempDir } from "./setup.ts";
 import { AppError } from "../src/server/http.ts";
 import type {
   Account,
+  AcquisitionRecord,
   CatalogDetail,
   CatalogReference,
   CatalogTagSelection,
@@ -51,7 +51,7 @@ let currentDir = "";
 function freshDir(): string {
   storage.closeStorage();
   rmTempDir(currentDir);
-  currentDir = mkdtempSync(join(tmpdir(), "velvarr-storage-"));
+  currentDir = testTempDir("velvarr-storage-");
   process.env.VELVARR_DATA_DIR = currentDir;
   return currentDir;
 }
@@ -320,6 +320,42 @@ test("revocation is immediate: explicit revoke, expiry path, and grant change ki
   );
 });
 
+test("expired sessions are swept: on issue and at boot, not only on presentation", () => {
+  const dir = freshDir();
+  storage.bootstrap(testConfig(), ownerUser(), "jf-owner-token");
+  const grant = storage.createSession(ownerUser().id, "jf-token-live");
+  const raw = new DatabaseSync(join(dir, "velvarr.sqlite"));
+  raw
+    .prepare("UPDATE sessions SET expires_at = ? WHERE token_hash = ?")
+    .run(Date.now() - 1000, tokenHash(grant.token));
+  raw.close();
+
+  // Issuing another session sweeps the expired row.
+  storage.createSession(ownerUser().id, "jf-token-next");
+  const afterIssue = new DatabaseSync(join(dir, "velvarr.sqlite"));
+  const leftAfterIssue = afterIssue
+    .prepare("SELECT count(*) AS n FROM sessions WHERE token_hash = ?")
+    .get(tokenHash(grant.token)) as { n: number };
+  afterIssue.close();
+  assert.equal(leftAfterIssue.n, 0, "issueSession must sweep expired rows");
+
+  // A second expired row survives until boot: initializeStorage sweeps it.
+  const second = storage.createSession(ownerUser().id, "jf-token-second");
+  const raw2 = new DatabaseSync(join(dir, "velvarr.sqlite"));
+  raw2
+    .prepare("UPDATE sessions SET expires_at = ? WHERE token_hash = ?")
+    .run(Date.now() - 1000, tokenHash(second.token));
+  raw2.close();
+  storage.closeStorage();
+  storage.initializeStorage();
+  const afterBoot = new DatabaseSync(join(dir, "velvarr.sqlite"));
+  const leftAfterBoot = afterBoot
+    .prepare("SELECT count(*) AS n FROM sessions WHERE token_hash = ?")
+    .get(tokenHash(second.token)) as { n: number };
+  afterBoot.close();
+  assert.equal(leftAfterBoot.n, 0, "boot must sweep expired rows");
+});
+
 test("library grants stay conservative: escalation rejected, valid subset accepted, owner protected", () => {
   freshDir();
   const grant = storage.bootstrap(testConfig(), ownerUser(), "jf-owner-token");
@@ -410,6 +446,142 @@ test("malformed whisparr block is rejected and never persisted; valid one round-
   const saved = storage.getConfig()?.whisparr;
   assert.equal(saved?.url, "http://127.0.0.1:7000");
   assert.equal(saved?.apiKey, "new-key");
+});
+
+test("Discord settings extend an old config and survive restart encrypted", () => {
+  const dir = freshDir();
+  storage.bootstrap(
+    { ...testConfig(), providers: { tpdbApiToken: "synthetic-tpdb-token" } },
+    ownerUser(),
+    "jf-owner-token",
+  );
+  storage.closeStorage();
+  const original = storage.getConfig();
+  assert.ok(original);
+  assert.equal(original.discord, undefined);
+
+  const token = "synthetic-storage-webhook-token";
+  const discord = {
+    webhookUrl: `https://discord.com/api/webhooks/123456789012345678/${token}`,
+    includeTitles: false,
+  };
+  storage.saveConfig({ ...original, discord });
+  assert.deepEqual(storage.getConfig(), { ...original, discord });
+
+  // Inspect the live WAL before closeStorage checkpoints it.
+  for (const name of ["velvarr.sqlite", "velvarr.sqlite-wal"]) {
+    const bytes = readFileSync(join(dir, name));
+    assert.ok(
+      !bytes.includes(discord.webhookUrl),
+      `${name} exposes the webhook`,
+    );
+    assert.ok(!bytes.includes(token), `${name} exposes the webhook token`);
+  }
+  storage.closeStorage();
+  assert.deepEqual(storage.getConfig(), { ...original, discord });
+  const raw = dbFiles(dir);
+  assert.ok(!raw.includes(discord.webhookUrl));
+  assert.ok(!raw.includes(token));
+});
+
+test("invalid Discord settings fail without changes to stored config", () => {
+  freshDir();
+  storage.bootstrap(testConfig(), ownerUser(), "jf-owner-token");
+  const original = storage.getConfig();
+  assert.ok(original);
+  const webhookUrl =
+    "https://discord.com/api/webhooks/123456789012345678/synthetic-validation-token";
+  storage.saveConfig({
+    ...original,
+    discord: { webhookUrl, includeTitles: true },
+  });
+  const saved = storage.getConfig();
+  const invalid: unknown[] = [
+    null,
+    [],
+    "",
+    1,
+    false,
+    { webhookUrl: "" },
+    { webhookUrl: null },
+    { webhookUrl: 123 },
+    { webhookUrl: false },
+    { webhookUrl: [] },
+    { webhookUrl: "not a URL" },
+    { webhookUrl: webhookUrl.replace("https:", "http:") },
+    { webhookUrl: webhookUrl.replace("discord.com", "example.org") },
+    {
+      webhookUrl: webhookUrl.replace("discord.com", "discord.com.example.org"),
+    },
+    { webhookUrl: webhookUrl.replace("discord.com", "discord.com:8443") },
+    { webhookUrl: webhookUrl.replace("discord.com", "user@discord.com") },
+    { webhookUrl: `${webhookUrl}?wait=true` },
+    { webhookUrl: `${webhookUrl}#fragment` },
+    { webhookUrl: `${webhookUrl}/extra` },
+    { webhookUrl: webhookUrl.replace("123456789012345678", "not-numeric") },
+    { webhookUrl: `${webhookUrl}${"x".repeat(2048)}` },
+    { includeTitles: null },
+    { includeTitles: "false" },
+    { includeTitles: 0 },
+    { includeTitles: [] },
+    { includeTitles: {} },
+  ];
+  for (const discord of invalid) {
+    assert.throws(
+      () => storage.saveConfig({ ...original, discord } as IntegrationConfig),
+      (e: AppError) => e.status === 400 && e.code === "invalid_config",
+    );
+    assert.deepEqual(storage.getConfig(), saved);
+  }
+  storage.closeStorage();
+  assert.deepEqual(storage.getConfig(), saved);
+});
+
+test("Discord fields save independently and preserve unrelated configuration", () => {
+  freshDir();
+  storage.bootstrap(testConfig(), ownerUser(), "jf-owner-token");
+  const original = storage.getConfig();
+  assert.ok(original);
+  const webhookUrl =
+    "https://discordapp.com/api/webhooks/123456789012345678/synthetic-optional-token/";
+  for (const discord of [
+    {},
+    { includeTitles: false },
+    { includeTitles: true },
+    { webhookUrl },
+  ]) {
+    storage.saveConfig({ ...original, discord });
+    assert.deepEqual(storage.getConfig(), { ...original, discord });
+  }
+  storage.saveConfig(original);
+  assert.deepEqual(storage.getConfig(), original);
+});
+
+test("Discord title overrides accept booleans only", () => {
+  freshDir();
+  storage.bootstrap(testConfig(), ownerUser(), "jf-owner-token");
+  const original = storage.getConfig();
+  assert.ok(original);
+  fc.assert(
+    fc.property(fc.jsonValue(), (includeTitles) => {
+      const config = {
+        ...original,
+        discord: { includeTitles },
+      } as IntegrationConfig;
+      if (typeof includeTitles === "boolean") {
+        storage.saveConfig(config);
+        assert.deepEqual(storage.getConfig(), config);
+      } else {
+        const saved = storage.getConfig();
+        assert.throws(
+          () => storage.saveConfig(config),
+          (e: AppError) => e.status === 400 && e.code === "invalid_config",
+        );
+        assert.deepEqual(storage.getConfig(), saved);
+      }
+    }),
+    { seed: 248, numRuns: 100, examples: [[false], [true], [null]] },
+  );
 });
 
 test("natural-language search settings are validated; a valid set round-trips", () => {
@@ -823,6 +995,43 @@ test("session cookie flags follow request transport and clear correctly", () => 
   assert.ok(clear.includes("Max-Age=0") && clear.includes("Secure"));
 });
 
+test("session cookie values preserve all nonempty matches and exclude other names", () => {
+  fc.assert(
+    fc.property(
+      fc.array(
+        fc.record({
+          name: fc.constantFrom(
+            "velvarr_session",
+            "other",
+            "velvarr_session_extra",
+          ),
+          value: fc.stringMatching(/^[A-Za-z0-9_=-]{0,32}$/),
+        }),
+        { maxLength: 20 },
+      ),
+      (cookies) => {
+        const request = new Request("http://127.0.0.1/api/logout", {
+          headers: {
+            cookie: cookies
+              .map(({ name, value }) => ` ${name} = ${value} `)
+              .join(";"),
+          },
+        });
+        const expected = cookies
+          .filter(
+            ({ name, value }) => name === "velvarr_session" && value !== "",
+          )
+          .map(({ value }) => value)
+          .toSorted();
+        assert.deepEqual(
+          security.readSessionTokens(request).toSorted(),
+          expected,
+        );
+      },
+    ),
+  );
+});
+
 test("origin pin is optional: unset VELVARR_ORIGIN skips the configured pin", () => {
   // content-type is pinned because guardMutation now also refuses non-JSON
   // bodies on mutations (the form-CSRF gate); this test is about the pin.
@@ -895,6 +1104,35 @@ test("origin pin is optional: unset VELVARR_ORIGIN skips the configured pin", ()
       () => security.guardMutation(req({ "sec-fetch-site": "same-origin" })),
       (e: { code: string }) => e.code === "origin_mismatch",
     );
+  } finally {
+    if (previous !== undefined) process.env.VELVARR_ORIGIN = previous;
+    else delete process.env.VELVARR_ORIGIN;
+  }
+});
+
+test("unpinned origin_mismatch names the proxy host fix", () => {
+  // The documented VELVARR_ORIGIN answer is refused for a dotted plain-HTTP
+  // name (unsafe_origin), so the 403 must also name the real fix: the proxy
+  // forwarding the original host.
+  const previous = process.env.VELVARR_ORIGIN;
+  delete process.env.VELVARR_ORIGIN;
+  try {
+    // Plain-HTTP LAN: no Sec-Fetch-Site, no content type, no body.
+    const req = new Request("http://192.168.1.5:6699/api/login", {
+      method: "POST",
+      headers: { origin: "http://velvarr.lan" },
+    });
+    let message = "";
+    assert.throws(
+      () => security.guardMutation(req),
+      (e: { code: string; message: string }) => {
+        message = e.message;
+        return e.code === "origin_mismatch";
+      },
+    );
+    assert.match(message, /forward the original host/);
+    assert.match(message, /X-Forwarded-Host/);
+    assert.match(message, /\(got velvarr\.lan\)/);
   } finally {
     if (previous !== undefined) process.env.VELVARR_ORIGIN = previous;
     else delete process.env.VELVARR_ORIGIN;
@@ -1176,8 +1414,8 @@ test("v1 database migrates in place preserving config, accounts, sessions, and g
     raw.prepare("PRAGMA user_version").get() as { user_version: number }
   ).user_version;
   raw.close();
-  // Schema 15 adds the natural-language search grant.
-  assert.equal(version, 15, "v1 database must migrate to the current schema");
+  // Schema 16 folds stored provider ids to lowercase.
+  assert.equal(version, 16, "v1 database must migrate to the current schema");
   assert.equal(owner.proseSearch, false, "migrated accounts start ungranted");
   // A v1 database never contained the removal tables (current migration 5
   // creates none), so nothing here can assert about them; the schema-10 test
@@ -1402,7 +1640,7 @@ test("a schema-10 database migrates to 11: every removal object is dropped, rows
   );
   assert.equal(
     versionRow.user_version,
-    15,
+    16,
     "schema 10 database must migrate to the current schema",
   );
   assert.ok(
@@ -1560,6 +1798,694 @@ test("two admitted users share one acquisition per identity; active intent is un
   );
 });
 
+test("mixed-case provider ids fold at the storage boundary: one active intent, one acquisition", () => {
+  freshDir();
+  storage.bootstrap(deliveryConfig(true), ownerUser(), "jf-owner-token");
+  const owner = storage.getAccount(ownerUser().id) as Account;
+
+  const upper: MediaReference = {
+    provider: "stashdb",
+    kind: "scene",
+    id: SCENE.id.toUpperCase(),
+  };
+  const first = storage.createRequest(owner.id, upper);
+  // The case-variant spelling is the same intent: refused, not duplicated.
+  assert.throws(
+    () => storage.createRequest(owner.id, SCENE),
+    (e: { code: string }) => e.code === "request_exists",
+  );
+  assert.throws(
+    () => storage.createRequest(owner.id, upper),
+    (e: { code: string }) => e.code === "request_exists",
+  );
+  assert.equal(
+    first.media.id,
+    SCENE.id,
+    "the stored request folds the id to lowercase",
+  );
+  assert.equal(
+    storage.getActiveRequest(owner.id, upper)?.id,
+    first.id,
+    "a mixed-case lookup still resolves the stored intent",
+  );
+
+  storage.decideRequest(owner, first.id, "approved");
+  const due = storage.listDueAcquisitions(Date.now() + 60_000);
+  const shared = due.filter((a) => a.media.id === SCENE.id);
+  assert.equal(shared.length, 1, "one acquisition row for the title");
+  const byUpper = storage.getAcquisitionByReference(upper);
+  assert.ok(byUpper, "a mixed-case acquisition lookup still resolves the row");
+  assert.equal(byUpper.media.id, SCENE.id);
+});
+
+test("migration 16 folds lone ids and keeps case-duplicate rows untouched for manual repair", () => {
+  const dir = freshDir();
+  storage.bootstrap(deliveryConfig(true), ownerUser(), "jf-owner-token");
+  const owner = storage.getAccount(ownerUser().id) as Account;
+
+  // Real rows through the write path: one lowercase request, approved, with
+  // its acquisition. The injected rows below recreate the bug's shape from
+  // before the write path normalized ids: an OLDER pending duplicate in
+  // uppercase, an OLDER uppercase acquisition for the same identity, an
+  // uppercase cancelled history row no active row collides with, and a
+  // lone uppercase pair for a different identity.
+  const kept = storage.createRequest(owner.id, SCENE);
+  storage.decideRequest(owner, kept.id, "approved");
+  const now = Date.now();
+
+  // Migration 16 only rewrites data, so a bootstrapped database rewound to
+  // 15 already holds the exact schema a version-15 install has.
+  const instanceId = storage.getConfig()?.whisparr?.instanceId;
+  assert.ok(instanceId, "bootstrap stores the whisparr instance identity");
+  const raw = new DatabaseSync(join(dir, "velvarr.sqlite"));
+  raw.exec("PRAGMA user_version = 15");
+  raw
+    .prepare(
+      "INSERT INTO requests (id, account_id, provider, kind, external_id, decision, created_at, decided_at) VALUES (?, ?, 'stashdb', 'scene', ?, 'pending', ?, NULL)",
+    )
+    .run(randomUUID(), owner.id, SCENE.id.toUpperCase(), now - 60_000);
+  // The unique index only spans pending and approved rows, so a cancelled
+  // history row in the same spelling is no collision: migration 16 folds it.
+  raw
+    .prepare(
+      "INSERT INTO requests (id, account_id, provider, kind, external_id, decision, created_at, decided_at) VALUES (?, ?, 'stashdb', 'scene', ?, 'cancelled', ?, ?)",
+    )
+    .run(
+      randomUUID(),
+      owner.id,
+      SCENE.id.toUpperCase(),
+      now - 120_000,
+      now - 90_000,
+    );
+  // due_at set: the legacy row must stay schedulable, not stranded.
+  raw
+    .prepare(
+      "INSERT INTO acquisitions (id, instance_id, provider, kind, external_id, state, due_at, created_at, updated_at) VALUES (?, ?, 'stashdb', 'scene', ?, 'unsent', ?, ?, ?)",
+    )
+    .run(
+      randomUUID(),
+      instanceId,
+      SCENE.id.toUpperCase(),
+      now - 1000,
+      now - 60_000,
+      now - 60_000,
+    );
+  const loneId = "ffffffff-ffff-ffff-ffff-ffffffffffff";
+  raw
+    .prepare(
+      "INSERT INTO requests (id, account_id, provider, kind, external_id, decision, created_at, decided_at) VALUES (?, ?, 'stashdb', 'scene', ?, 'pending', ?, NULL)",
+    )
+    .run(randomUUID(), owner.id, loneId.toUpperCase(), now - 30_000);
+  raw
+    .prepare(
+      "INSERT INTO acquisitions (id, instance_id, provider, kind, external_id, state, created_at, updated_at) VALUES (?, ?, 'stashdb', 'scene', ?, 'unsent', ?, ?)",
+    )
+    .run(
+      randomUUID(),
+      instanceId,
+      loneId.toUpperCase(),
+      now - 30_000,
+      now - 30_000,
+    );
+  raw.close();
+  storage.closeStorage();
+
+  // Reopening runs migration 16 in place: the lone identity folds to
+  // lowercase, and the colliding identity keeps every row exactly as it
+  // is — nothing is cancelled or deleted; the operator repairs it by
+  // hand.
+  assert.equal(storage.isInitialized(), true);
+  const active = storage.getActiveRequest(owner.id, SCENE);
+  assert.ok(active, "the stored lowercase intent still resolves");
+  assert.equal(active.id, kept.id);
+  assert.equal(active.decision, "approved");
+
+  const check = new DatabaseSync(join(dir, "velvarr.sqlite"));
+  const identityRequests = check
+    .prepare("SELECT COUNT(*) AS n FROM requests WHERE lower(external_id) = ?")
+    .get(SCENE.id) as { n: number };
+  assert.equal(
+    identityRequests.n,
+    3,
+    "kept, duplicate and history request rows all survive",
+  );
+  const duplicate = check
+    .prepare("SELECT decision, decided_at FROM requests WHERE external_id = ?")
+    .get(SCENE.id.toUpperCase()) as {
+    decision: string;
+    decided_at: number | null;
+  };
+  assert.ok(duplicate, "the case-duplicate request row is not deleted");
+  assert.equal(
+    duplicate.decision,
+    "pending",
+    "the duplicate keeps its decision",
+  );
+  assert.equal(duplicate.decided_at, null, "the duplicate keeps its history");
+  const keptHistory = check
+    .prepare(
+      "SELECT COUNT(*) AS n FROM requests WHERE external_id = ? AND decision = 'cancelled'",
+    )
+    .get(SCENE.id.toUpperCase()) as { n: number };
+  assert.equal(
+    keptHistory.n,
+    1,
+    "the pin moved with the identity-level fold: a case collision keeps every row's spelling, even an inert history row's",
+  );
+  const identityAcquisitions = check
+    .prepare(
+      "SELECT COUNT(*) AS n FROM acquisitions WHERE lower(external_id) = ?",
+    )
+    .get(SCENE.id) as { n: number };
+  assert.equal(identityAcquisitions.n, 2, "both acquisition rows survive");
+  const mixed = check
+    .prepare(
+      "SELECT (SELECT COUNT(*) FROM requests WHERE external_id != lower(external_id)) + (SELECT COUNT(*) FROM acquisitions WHERE external_id != lower(external_id)) AS n",
+    )
+    .get() as { n: number };
+  const lone = check
+    .prepare(
+      "SELECT (SELECT COUNT(*) FROM requests WHERE external_id = ?) + (SELECT COUNT(*) FROM acquisitions WHERE external_id = ?) AS n",
+    )
+    .get(loneId, loneId) as { n: number };
+  check.close();
+  assert.equal(
+    mixed.n,
+    3,
+    "the colliding identity keeps every row's spelling: both duplicate rows and the history row",
+  );
+  assert.equal(lone.n, 2, "lone rows fold to lowercase");
+  const due = storage.listDueAcquisitions(Date.now() + 60_000);
+  assert.equal(
+    due.filter((a) => a.media.id.toLowerCase() === SCENE.id).length,
+    2,
+    "both kept acquisition rows stay readable and due",
+  );
+});
+
+test("active intent keys fold ids, so a mixed-case provider row matches the stored spelling", () => {
+  freshDir();
+  storage.bootstrap(deliveryConfig(true), ownerUser(), "jf-owner-token");
+  const owner = storage.getAccount(ownerUser().id) as Account;
+  storage.createRequest(owner.id, SCENE);
+  const keys = storage.listActiveIntentKeys(owner.id);
+  assert.ok(keys.has(storage.intentKey("stashdb", "scene", SCENE.id)));
+  assert.ok(
+    keys.has(storage.intentKey("stashdb", "scene", SCENE.id.toUpperCase())),
+    "a mixed-case provider row matches the stored lowercase intent",
+  );
+  assert.equal(keys.size, 1, "both spellings fold to the one stored intent");
+});
+
+test("migration 16 keeps every row: the contacted acquisition and both shadows survive", () => {
+  const dir = freshDir();
+  storage.bootstrap(deliveryConfig(true), ownerUser(), "jf-owner-token");
+  const owner = storage.getAccount(ownerUser().id) as Account;
+
+  // The realistic duplicate order: the single route files lowercase and an
+  // admin approves (the acquisition reaches Whisparr and is observed), then
+  // a bulk run files an uppercase pending duplicate. Migration 16 used to
+  // rank the rows, cancel the losing intent and delete the losing
+  // acquisition; the operator chose the non-destructive fold (VELV-233):
+  // every row keeps its state and the identity waits for a manual repair.
+  const approved = storage.createRequest(owner.id, SCENE);
+  storage.decideRequest(owner, approved.id, "approved");
+  const due = storage.listDueAcquisitions(Date.now() + 60_000);
+  assert.equal(due.length, 1);
+  const work = due[0];
+  assert.ok(work);
+  const claim = storage.claimAcquisition(work.id);
+  storage.beginSubmission(work.id, claim.claimToken);
+  storage.recordAcquisitionObservation(
+    work.id,
+    {
+      state: "monitoring",
+      item: { whisparrId: 42, path: "/data/xxx", title: "Pirates II" },
+    },
+    claim.claimToken,
+  );
+  storage.releaseAcquisitionClaim(work.id, claim.claimToken);
+
+  const now = Date.now();
+  const instanceId = storage.getConfig()?.whisparr?.instanceId;
+  assert.ok(instanceId, "bootstrap stores the whisparr instance identity");
+  const raw = new DatabaseSync(join(dir, "velvarr.sqlite"));
+  raw.exec("PRAGMA user_version = 15");
+  // A NEWER uppercase pending duplicate...
+  const dupRequestId = randomUUID();
+  raw
+    .prepare(
+      "INSERT INTO requests (id, account_id, provider, kind, external_id, decision, created_at, decided_at) VALUES (?, ?, 'stashdb', 'scene', ?, 'pending', ?, NULL)",
+    )
+    .run(dupRequestId, owner.id, SCENE.id.toUpperCase(), now + 60_000);
+  // ...and a NEWER uppercase acquisition that never contacted Whisparr.
+  raw
+    .prepare(
+      "INSERT INTO acquisitions (id, instance_id, provider, kind, external_id, state, created_at, updated_at) VALUES (?, ?, 'stashdb', 'scene', ?, 'unsent', ?, ?)",
+    )
+    .run(
+      randomUUID(),
+      instanceId,
+      SCENE.id.toUpperCase(),
+      now + 60_000,
+      now + 60_000,
+    );
+  raw.close();
+  storage.closeStorage();
+
+  assert.equal(storage.isInitialized(), true);
+  // Both intents stay live, so the folded NOCASE lookup resolves one row of
+  // the pair; the migration must not pick which — nothing is cancelled.
+  const active = storage.getActiveRequest(owner.id, SCENE);
+  assert.ok(active, "the folded lookup still resolves a live intent");
+  assert.ok(
+    active.id === approved.id || active.id === dupRequestId,
+    "the resolved intent is one of the two kept rows",
+  );
+  assert.ok(
+    active.decision === "approved" || active.decision === "pending",
+    "the resolved intent keeps its decision",
+  );
+
+  const check = new DatabaseSync(join(dir, "velvarr.sqlite"));
+  const approvedRow = check
+    .prepare("SELECT decision FROM requests WHERE external_id = ?")
+    .get(SCENE.id) as { decision: string };
+  assert.equal(
+    approvedRow.decision,
+    "approved",
+    "the approved row keeps its decision",
+  );
+  const duplicate = check
+    .prepare("SELECT decision, decided_at FROM requests WHERE external_id = ?")
+    .get(SCENE.id.toUpperCase()) as {
+    decision: string;
+    decided_at: number | null;
+  };
+  assert.ok(duplicate, "the newer pending duplicate is not deleted");
+  // The pin moved with the operator's decision: nothing is cancelled, so
+  // both intents stay live until the identity is repaired by hand.
+  assert.equal(duplicate.decision, "pending");
+  assert.equal(duplicate.decided_at, null);
+  const identityAcquisitions = check
+    .prepare(
+      "SELECT COUNT(*) AS n FROM acquisitions WHERE lower(external_id) = ?",
+    )
+    .get(SCENE.id) as { n: number };
+  assert.equal(
+    identityAcquisitions.n,
+    2,
+    "the contacted acquisition and the shadow both survive",
+  );
+  const shadow = check
+    .prepare("SELECT state FROM acquisitions WHERE external_id = ?")
+    .get(SCENE.id.toUpperCase()) as { state: string };
+  assert.ok(shadow, "the uppercase shadow row keeps its spelling");
+  assert.equal(shadow.state, "unsent");
+  const mixed = check
+    .prepare(
+      "SELECT (SELECT COUNT(*) FROM requests WHERE external_id != lower(external_id)) + (SELECT COUNT(*) FROM acquisitions WHERE external_id != lower(external_id)) AS n",
+    )
+    .get() as { n: number };
+  const versionRow = check.prepare("PRAGMA user_version").get() as {
+    user_version: number;
+  };
+  check.close();
+  assert.equal(versionRow.user_version, 16);
+  assert.equal(
+    mixed.n,
+    2,
+    "the colliding rows keep their case for manual repair",
+  );
+
+  const acq = storage.getAcquisitionByReference(SCENE);
+  assert.ok(acq, "the folded lookup still resolves the contacted row");
+  assert.equal(acq.state, "monitoring");
+  assert.equal(acq.media.id, SCENE.id);
+});
+
+test("migration 16 keeps an uppercase request spelling its acquisition still carries", () => {
+  const dir = freshDir();
+  storage.bootstrap(deliveryConfig(true), ownerUser(), "jf-owner-token");
+  const owner = storage.getAccount(ownerUser().id) as Account;
+  const [imported] = storage.importAccounts([otherUser()]);
+  assert.ok(imported, "the second account imports");
+
+  // Two accounts hold one identity in two spellings, each with its own
+  // acquisition. Cancellation and the eligibility checks match ids
+  // exactly, so folding the uppercase request away from its uppercase
+  // acquisition would strand that row: no lookup could reach or withdraw
+  // it, and it would stay scheduled with no intent behind it.
+  const now = Date.now();
+  const instanceId = storage.getConfig()?.whisparr?.instanceId;
+  assert.ok(instanceId, "bootstrap stores the whisparr instance identity");
+  const ownerRequestId = randomUUID();
+  const raw = new DatabaseSync(join(dir, "velvarr.sqlite"));
+  raw.exec("PRAGMA user_version = 15");
+  raw
+    .prepare(
+      "INSERT INTO requests (id, account_id, provider, kind, external_id, decision, created_at, decided_at) VALUES (?, ?, 'stashdb', 'scene', ?, 'approved', ?, ?)",
+    )
+    .run(
+      ownerRequestId,
+      owner.id,
+      SCENE.id.toUpperCase(),
+      now - 120_000,
+      now - 90_000,
+    );
+  raw
+    .prepare(
+      "INSERT INTO requests (id, account_id, provider, kind, external_id, decision, created_at, decided_at) VALUES (?, ?, 'stashdb', 'scene', ?, 'approved', ?, ?)",
+    )
+    .run(randomUUID(), imported.id, SCENE.id, now - 60_000, now - 30_000);
+  raw
+    .prepare(
+      "INSERT INTO acquisitions (id, instance_id, provider, kind, external_id, state, due_at, created_at, updated_at) VALUES (?, ?, 'stashdb', 'scene', ?, 'unsent', ?, ?, ?)",
+    )
+    .run(
+      randomUUID(),
+      instanceId,
+      SCENE.id.toUpperCase(),
+      now - 1000,
+      now - 120_000,
+      now - 120_000,
+    );
+  raw
+    .prepare(
+      "INSERT INTO acquisitions (id, instance_id, provider, kind, external_id, state, due_at, created_at, updated_at) VALUES (?, ?, 'stashdb', 'scene', ?, 'unsent', ?, ?, ?)",
+    )
+    .run(
+      randomUUID(),
+      instanceId,
+      SCENE.id,
+      now - 1000,
+      now - 60_000,
+      now - 60_000,
+    );
+  raw.close();
+  storage.closeStorage();
+
+  assert.equal(storage.isInitialized(), true);
+  const check = new DatabaseSync(join(dir, "velvarr.sqlite"));
+  const keptSpelling = check
+    .prepare("SELECT decision FROM requests WHERE external_id = ?")
+    .get(SCENE.id.toUpperCase()) as { decision: string };
+  assert.ok(keptSpelling, "the uppercase request row survives");
+  assert.equal(
+    keptSpelling.decision,
+    "approved",
+    "the uppercase request keeps its decision",
+  );
+  const spellings = check
+    .prepare("SELECT COUNT(*) AS n FROM acquisitions")
+    .get() as { n: number };
+  assert.equal(spellings.n, 2, "both acquisition rows survive");
+  check.close();
+
+  // The pre-migration withdrawal path still works end to end: cancelling
+  // the uppercase request reaches and withdraws its own acquisition, and
+  // the other account's lowercase row is untouched.
+  storage.cancelRequest(owner, ownerRequestId);
+  const after = new DatabaseSync(join(dir, "velvarr.sqlite"));
+  const left = after.prepare("SELECT external_id FROM acquisitions").all() as {
+    external_id: string;
+  }[];
+  after.close();
+  assert.deepEqual(
+    left.map((r) => r.external_id).sort(),
+    [SCENE.id],
+    "cancelling the uppercase request withdraws its own acquisition",
+  );
+});
+
+test("migration 16 keeps an acquisition whose spelling a kept active request carries", () => {
+  const dir = freshDir();
+  storage.bootstrap(deliveryConfig(true), ownerUser(), "jf-owner-token");
+  const owner = storage.getAccount(ownerUser().id) as Account;
+
+  // One account approved the uppercase spelling, then a lowercase
+  // duplicate intent arrived: both active rows keep each other in place,
+  // so the singleton uppercase acquisition must not fold either. Folding
+  // it would put the approved intent's work under the pending spelling,
+  // and cancelling that pending duplicate would withdraw the work the
+  // approval still wants.
+  const now = Date.now();
+  const instanceId = storage.getConfig()?.whisparr?.instanceId;
+  assert.ok(instanceId, "bootstrap stores the whisparr instance identity");
+  const approvedRequestId = randomUUID();
+  const pendingRequestId = randomUUID();
+  const raw = new DatabaseSync(join(dir, "velvarr.sqlite"));
+  raw.exec("PRAGMA user_version = 15");
+  raw
+    .prepare(
+      "INSERT INTO requests (id, account_id, provider, kind, external_id, decision, created_at, decided_at) VALUES (?, ?, 'stashdb', 'scene', ?, 'approved', ?, ?)",
+    )
+    .run(
+      approvedRequestId,
+      owner.id,
+      SCENE.id.toUpperCase(),
+      now - 120_000,
+      now - 90_000,
+    );
+  raw
+    .prepare(
+      "INSERT INTO requests (id, account_id, provider, kind, external_id, decision, created_at, decided_at) VALUES (?, ?, 'stashdb', 'scene', ?, 'pending', ?, NULL)",
+    )
+    .run(pendingRequestId, owner.id, SCENE.id, now - 60_000);
+  raw
+    .prepare(
+      "INSERT INTO acquisitions (id, instance_id, provider, kind, external_id, state, due_at, created_at, updated_at) VALUES (?, ?, 'stashdb', 'scene', ?, 'unsent', ?, ?, ?)",
+    )
+    .run(
+      randomUUID(),
+      instanceId,
+      SCENE.id.toUpperCase(),
+      now - 1000,
+      now - 120_000,
+      now - 120_000,
+    );
+  raw.close();
+  storage.closeStorage();
+
+  assert.equal(storage.isInitialized(), true);
+  const check = new DatabaseSync(join(dir, "velvarr.sqlite"));
+  const spellings = check
+    .prepare("SELECT state FROM acquisitions WHERE external_id = ?")
+    .get(SCENE.id.toUpperCase()) as { state: string };
+  check.close();
+  assert.ok(spellings, "the uppercase acquisition survives");
+  assert.equal(spellings.state, "unsent", "the acquisition keeps its state");
+
+  // Cancelling the lowercase duplicate must not reach the uppercase
+  // acquisition: the exact-match lookup finds nothing to withdraw.
+  storage.cancelRequest(owner, pendingRequestId);
+  const after = new DatabaseSync(join(dir, "velvarr.sqlite"));
+  const left = after
+    .prepare("SELECT COUNT(*) AS n FROM acquisitions")
+    .get() as { n: number };
+  after.close();
+  assert.equal(left.n, 1, "the lowercase cancellation withdraws nothing");
+
+  // Cancelling the uppercase approval withdraws its own acquisition, as
+  // it did before the migration.
+  storage.cancelRequest(owner, approvedRequestId);
+  const last = new DatabaseSync(join(dir, "velvarr.sqlite"));
+  const gone = last.prepare("SELECT COUNT(*) AS n FROM acquisitions").get() as {
+    n: number;
+  };
+  last.close();
+  assert.equal(
+    gone.n,
+    0,
+    "the uppercase cancellation withdraws the acquisition",
+  );
+});
+
+test("migration 16 keeps a whole colliding identity, so another account's cancellation cannot strand an approval", () => {
+  const dir = freshDir();
+  storage.bootstrap(deliveryConfig(true), ownerUser(), "jf-owner-token");
+  const owner = storage.getAccount(ownerUser().id) as Account;
+  const [imported] = storage.importAccounts([otherUser()]);
+  assert.ok(imported, "the second account imports");
+
+  // Account A approved the uppercase spelling and its approval created
+  // the only acquisition. Account B holds two pending intents, one per
+  // spelling. A local check folds A's request: its account holds one
+  // active intent and the acquisition partition is single. But B's
+  // colliding pair keeps the acquisition's spelling alive on the request
+  // side, so folding A's request would let B's exact-match cancellation
+  // withdraw the acquisition A's approval still wants.
+  const now = Date.now();
+  const instanceId = storage.getConfig()?.whisparr?.instanceId;
+  assert.ok(instanceId, "bootstrap stores the whisparr instance identity");
+  const approvedRequestId = randomUUID();
+  const bUpperRequestId = randomUUID();
+  const raw = new DatabaseSync(join(dir, "velvarr.sqlite"));
+  raw.exec("PRAGMA user_version = 15");
+  raw
+    .prepare(
+      "INSERT INTO requests (id, account_id, provider, kind, external_id, decision, created_at, decided_at) VALUES (?, ?, 'stashdb', 'scene', ?, 'approved', ?, ?)",
+    )
+    .run(
+      approvedRequestId,
+      owner.id,
+      SCENE.id.toUpperCase(),
+      now - 120_000,
+      now - 90_000,
+    );
+  raw
+    .prepare(
+      "INSERT INTO requests (id, account_id, provider, kind, external_id, decision, created_at, decided_at) VALUES (?, ?, 'stashdb', 'scene', ?, 'pending', ?, NULL)",
+    )
+    .run(bUpperRequestId, imported.id, SCENE.id.toUpperCase(), now - 60_000);
+  raw
+    .prepare(
+      "INSERT INTO requests (id, account_id, provider, kind, external_id, decision, created_at, decided_at) VALUES (?, ?, 'stashdb', 'scene', ?, 'pending', ?, NULL)",
+    )
+    .run(randomUUID(), imported.id, SCENE.id, now - 30_000);
+  raw
+    .prepare(
+      "INSERT INTO acquisitions (id, instance_id, provider, kind, external_id, state, due_at, created_at, updated_at) VALUES (?, ?, 'stashdb', 'scene', ?, 'unsent', ?, ?, ?)",
+    )
+    .run(
+      randomUUID(),
+      instanceId,
+      SCENE.id.toUpperCase(),
+      now - 1000,
+      now - 120_000,
+      now - 120_000,
+    );
+  raw.close();
+  storage.closeStorage();
+
+  assert.equal(storage.isInitialized(), true);
+  const check = new DatabaseSync(join(dir, "velvarr.sqlite"));
+  const approvedRow = check
+    .prepare("SELECT decision FROM requests WHERE external_id = ?")
+    .get(SCENE.id.toUpperCase()) as { decision: string };
+  assert.ok(approvedRow, "the uppercase approved request survives");
+  assert.equal(
+    approvedRow.decision,
+    "approved",
+    "the whole identity keeps its spellings",
+  );
+  check.close();
+
+  // B cancels its uppercase duplicate: the exact-match pending count sees
+  // A's approved intent and blocks the withdrawal, so A's acquisition
+  // stays exactly as before the migration.
+  storage.cancelRequest(imported, bUpperRequestId);
+  const after = new DatabaseSync(join(dir, "velvarr.sqlite"));
+  const acquisitions = after
+    .prepare("SELECT COUNT(*) AS n FROM acquisitions WHERE external_id = ?")
+    .get(SCENE.id.toUpperCase()) as { n: number };
+  after.close();
+  assert.equal(
+    acquisitions.n,
+    1,
+    "the other account's cancellation does not withdraw A's acquisition",
+  );
+});
+
+test("migration 16 keeps a current-instance acquisition whose spelling survives through another instance", () => {
+  const dir = freshDir();
+  storage.bootstrap(deliveryConfig(true), ownerUser(), "jf-owner-token");
+  const owner = storage.getAccount(ownerUser().id) as Account;
+
+  // A retired Whisparr instance holds the identity in two spellings; the
+  // current instance holds only the uppercase acquisition. A local
+  // instance-partition check folds the current acquisition, but its
+  // spelling is kept alive by the retired instance's collision. Folding
+  // it would strand scheduled work: a cancellation matches ids exactly
+  // and would find nothing to withdraw.
+  const now = Date.now();
+  const instanceId = storage.getConfig()?.whisparr?.instanceId;
+  assert.ok(instanceId, "bootstrap stores the whisparr instance identity");
+  const requestId = randomUUID();
+  const raw = new DatabaseSync(join(dir, "velvarr.sqlite"));
+  raw.exec("PRAGMA user_version = 15");
+  raw
+    .prepare(
+      "INSERT INTO requests (id, account_id, provider, kind, external_id, decision, created_at, decided_at) VALUES (?, ?, 'stashdb', 'scene', ?, 'approved', ?, ?)",
+    )
+    .run(
+      requestId,
+      owner.id,
+      SCENE.id.toUpperCase(),
+      now - 120_000,
+      now - 90_000,
+    );
+  raw
+    .prepare(
+      "INSERT INTO acquisitions (id, instance_id, provider, kind, external_id, state, due_at, created_at, updated_at) VALUES (?, ?, 'stashdb', 'scene', ?, 'unsent', ?, ?, ?)",
+    )
+    .run(
+      randomUUID(),
+      instanceId,
+      SCENE.id.toUpperCase(),
+      now - 1000,
+      now - 120_000,
+      now - 120_000,
+    );
+  raw
+    .prepare(
+      "INSERT INTO acquisitions (id, instance_id, provider, kind, external_id, state, created_at, updated_at) VALUES (?, ?, 'stashdb', 'scene', ?, 'unsent', ?, ?)",
+    )
+    .run(
+      randomUUID(),
+      "retired-whisparr",
+      SCENE.id.toUpperCase(),
+      now - 200_000,
+      now - 200_000,
+    );
+  raw
+    .prepare(
+      "INSERT INTO acquisitions (id, instance_id, provider, kind, external_id, state, created_at, updated_at) VALUES (?, ?, 'stashdb', 'scene', ?, 'unsent', ?, ?)",
+    )
+    .run(
+      randomUUID(),
+      "retired-whisparr",
+      SCENE.id,
+      now - 200_000,
+      now - 200_000,
+    );
+  raw.close();
+  storage.closeStorage();
+
+  assert.equal(storage.isInitialized(), true);
+  const check = new DatabaseSync(join(dir, "velvarr.sqlite"));
+  const current = check
+    .prepare(
+      "SELECT external_id, state FROM acquisitions WHERE instance_id = ?",
+    )
+    .get(instanceId) as { external_id: string; state: string };
+  assert.ok(current, "the current-instance acquisition survives");
+  assert.equal(
+    current.external_id,
+    SCENE.id.toUpperCase(),
+    "its spelling survives the retired instance's collision",
+  );
+  check.close();
+
+  // Cancelling the request withdraws the current-instance acquisition by
+  // its exact spelling, as it did before the migration.
+  storage.cancelRequest(owner, requestId);
+  const after = new DatabaseSync(join(dir, "velvarr.sqlite"));
+  const leftOnCurrent = after
+    .prepare("SELECT COUNT(*) AS n FROM acquisitions WHERE instance_id = ?")
+    .get(instanceId) as { n: number };
+  const retired = after
+    .prepare("SELECT COUNT(*) AS n FROM acquisitions WHERE instance_id != ?")
+    .get(instanceId) as { n: number };
+  after.close();
+  assert.equal(
+    leftOnCurrent.n,
+    0,
+    "the cancellation withdraws the current-instance acquisition",
+  );
+  assert.equal(retired.n, 2, "the retired instance's rows are untouched");
+});
+
 test("request lifecycle authorization: role checks, privacy, own-cancellation isolation", () => {
   freshDir();
   storage.bootstrap(deliveryConfig(false), ownerUser(), "jf-owner-token");
@@ -1707,7 +2633,7 @@ test("submission attempts are CAS-safe and recover to uncertain after restart", 
     done.id,
     { unavailable: true, reason: "whisparr timeout" },
     second.claimToken,
-  );
+  ) as AcquisitionRecord;
   assert.equal(outage.state, "monitoring");
   assert.equal(outage.lastError, "whisparr timeout");
   assert.equal(outage.lastObservedAt, null);
@@ -1715,7 +2641,7 @@ test("submission attempts are CAS-safe and recover to uncertain after restart", 
     done.id,
     { state: "downloading" },
     second.claimToken,
-  );
+  ) as AcquisitionRecord;
   assert.equal(observed.state, "downloading");
   assert.ok(observed.lastObservedAt);
   assert.equal(observed.lastError, null);
@@ -2397,12 +3323,12 @@ test("observations update changed facts; a proven absence is distinct from an ou
   const first = storage.recordAcquisitionObservation(work.id, {
     state: "monitoring",
     item: { whisparrId: 5, path: "/data/old", title: "Old" },
-  });
+  }) as AcquisitionRecord;
   assert.equal(first.whisparrPath, "/data/old");
   const moved = storage.recordAcquisitionObservation(work.id, {
     state: "monitoring",
     item: { whisparrId: 6, path: "/data/new", title: "New" },
-  });
+  }) as AcquisitionRecord;
   assert.equal(moved.whisparrPath, "/data/new", "a changed path is persisted");
   assert.ok(moved.lastObservedAt);
 
@@ -2410,7 +3336,7 @@ test("observations update changed facts; a proven absence is distinct from an ou
   const outage = storage.recordAcquisitionObservation(work.id, {
     unavailable: true,
     reason: "whisparr timeout",
-  });
+  }) as AcquisitionRecord;
   assert.equal(outage.whisparrPath, "/data/new");
   assert.equal(outage.lastObservedAt, moved.lastObservedAt);
   assert.ok(outage.lastErrorAt);
@@ -2437,7 +3363,7 @@ test("observations update changed facts; a proven absence is distinct from an ou
   const healed = storage.recordAcquisitionObservation(work.id, {
     state: "downloading",
     item: { whisparrId: 6, path: "/data/new" },
-  });
+  }) as AcquisitionRecord;
   assert.equal(
     storage.isObservationStale(
       healed,
@@ -2452,7 +3378,7 @@ test("observations update changed facts; a proven absence is distinct from an ou
   const absent = storage.recordAcquisitionObservation(work.id, {
     absent: true,
     reason: "whisparr no longer has this identity",
-  });
+  }) as AcquisitionRecord;
   assert.equal(
     storage.hasAuthoritativeAbsence(absent),
     true,
@@ -2473,7 +3399,7 @@ test("observations update changed facts; a proven absence is distinct from an ou
   const outage2 = storage.recordAcquisitionObservation(work.id, {
     unavailable: true,
     reason: "down again",
-  });
+  }) as AcquisitionRecord;
   assert.equal(
     storage.hasAuthoritativeAbsence(outage2),
     true,
@@ -2500,7 +3426,7 @@ test("observations persist monitored and progress facts without inventing or lea
     state: "downloading",
     item: { whisparrId: 7, path: "/data/dl", monitored: true },
     progress: { percent: 42, timeleft: "00:10:00" },
-  });
+  }) as AcquisitionRecord;
   assert.deepEqual(started.progress, { percent: 42, timeleft: "00:10:00" });
   assert.equal(started.whisparrMonitored, true);
   assert.equal(started.whisparrPath, "/data/dl");
@@ -2510,7 +3436,7 @@ test("observations persist monitored and progress facts without inventing or lea
   const outage = storage.recordAcquisitionObservation(work.id, {
     unavailable: true,
     reason: "whisparr timeout",
-  });
+  }) as AcquisitionRecord;
   assert.equal(outage.state, "downloading");
   assert.deepEqual(outage.progress, { percent: 42, timeleft: "00:10:00" });
   assert.equal(outage.whisparrMonitored, true);
@@ -2522,7 +3448,7 @@ test("observations persist monitored and progress facts without inventing or lea
     state: "downloading",
     item: { whisparrId: 7, path: "/data/dl" },
     progress: { percent: 90, timeleft: "00:02:00" },
-  });
+  }) as AcquisitionRecord;
   assert.equal(later.whisparrMonitored, true, "omitted monitored is preserved");
   assert.deepEqual(later.progress, { percent: 90, timeleft: "00:02:00" });
 
@@ -2531,14 +3457,14 @@ test("observations persist monitored and progress facts without inventing or lea
     state: "downloading",
     item: { whisparrId: 7, path: "/data/dl", monitored: false },
     progress: { percent: 95, timeleft: "00:01:00" },
-  });
+  }) as AcquisitionRecord;
   assert.equal(unmonitored.whisparrMonitored, false);
 
   // Progress never outlives its download.
   const done = storage.recordAcquisitionObservation(work.id, {
     state: "imported",
     item: { whisparrId: 7, path: "/data/dl", monitored: false },
-  });
+  }) as AcquisitionRecord;
   assert.equal(done.state, "imported");
   assert.equal(done.progress, null, "a finished download leaves no progress");
   assert.equal(done.whisparrMonitored, false);
@@ -2555,7 +3481,7 @@ test("observations persist monitored and progress facts without inventing or lea
       state: "downloading",
       item: { whisparrId: 7, path: "/data/dl" },
       progress,
-    });
+    }) as AcquisitionRecord;
     assert.deepEqual(
       bad.progress,
       { percent: null, timeleft: "00:01:00" },
@@ -2566,13 +3492,13 @@ test("observations persist monitored and progress facts without inventing or lea
     state: "downloading",
     item: { whisparrId: 7, path: "/data/dl" },
     progress: { percent: 50, timeleft: 7 as unknown as string },
-  });
+  }) as AcquisitionRecord;
   assert.deepEqual(badTimeleft.progress, { percent: 50, timeleft: null });
   const monitoring = storage.recordAcquisitionObservation(work.id, {
     state: "monitoring",
     item: { whisparrId: 7, path: "/data/dl" },
     progress: { percent: 50, timeleft: "00:01:00" },
-  });
+  }) as AcquisitionRecord;
   assert.equal(
     monitoring.progress,
     null,
@@ -2849,7 +3775,7 @@ test("migration 13 admits failed_permanent and preserves acquisition rows", () =
     const versionRow = raw.prepare("PRAGMA user_version").get() as {
       user_version: number;
     };
-    assert.equal(versionRow.user_version, 15);
+    assert.equal(versionRow.user_version, 16);
     // The fabricated row survives the rebuild intact.
     const row = raw
       .prepare(
@@ -2921,7 +3847,7 @@ test("backup restores into a fresh data directory with everything intact; a wron
   );
 
   // Restore = copy the snapshot in as velvarr.sqlite of a NEW data directory.
-  const restored = mkdtempSync(join(tmpdir(), "velvarr-restore-"));
+  const restored = testTempDir("velvarr-restore-");
   copyFileSync(snapshot, join(restored, "velvarr.sqlite"));
   storage.closeStorage();
   process.env.VELVARR_DATA_DIR = restored;
@@ -2936,7 +3862,7 @@ test("backup restores into a fresh data directory with everything intact; a wron
 
   // A wrong key fails loudly and corrupts nothing on the restored copy.
   storage.closeStorage();
-  const wrongKey = mkdtempSync(join(tmpdir(), "velvarr-wrongkey-"));
+  const wrongKey = testTempDir("velvarr-wrongkey-");
   copyFileSync(snapshot, join(wrongKey, "velvarr.sqlite"));
   process.env.VELVARR_DATA_DIR = wrongKey;
   process.env.VELVARR_SECRET_KEY = KEY_B;
@@ -2989,7 +3915,7 @@ test("restored in-flight submissions reconcile to uncertain, never unsent; ident
   // Crash-equivalent: snapshot mid-submission, restore elsewhere.
   const snapshot = join(dir, "snapshot.sqlite");
   runBackup(dir, snapshot);
-  const restored = mkdtempSync(join(tmpdir(), "velvarr-reconcile-"));
+  const restored = testTempDir("velvarr-reconcile-");
   copyFileSync(snapshot, join(restored, "velvarr.sqlite"));
   storage.closeStorage();
   process.env.VELVARR_DATA_DIR = restored;
@@ -3180,6 +4106,192 @@ test("follow validation refuses non-performer references, unknown providers, non
   );
   // No refused call wrote anything.
   assert.deepEqual(storage.listFollows(grant.account.id), []);
+});
+
+test("follow image urls are bounded: 2048 characters store, longer ones are refused", () => {
+  freshDir();
+  const grant = storage.bootstrap(testConfig(), ownerUser(), "jf-owner-token");
+  const prefix = "https://cdn.theporndb.net/";
+  const atLimit = `${prefix}${"a".repeat(storage.FOLLOW_IMAGE_URL_MAX - prefix.length)}`;
+  assert.equal(atLimit.length, storage.FOLLOW_IMAGE_URL_MAX);
+  const follow = storage.followPerformer(
+    grant.account.id,
+    FOLLOW_TPDB_A,
+    "Fixture Performer",
+    atLimit,
+  );
+  assert.equal(follow.imageUrl, atLimit);
+  // One character over the pin is refused, whatever the artwork shape.
+  assert.throws(
+    () =>
+      storage.followPerformer(
+        grant.account.id,
+        FOLLOW_TPDB_B,
+        "Fixture Performer",
+        `${atLimit}a`,
+      ),
+    (e: { code: string }) => e.code === "invalid_field",
+  );
+  // The refusal stored nothing.
+  assert.deepEqual(storage.listFollows(grant.account.id), [follow]);
+});
+
+test("an account holds at most FOLLOW_CAP_PER_ACCOUNT follow rows, and unfollowing frees the cap", () => {
+  freshDir();
+  const grant = storage.bootstrap(testConfig(), ownerUser(), "jf-owner-token");
+  const ref = (i: number): CatalogReference => ({
+    provider: "tpdb",
+    kind: "performer",
+    id: `e1a7c3d9-4f2b-4c8e-a5d6-${String(i).padStart(12, "0")}`,
+  });
+  for (let i = 0; i < storage.FOLLOW_CAP_PER_ACCOUNT; i++) {
+    storage.followPerformer(
+      grant.account.id,
+      ref(i),
+      "Fixture Performer",
+      null,
+    );
+  }
+  assert.equal(
+    storage.listFollows(grant.account.id).length,
+    storage.FOLLOW_CAP_PER_ACCOUNT,
+  );
+  assert.throws(
+    () =>
+      storage.followPerformer(
+        grant.account.id,
+        ref(storage.FOLLOW_CAP_PER_ACCOUNT),
+        "Fixture Performer",
+        null,
+      ),
+    (e: { status: number; code: string }) =>
+      e.status === 409 && e.code === "follow_cap_reached",
+  );
+  // The cap is live: freeing one row admits exactly one more.
+  storage.unfollowPerformer(grant.account.id, "tpdb", ref(0).id);
+  storage.followPerformer(
+    grant.account.id,
+    ref(storage.FOLLOW_CAP_PER_ACCOUNT),
+    "Fixture Performer",
+    null,
+  );
+  assert.equal(
+    storage.listFollows(grant.account.id).length,
+    storage.FOLLOW_CAP_PER_ACCOUNT,
+  );
+  // A pair press at cap - 1 refuses whole: the counterpart row would pass
+  // the cap, so the transaction rolls the asked-for row back too — never a
+  // half-recorded pair.
+  storage.unfollowPerformer(grant.account.id, "tpdb", ref(1).id);
+  assert.throws(
+    () =>
+      storage.followPerformerPair(
+        grant.account.id,
+        ref(0),
+        "Fixture Performer",
+        null,
+        { reference: ref(1), name: "Fixture Performer", imageUrl: null },
+      ),
+    (e: { code: string }) => e.code === "follow_cap_reached",
+  );
+  assert.equal(
+    storage.listFollows(grant.account.id).length,
+    storage.FOLLOW_CAP_PER_ACCOUNT - 1,
+  );
+  // The freed row admits a plain follow again.
+  storage.followPerformer(grant.account.id, ref(1), "Fixture Performer", null);
+  assert.equal(
+    storage.listFollows(grant.account.id).length,
+    storage.FOLLOW_CAP_PER_ACCOUNT,
+  );
+});
+
+test("an already-followed counterpart adds no row, so the duplicate check wins over the cap", () => {
+  freshDir();
+  const grant = storage.bootstrap(testConfig(), ownerUser(), "jf-owner-token");
+  const ref = (i: number): CatalogReference => ({
+    provider: "tpdb",
+    kind: "performer",
+    id: `e1a7c3d9-4f2b-4c8e-a5d6-${String(i).padStart(12, "0")}`,
+  });
+  // Filler rows to cap - 1, with the stash side followed standalone: the
+  // counterpart row the boundary press names already exists.
+  for (let i = 0; i < storage.FOLLOW_CAP_PER_ACCOUNT - 2; i++) {
+    storage.followPerformer(
+      grant.account.id,
+      ref(i),
+      "Fixture Performer",
+      null,
+    );
+  }
+  storage.followPerformer(
+    grant.account.id,
+    FOLLOW_STASH_A,
+    "Fixture Performer",
+    null,
+  );
+  assert.equal(
+    storage.listFollows(grant.account.id).length,
+    storage.FOLLOW_CAP_PER_ACCOUNT - 1,
+  );
+  // The press takes the account to the cap exactly: the TPDB row is new
+  // (cap - 1 -> cap), and the already-followed counterpart adds no row,
+  // so the press must land, never roll back.
+  const follow = storage.followPerformerPair(
+    grant.account.id,
+    FOLLOW_TPDB_A,
+    "Fixture Performer",
+    null,
+    { reference: FOLLOW_STASH_A, name: "Fixture Performer", imageUrl: null },
+  );
+  assert.deepEqual(follow.linked, {
+    provider: "stashdb",
+    kind: "performer",
+    id: FOLLOW_STASH_A.id,
+  });
+  // Both rows exist: the pair answers as one listed entry (folded), so the
+  // row count reads off the provider-scoped lists — cap - 1 tpdb rows plus
+  // the stash row, exactly the row cap. A rolled-back press would leave
+  // cap - 2 tpdb rows.
+  assert.equal(
+    storage.listFollowsByProvider(
+      grant.account.id,
+      "tpdb",
+      storage.FOLLOW_CAP_PER_ACCOUNT,
+    ).length,
+    storage.FOLLOW_CAP_PER_ACCOUNT - 1,
+  );
+  assert.equal(
+    storage.listFollowsByProvider(
+      grant.account.id,
+      "stashdb",
+      storage.FOLLOW_CAP_PER_ACCOUNT,
+    ).length,
+    1,
+  );
+  // The same precedence on a full account: a re-follow answers
+  // already_following, never follow_cap_reached.
+  assert.throws(
+    () =>
+      storage.followPerformer(
+        grant.account.id,
+        FOLLOW_STASH_A,
+        "Fixture Performer",
+        null,
+      ),
+    (e: { code: string }) => e.code === "already_following",
+  );
+  // A genuinely new row on a full account is still the cap's refusal.
+  assert.throws(
+    () =>
+      storage.followPerformer(
+        grant.account.id,
+        FOLLOW_TPDB_B,
+        "Fixture Performer",
+        null,
+      ),
+    (e: { code: string }) => e.code === "follow_cap_reached",
+  );
 });
 
 test("listFollowsByProvider is provider-scoped, newest-first, and honours its limit", async () => {
@@ -4247,7 +5359,7 @@ test("migration 14 adds the request indexes to a schema 13 database and keeps ev
     const version = raw.prepare("PRAGMA user_version").get() as {
       user_version: number;
     };
-    assert.equal(version.user_version, 15);
+    assert.equal(version.user_version, 16);
     const present = (
       raw
         .prepare(
@@ -4292,7 +5404,7 @@ test("migration 15 adds the natural-language search grant to a schema 14 databas
     const version = raw.prepare("PRAGMA user_version").get() as {
       user_version: number;
     };
-    assert.equal(version.user_version, 15);
+    assert.equal(version.user_version, 16);
     const column = (
       raw.prepare("PRAGMA table_info(accounts)").all() as {
         name: string;

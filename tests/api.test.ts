@@ -8,35 +8,54 @@ import {
   type ServerResponse,
   type Server,
 } from "node:http";
-import { mkdtempSync } from "node:fs";
-import { randomUUID } from "node:crypto";
-import { tmpdir } from "node:os";
+import {
+  existsSync,
+  readdirSync,
+  readFileSync,
+  renameSync,
+  statSync,
+  utimesSync,
+} from "node:fs";
+import { createHash, randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { rmTempDir } from "./setup.ts";
+import { rmTempDir, testTempDir } from "./setup.ts";
 import { Buffer } from "node:buffer";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { resetMetaCache } from "../src/server/providers.ts";
+import {
+  fetchProviderArtwork,
+  resetMetaCache,
+} from "../src/server/providers.ts";
 import sharp from "sharp";
 import {
   artworkStoreStateForTest,
   setArtworkStoreBudgetForTest,
 } from "../src/server/artwork-store.ts";
-import { normalizeFacetName } from "../src/lib/contracts.ts";
+import { catalogImageUrl, normalizeFacetName } from "../src/lib/contracts.ts";
 import type { IntegrationConfig, ProviderCheck } from "../src/lib/contracts.ts";
+import type { DuplicateMoviesResponse } from "../src/lib/contracts.ts";
+import type {
+  DiscordCheck,
+  DiscordSettingsInfo,
+} from "../src/lib/discord-settings.ts";
 import {
   DISCOVER_CACHE_TTL_MS,
   releasesCacheKey,
 } from "../src/server/discovery.ts";
 import {
   clearDiscoverCache,
+  FOLLOW_CAP_PER_ACCOUNT,
+  FOLLOW_IMAGE_URL_MAX,
+  followPerformer,
   getDiscoverCache,
   getConfig,
   OPEN_REQUEST_CAP,
   putDiscoverCache,
   saveConfig,
+  unfollowPerformer,
 } from "../src/server/storage.ts";
 import { resetSweepCache } from "../src/server/jellyfin.ts";
+import { resetMovieListCache } from "../src/server/whisparr.ts";
 import { resetUpdateCache } from "../src/server/update.ts";
 import { resetLoginBuckets } from "../src/server/security.ts";
 import { AppError } from "../src/server/http.ts";
@@ -103,7 +122,7 @@ test("route tables never shadow: every request shape matches at most one def", (
 });
 
 // Isolated environment BEFORE importing route/storage modules.
-const apiDataDir = mkdtempSync(join(tmpdir(), "velvarr-api-test-"));
+const apiDataDir = testTempDir("velvarr-api-test-");
 process.env.VELVARR_DATA_DIR = apiDataDir;
 process.env.VELVARR_SECRET_KEY = "ab".repeat(32);
 process.env.VELVARR_SETUP_SECRET = "setup-secret-".repeat(4);
@@ -170,6 +189,10 @@ const TPDB_PERFORMER2 = "2a2b3c4d-0000-0000-0000-00000000000e";
 // Filmography of 120 distinct titles across five 24-row pages: the bulk
 // continuation test needs unfiled backlog past the first 100 the cap files.
 const TPDB_PERFORMER_PAGING = "2a2b3c4d-0000-0000-0000-00000000b161";
+// Same shape as PAGING but in its own band: the pending-cap test needs an
+// unfiled backlog bigger than the pass's 100-title cap, on titles no other
+// test has filed.
+const TPDB_PERFORMER_CAPFILL = "2a2b3c4d-0000-0000-0000-00000000ca70";
 // A published cross-provider pair: the TPDB record links to the StashDB one,
 // so following either follows both. Fresh ids — every other performer follow
 // in this file must stay single-provider.
@@ -251,6 +274,10 @@ const fx = {
   adminKey: "jf-admin-key-9",
   serverId: SERVER_ID,
   tokenCounter: 0,
+  // VELV-236: set to a release promise to hold the unfiltered Whisparr
+  // movie-list response open; the held request answers 500 on release, so
+  // the loser fetch rejects and its cache entry cleans itself up.
+  holdMovieList: null as Promise<unknown> | null,
   users: [
     {
       id: OWNER_ID,
@@ -306,6 +333,11 @@ const fx = {
   ] as FxUser[],
   tokens: new Map<string, string>(), // access token -> user id
   impersonate: null as string | null, // force /Users/Me identity for regression testing
+  // VELV-244: a test parks one fixture path mid-flight (an upstream probe
+  // held while a second session changes privileges) by setting holdPath.
+  holdPath: null as string | null,
+  holdArrived: null as (() => void) | null,
+  holdRelease: null as (() => void) | null,
 
   fail: { items: 0, views: 0, me401: 0, info: 0 },
   // Every /Users/{id}/Items hit; the sweep cache test reads the delta.
@@ -419,8 +451,17 @@ async function jellyfinHandler(
   const userId = token ? (fx.tokens.get(token) ?? null) : null;
   if (fx.journalOn) fx.journal.push({ method: req.method ?? "", path: p });
 
-  if (p === "/System/Info/Public")
+  if (p === "/System/Info/Public") {
+    // VELV-244: a test parks this one probe; the hold clears on release and
+    // the fixture keeps answering once holdRelease is set.
+    if (fx.holdPath === p && !fx.holdRelease) {
+      fx.holdArrived?.();
+      const hold = Promise.withResolvers<void>();
+      fx.holdRelease = hold.resolve;
+      await hold.promise;
+    }
     return json(res, 200, { Id: fx.serverId, ServerName: "FixtureJF" });
+  }
   if (p === "/System/Info") {
     // Countdown knob: one armed rejection for the admin status probe, then
     // honest answers again (same pattern as fail.me401).
@@ -611,8 +652,16 @@ async function whisparrHandler(
     const stashId = url.searchParams.get("stashId");
     // Unfiltered list: the library-detail enrichment resolves identity by
     // walking every stored movie and matching paths itself.
-    if (tpdbId === null && stashId === null)
+    if (tpdbId === null && stashId === null) {
+      // A test can hold this response open to prove the availability badge
+      // never waits it out; releasing answers 500 so the loser fetch
+      // rejects and the cache's own failure path cleans up after it.
+      if (fx.holdMovieList !== null) {
+        await fx.holdMovieList;
+        return json(res, 500, {});
+      }
       return json(res, 200, whisparrMovies);
+    }
     return json(
       res,
       200,
@@ -657,12 +706,67 @@ const tpdbFx = {
   pageReads: new Map<string, number>(),
   imageAuth: "unset",
   lastQuery: "",
+  /** VELV-240: the fan-out amplification test adds its five tag rows to
+   * the /tags listing while on, so the uuid->number walk behind the
+   * native fan-out criterion resolves them; every other test keeps the
+   * two-row listing. */
+  amplifyTags: false,
 };
+
+const DUPLICATE_SOURCE = "2a2b3c4d-0000-0000-d001-000000000001";
+const DUPLICATE_CANDIDATE = "2a2b3c4d-0000-0000-d001-000000000002";
+let duplicateFixture:
+  | {
+      source: Record<string, unknown>;
+      candidates: Record<string, unknown>[];
+      failMetadata: boolean;
+      hashReads: number;
+    }
+  | undefined;
+
+function duplicateMovieRow(id: string): Record<string, unknown> {
+  return {
+    ...tpdbMovieRow(id),
+    title: id === DUPLICATE_SOURCE ? "Originaltitel" : "Translated title",
+    duration: 1000,
+    posters: { full: "https://cdn.theporndb.net/duplicate-poster.png" },
+    performers: [
+      {
+        id: TPDB_PERFORMER,
+        name: "Fixture performer",
+        parent: { id: TPDB_PERFORMER, _id: 123, name: "Fixture performer" },
+      },
+    ],
+    hashes: [],
+  };
+}
 
 // Distinct uuids for the bulk continuation filmography: 120 titles the
 // paging fixture serves five pages of, in the performer's own id band.
 const bulkContinuationId = (n: number) =>
   `2a2b3c4d-0000-0000-b161-${String(n).padStart(12, "0")}`;
+// Same for the pending-cap filmography, in its own band.
+const capFillId = (n: number) =>
+  `2a2b3c4d-0000-0000-ca70-${String(n).padStart(12, "0")}`;
+// VELV-211: bulk pre-skip mixed-case filmography. The movie id is UPPERCASE
+// like a raw provider row; the single-request route stores the lowercase
+// spelling, so the bulk key must fold to match it.
+const TPDB_PERFORMER_MIXED = "2a2b3c4d-0000-0000-0000-00000000001b";
+const TPDB_MOVIE_MIXED_UPPER = "2A2B3C4D-0000-0000-0000-00000000001C";
+const TPDB_MOVIE_MIXED = TPDB_MOVIE_MIXED_UPPER.toLowerCase();
+const bulkMixedBacklogId = (n: number) =>
+  `2a2b3c4d-0000-0000-0ba5-${String(n).padStart(12, "0")}`;
+// VELV-240 worst-case bands: 5 fan-out tag ids (the native fan-out group),
+// 6 tag ids that miss FANOUT_GROUP_CAP and re-check locally, 5 studio
+// entities resolving to site ids 555001..555005, one movie row band.
+const amplificationFanId = (n: number) =>
+  `2a2b3c4d-0000-0000-fa00-${String(n).padStart(12, "0")}`;
+const amplificationOffId = (n: number) =>
+  `2a2b3c4d-0000-0000-0ff6-${String(n).padStart(12, "0")}`;
+const amplificationStudioId = (n: number) =>
+  `2a2b3c4d-0000-0000-517d-${String(n).padStart(12, "0")}`;
+const amplificationMovieId = (n: number) =>
+  `2a2b3c4d-0000-0000-fa11-${String(n).padStart(12, "0")}`;
 
 function tpdbMovieRow(id: string) {
   return {
@@ -742,6 +846,59 @@ interface InjectedMovieRow {
 
 let extraTpdbMovies: InjectedMovieRow[] = [];
 
+const HISTORICAL_BROWSE_QUERY = "HistoricalRanges";
+const historicalBrowseId = (year: number, index: number) =>
+  `b1800000-0000-0000-${year}-${String(index).padStart(12, "0")}`;
+const historicalBrowseDate = (year: number, index: number) =>
+  index === 39
+    ? `${year}-12-31`
+    : new Date(Date.UTC(year, 0, index + 1)).toISOString().slice(0, 10);
+const historicalBrowseCatalog = [2024, 2012, 2011, 2010, 2005].flatMap((year) =>
+  Array.from(
+    { length: year === 2024 || year === 2005 ? 2500 : 40 },
+    (_, index) => ({
+      id: historicalBrowseId(year, index),
+      date:
+        year === 2024 || year === 2005
+          ? `${year}-06-15`
+          : historicalBrowseDate(year, index),
+    }),
+  ),
+);
+let historicalBrowseMode:
+  { reads: { movie: number; scene: number } } | undefined;
+
+function historicalBrowseRows(
+  cutoff: string | undefined,
+  operation: string | undefined,
+  ascending: boolean,
+) {
+  return historicalBrowseCatalog
+    .filter(({ date }) => {
+      if (cutoff === undefined) return true;
+      switch (operation) {
+        case "<":
+          return date < cutoff;
+        case "<=":
+          return date <= cutoff;
+        case "=":
+          return date === cutoff;
+        case ">":
+          return date > cutoff;
+        case ">=":
+          return date >= cutoff;
+        default:
+          throw new Error(`Unexpected historical date operator: ${operation}`);
+      }
+    })
+    .sort(
+      (a, b) =>
+        (ascending
+          ? a.date.localeCompare(b.date)
+          : b.date.localeCompare(a.date)) || a.id.localeCompare(b.id),
+    );
+}
+
 async function tpdbHandler(
   req: IncomingMessage,
   res: ServerResponse,
@@ -774,8 +931,53 @@ async function tpdbHandler(
   // calls a route happens to issue around them.
   if (tpdbFx.failPaths.includes(p)) return json(res, 500, {});
   if (auth !== `Bearer ${tpdbToken}`) return json(res, 401, {});
+  if (duplicateFixture) {
+    if (p === `/movies/${DUPLICATE_SOURCE}`) {
+      return json(res, 200, { data: duplicateFixture.source });
+    }
+    if (p === "/movies") {
+      if (url.searchParams.has("hash")) duplicateFixture.hashReads += 1;
+      else if (duplicateFixture.failMetadata) return json(res, 503, {});
+      return json(res, 200, {
+        data: duplicateFixture.candidates,
+        links: { next: null },
+      });
+    }
+  }
   if (p === "/user") return json(res, 200, { data: { name: "Fixture TPDB" } });
   if (p === "/movies") {
+    if (
+      historicalBrowseMode &&
+      url.searchParams.get("q") === HISTORICAL_BROWSE_QUERY
+    ) {
+      historicalBrowseMode.reads.movie += 1;
+      const rows = historicalBrowseRows(
+        url.searchParams.get("date") ?? undefined,
+        url.searchParams.get("date_operation") ?? undefined,
+        url.searchParams.get("orderBy") === "former_released",
+      ).filter(
+        ({ date }) =>
+          !url.searchParams.has("year") ||
+          date.slice(0, 4) === url.searchParams.get("year"),
+      );
+      const page = Number(url.searchParams.get("page") ?? 1);
+      const perPage = Number(url.searchParams.get("per_page") ?? 50);
+      return json(res, 200, {
+        data: rows.slice((page - 1) * perPage, page * perPage).map((row) => ({
+          ...tpdbMovieRow(row.id),
+          title: `${HISTORICAL_BROWSE_QUERY} ${row.id}`,
+          date: row.date,
+          tags: [],
+        })),
+        meta: { total: rows.length },
+        links: {
+          next:
+            page * perPage < rows.length
+              ? `http://fixture/movies?page=${page + 1}`
+              : null,
+        },
+      });
+    }
     // Family-proof snapshot, isolated behind an exact q marker so the
     // shared unfiltered /movies rows keep feeding every existing
     // assertion unchanged.
@@ -805,6 +1007,22 @@ async function tpdbHandler(
     // VELV-166: the two rows gain performer credits so a TPDB filmography
     // for the fixture performers returns real credited rows (tpdbCredits
     // maps performers[].id into the details' credits).
+    // VELV-240: the amplification test's five studio filters arrive as
+    // site ids 555001..555005. Every page keeps a provider `next` link and
+    // its one row carries only "Fixture Tag A", so every mapped row fails
+    // the browse's local include re-check and each stream walks toward the
+    // scan ceiling.
+    if ((url.searchParams.get("site_id") ?? "").startsWith("55500")) {
+      tpdbFx.pageReads.set(
+        "/movies",
+        (tpdbFx.pageReads.get("/movies") ?? 0) + 1,
+      );
+      return json(res, 200, {
+        data: [tpdbMovieRow(amplificationMovieId(1))],
+        meta: { total: 10000 },
+        links: { next: "https://fixture.test/next" },
+      });
+    }
     const realTotal = url.searchParams.get("q") !== null;
     return json(res, 200, {
       // Second row feeds the unified facet shelves an unlinked studio tile
@@ -884,6 +1102,11 @@ async function tpdbHandler(
       links: {},
     });
   }
+  // VELV-240: the amplification test's five studio uuids resolve to
+  // numeric site ids 555001..555005.
+  if (p.startsWith("/sites/2a2b3c4d-0000-0000-517d-")) {
+    return json(res, 200, { data: { id: 555000 + Number(p.slice(-1)) } });
+  }
   if (p === `/sites/${TPDB_STUDIO}`)
     return json(res, 200, { data: tpdbSiteRow(TPDB_STUDIO) });
   if (p === "/tags") {
@@ -897,8 +1120,15 @@ async function tpdbHandler(
         : [
             { id: 70, uuid: TAG_A, name: "Fixture Tag A" },
             { id: 194, uuid: TAG_B, name: "Fixture Tag B" },
+            ...(tpdbFx.amplifyTags
+              ? Array.from({ length: 5 }, (_, i) => ({
+                  id: 901 + i,
+                  uuid: amplificationFanId(i + 1),
+                  name: `Amplify Fan ${i + 1}`,
+                }))
+              : []),
           ],
-      meta: { total: empty ? 0 : 2 },
+      meta: { total: empty ? 0 : tpdbFx.amplifyTags ? 7 : 2 },
       links: {},
     });
   }
@@ -943,6 +1173,25 @@ async function tpdbHandler(
       meta: { total: 1 },
       links: { next: "https://fixture.test/next" },
     });
+  // VELV-211: one row whose provider id is UPPERCASE, plus 100 unfiled
+  // backlog rows behind it over five 24-row pages. With the fold the
+  // pre-skip frees the cap slot for the backlog; without it the mixed-case
+  // row 409-skips inside the pass and costs one backlog title.
+  if (p === `/performers/${TPDB_PERFORMER_MIXED}/movies`) {
+    const page = Number(url.searchParams.get("page") ?? "1");
+    const start = (page - 1) * 24;
+    const rows = [
+      tpdbMovieRow(TPDB_MOVIE_MIXED_UPPER),
+      ...Array.from({ length: 100 }, (_, i) =>
+        tpdbMovieRow(bulkMixedBacklogId(i + 1)),
+      ),
+    ];
+    return json(res, 200, {
+      data: rows.slice(start, start + 24),
+      meta: { total: 101 },
+      links: page < 5 ? { next: "https://fixture.test/next" } : {},
+    });
+  }
   // The bulk cap test's filmography: full pages of the same 24 readable
   // titles and a `next` link that never ends, so the pass fills the
   // 100-title cap inside the page ceiling.
@@ -983,6 +1232,21 @@ async function tpdbHandler(
       data: Array.from({ length: 24 }, (_, i) => ({
         ...tpdbMovieRow(bulkContinuationId(start + i + 1)),
         title: `Bulk Continuation ${start + i + 1}`,
+      })),
+      meta: { total: 120 },
+      links: page < 5 ? { next: "https://fixture.test/next" } : {},
+    });
+  }
+  // Same walk as PAGING, own band: the pending-cap test reads five pages to
+  // fill the pass's 100-title cap, then the account's pending cap refuses.
+  if (p === `/performers/${TPDB_PERFORMER_CAPFILL}/movies`) {
+    tpdbFx.pageReads.set(p, (tpdbFx.pageReads.get(p) ?? 0) + 1);
+    const page = Number(url.searchParams.get("page") ?? "1");
+    const start = (page - 1) * 24;
+    return json(res, 200, {
+      data: Array.from({ length: 24 }, (_, i) => ({
+        ...tpdbMovieRow(capFillId(start + i + 1)),
+        title: `Pending Cap ${start + i + 1}`,
       })),
       meta: { total: 120 },
       links: page < 5 ? { next: "https://fixture.test/next" } : {},
@@ -1081,6 +1345,54 @@ async function stashdbHandler(
     });
   }
   if (query.includes("queryScenes")) {
+    const input = (
+      body.variables as
+        | {
+            f?: {
+              text?: string;
+              date?: { value: string; modifier: string };
+              sort?: string;
+              direction?: string;
+              page?: number;
+              per_page?: number;
+            };
+          }
+        | undefined
+    )?.f;
+    if (historicalBrowseMode && input?.text === HISTORICAL_BROWSE_QUERY) {
+      historicalBrowseMode.reads.scene += 1;
+      const operators: Record<string, string> = {
+        LESS_THAN: "<",
+        EQUALS: "=",
+        GREATER_THAN: ">",
+      };
+      const rows = historicalBrowseRows(
+        input.date?.value,
+        input.date ? operators[input.date.modifier] : undefined,
+        input.sort === "DATE" && input.direction === "ASC",
+      );
+      const page = input.page ?? 1;
+      const perPage = input.per_page ?? 50;
+      return json(res, 200, {
+        data: {
+          queryScenes: {
+            count: rows.length,
+            scenes: rows
+              .slice((page - 1) * perPage, page * perPage)
+              .map((row) => ({
+                ...row,
+                title: `${HISTORICAL_BROWSE_QUERY} ${row.id}`,
+                duration: 600,
+                urls: [],
+                images: [],
+                studio: { id: STASH_STUDIO, name: "Fixture Studio" },
+                tags: [],
+                performers: [],
+              })),
+          },
+        },
+      });
+    }
     return json(res, 200, {
       data: {
         queryScenes: {
@@ -1302,9 +1614,23 @@ function cookieOf(response: Response): string {
 }
 
 async function loginAs(name: string): Promise<string> {
-  const res = await call("POST", "/api/login", {
-    body: { username: name, password: `pass-${name}` },
-  });
+  const attempt = () =>
+    call("POST", "/api/login", {
+      body: { username: name, password: `pass-${name}` },
+    });
+  let res = await attempt();
+  // CI run 45055559291 failed one login with 502 upstream_unavailable
+  // ("Jellyfin could not be reached."): the upstream fetch threw, so the
+  // fixture never returned a status. The runner was saturated — four test
+  // files on four vCPUs, directly after the 50 000-row pagination test —
+  // while the keep-alive defaults probe clean and six stressed runs pass.
+  // That points at runner timing, not app code. One retry rides out the
+  // transient; a real outage fails every login, so the second response is
+  // still asserted below.
+  if (res.status === 502) {
+    await res.text();
+    res = await attempt();
+  }
   const text = await res.text();
   assert.equal(
     res.status,
@@ -2077,13 +2403,93 @@ test("setup secret guesses are bounded per source", async () => {
   }
 });
 
-test("rotating X-Forwarded-For values cannot escape the global setup-secret cap", async () => {
-  // The per-source key is the first X-Forwarded-For entry, which the client
-  // controls (Next fills the header from the socket only when it is absent,
-  // and appending proxies keep the client's value first). A fresh value per
-  // guess dodges the per-source bucket, so the spray cap shared with
-  // sign-in (GLOBAL_LIMIT, 300 per five-minute window) is what bounds an
-  // unauthenticated guesser before the first admin exists.
+test("without a trusted proxy, setup attempts share one bounded bucket", async () => {
+  // The handler cannot tell a client-supplied X-Forwarded-For from the
+  // one Next fills with the socket address, so without
+  // VELVARR_TRUSTED_PROXY every setup attempt keys on one shared
+  // "unverified" source. A spoofed-header flood stays bounded - five
+  // gate guesses, then five exempt compares, then refusals without a
+  // compare - but it can deny that one shared source for the rest of
+  // the window, the owner's correct secret included. That residual is
+  // the cost of direct exposure; the saturated-cap test pins the
+  // trusted-proxy topology that removes it.
+  resetLoginBuckets();
+  const wrong = {
+    ...inspectBody(),
+    setupSecret: "wrong-secret-wrong-secret-wrong-secret!",
+  };
+  const source = (n: number) => ({
+    "x-forwarded-for": `198.51.${Math.floor(n / 256)}.${n % 256}`,
+  });
+  const originalWarn = console.warn;
+  console.warn = () => {};
+  try {
+    for (let guess = 0; guess < 5; guess += 1) {
+      await errorShape(
+        await call("POST", "/api/setup/inspect", {
+          headers: source(guess),
+          body: { ...wrong },
+        }),
+        403,
+      );
+    }
+    // The shared source bucket is full: further guesses are refused and
+    // each pays one of the five exempt compare slots.
+    for (const guess of [5, 6, 7, 8, 9]) {
+      await errorShape(
+        await call("POST", "/api/setup/inspect", {
+          headers: source(guess),
+          body: { ...wrong },
+        }),
+        429,
+      );
+    }
+    // The compare budget is spent: refusal without a compare, whatever
+    // the header says.
+    const budgetGone = await errorShape(
+      await call("POST", "/api/setup/inspect", {
+        headers: source(10),
+        body: { ...wrong },
+      }),
+      429,
+    );
+    assert.equal(budgetGone.code, "too_many_attempts");
+    // The shared key couples attacker and owner: the owner's correct
+    // secret keys on the same shared source and is refused until the
+    // window rolls. Pinned, disclosed residual of direct exposure.
+    const ownerDenied = await errorShape(
+      await call("POST", "/api/setup/inspect", { body: inspectBody() }),
+      429,
+    );
+    assert.equal(ownerDenied.code, "too_many_attempts");
+    // With the trusted proxy configured, the same owner request keys on
+    // the address the proxy appended: fresh source, proof accepted.
+    process.env.VELVARR_TRUSTED_PROXY = "1";
+    const proxied = await call("POST", "/api/setup/inspect", {
+      headers: { "x-forwarded-for": "192.0.2.140" },
+      body: inspectBody(),
+    });
+    assert.equal(proxied.status, 200);
+  } finally {
+    console.warn = originalWarn;
+    resetLoginBuckets();
+    delete process.env.VELVARR_TRUSTED_PROXY;
+  }
+});
+
+test("a saturated setup cap keeps compares bounded and accepts the owner's secret", async () => {
+  // Behind a trusted proxy the limiter keys on the last X-Forwarded-For
+  // entry, the one the proxy appended. Enough sources can still fill the
+  // global cap, so the owner's proof must survive a full window - but
+  // never as a free compare. Under a saturated window every compare
+  // pays the source's own five-per-window compare budget, so
+  // 429-versus-200 stays a bounded oracle per source - ten compares per
+  // source per window in total: five at the gate, five exempt. A source
+  // that spent its own budget is refused without a compare until the
+  // window rolls, and the owner's browser, which has not been guessing,
+  // still has its own budget no matter how many other sources spent
+  // theirs.
+  process.env.VELVARR_TRUSTED_PROXY = "1";
   resetLoginBuckets();
   const wrong = {
     ...inspectBody(),
@@ -2104,25 +2510,70 @@ test("rotating X-Forwarded-For values cannot escape the global setup-secret cap"
         403,
       );
     }
-    const inspect = await errorShape(
+    // Saturated: the global cap refuses a fresh source before any
+    // compare runs.
+    const saturated = await errorShape(
       await call("POST", "/api/setup/inspect", {
-        headers: source(300),
+        headers: source(999),
         body: { ...wrong },
       }),
       429,
     );
-    assert.equal(inspect.code, "too_many_attempts");
-    const commit = await errorShape(
-      await call("POST", "/api/setup", {
-        headers: source(301),
-        body: { ...wrong, libraryIds: [MOVIES_LIB] },
+    assert.equal(saturated.code, "too_many_attempts");
+    // The owner's proof survives the full window: the compare runs on
+    // the owner's untouched compare budget and refunds its slot.
+    const owner = await call("POST", "/api/setup/inspect", {
+      headers: source(1000),
+      body: inspectBody(),
+    });
+    assert.equal(owner.status, 200);
+    // A source that guesses inside the saturated window pays its own
+    // compare budget: five compares, then refusal without a compare.
+    const sprayKey = source(1001)["x-forwarded-for"];
+    for (let guess = 0; guess < 5; guess += 1) {
+      await errorShape(
+        await call("POST", "/api/setup/inspect", {
+          headers: { "x-forwarded-for": sprayKey },
+          body: { ...wrong },
+        }),
+        429,
+      );
+    }
+    // The spent budget holds even for the correct secret from that same
+    // source - self-inflicted by its own wrong guesses, gone when the
+    // window rolls. A fresh source still proves ownership.
+    const spent = await errorShape(
+      await call("POST", "/api/setup/inspect", {
+        headers: { "x-forwarded-for": sprayKey },
+        body: inspectBody(),
       }),
       429,
     );
-    assert.equal(commit.code, "too_many_attempts");
+    assert.equal(spent.code, "too_many_attempts");
+    // A fleet of sources can spend every source's own compare budget -
+    // there is no global compare ceiling to fill - and the owner still
+    // passes from a fresh source. Six more sources burn theirs.
+    for (const fleet of [1002, 1003, 1004, 1005, 1006, 1007]) {
+      const fleetKey = source(fleet)["x-forwarded-for"];
+      for (let guess = 0; guess < 5; guess += 1) {
+        await errorShape(
+          await call("POST", "/api/setup/inspect", {
+            headers: { "x-forwarded-for": fleetKey },
+            body: { ...wrong },
+          }),
+          429,
+        );
+      }
+    }
+    const fresh = await call("POST", "/api/setup/inspect", {
+      headers: source(1008),
+      body: inspectBody(),
+    });
+    assert.equal(fresh.status, 200);
   } finally {
     console.warn = originalWarn;
     resetLoginBuckets();
+    delete process.env.VELVARR_TRUSTED_PROXY;
   }
 });
 
@@ -2623,9 +3074,11 @@ test("library detail: catalog enrichment via whisparr path mappings", async (t) 
       item: { kind: string };
       catalog?: unknown;
       catalogNote?: string;
+      catalogIssue?: string;
     };
     assert.equal(ambiguousBody.catalog, undefined);
     assert.equal(typeof ambiguousBody.catalogNote, "string");
+    assert.equal(ambiguousBody.catalogIssue, "ambiguous");
     // Ambiguous identity: no upgrade, the honest Jellyfin kind stays.
     assert.equal(ambiguousBody.item.kind, "movie");
     whisparrMovies.pop();
@@ -2639,9 +3092,12 @@ test("library detail: catalog enrichment via whisparr path mappings", async (t) 
     const bareBody = (await bare.json()) as {
       catalog?: unknown;
       catalogNote?: string;
+      catalogIssue?: string;
     };
     assert.equal(bareBody.catalog, undefined);
     assert.equal(bareBody.catalogNote, undefined);
+    // A plain absence is no issue: the page shows a neutral "No catalog match".
+    assert.equal(bareBody.catalogIssue, undefined);
 
     // Whisparr configured but unreachable: the failure is named, not hidden.
     assert.equal((await saveWhisparr("http://127.0.0.1:9")).status, 200);
@@ -2652,13 +3108,15 @@ test("library detail: catalog enrichment via whisparr path mappings", async (t) 
     const outageBody = (await outage.json()) as {
       catalog?: unknown;
       catalogNote?: string;
+      catalogIssue?: string;
     };
     assert.equal(outageBody.catalog, undefined);
     assert.equal(typeof outageBody.catalogNote, "string");
+    assert.equal(outageBody.catalogIssue, "failed");
 
-    // Whisparr unconfigured: no catalog, no note. A blank URL clears the
-    // connection, so the body must not also carry the key — key + blank URL
-    // is rejected by the integrations validation, never dropped.
+    // Whisparr unconfigured: no catalog, and a note that names the cause.
+    // A blank URL clears the connection, so the body must not also carry the
+    // key — key + blank URL is rejected by the integrations validation.
     assert.equal(
       (
         await call("PATCH", "/api/admin/integrations", {
@@ -2679,9 +3137,16 @@ test("library detail: catalog enrichment via whisparr path mappings", async (t) 
     const unconfiguredBody = (await unconfigured.json()) as {
       catalog?: unknown;
       catalogNote?: string;
+      catalogIssue?: string;
     };
     assert.equal(unconfiguredBody.catalog, undefined);
-    assert.equal(unconfiguredBody.catalogNote, undefined);
+    // Contract move: this used to be no note, so the page claimed "no
+    // provider match" when nothing could ever match. The cause is named now.
+    assert.match(
+      unconfiguredBody.catalogNote ?? "",
+      /Whisparr is not connected/,
+    );
+    assert.equal(unconfiguredBody.catalogIssue, "not_connected");
   } finally {
     // Leave whisparr removed: later tests re-establish it themselves.
     await call("PATCH", "/api/admin/integrations", {
@@ -3412,6 +3877,43 @@ test("login admission: outsider denied, logout revokes immediately", async () =>
   assert.deepEqual(await out.json(), { ok: true });
   assert.match(out.headers.get("set-cookie") ?? "", /velvarr_session=/);
   assert.equal((await call("GET", "/api/me", { cookie: member })).status, 401);
+});
+
+test("logout with a planted duplicate cookie revokes the real session", async () => {
+  // boot() arms the fixture integrations so a --test-name-pattern run that
+  // filters to only this test still has a bootstrapped instance to sign
+  // into. Its provider env is restored after, so later tests see the
+  // environment they saw before this one — the requests tests assert
+  // StashDB unconfigured.
+  const prevTpdb = process.env.TPDB_API_TOKEN;
+  const prevTpdbBase = process.env.TPDB_BASE_URL;
+  const prevStash = process.env.STASHDB_API_KEY;
+  const prevStashBase = process.env.STASHDB_BASE_URL;
+  try {
+    await boot();
+    // A same-host sibling origin can plant a narrower-Path velvarr_session;
+    // the browser sends it first (RFC 6265 §5.4). Sign out must revoke every
+    // copy in the header: the planted one is dead anyway, but the real
+    // session behind it must not survive a 200 {ok:true}.
+    const real = await loginAs("member");
+    const dup = await call("POST", "/api/logout", {
+      body: {},
+      cookie: `velvarr_session=planted; ${real}`,
+    });
+    assert.equal(dup.status, 200);
+    assert.deepEqual(await dup.json(), { ok: true });
+    // What the browser still sends afterwards is only the real Path=/ copy.
+    assert.equal((await call("GET", "/api/me", { cookie: real })).status, 401);
+  } finally {
+    if (prevTpdb === undefined) delete process.env.TPDB_API_TOKEN;
+    else process.env.TPDB_API_TOKEN = prevTpdb;
+    if (prevTpdbBase === undefined) delete process.env.TPDB_BASE_URL;
+    else process.env.TPDB_BASE_URL = prevTpdbBase;
+    if (prevStash === undefined) delete process.env.STASHDB_API_KEY;
+    else process.env.STASHDB_API_KEY = prevStash;
+    if (prevStashBase === undefined) delete process.env.STASHDB_BASE_URL;
+    else process.env.STASHDB_BASE_URL = prevStashBase;
+  }
 });
 
 // --- M2 phase 3: catalog, requests, availability ---
@@ -4667,6 +5169,24 @@ test("catalog artwork proxy: query and non-image paths refused; misses charge, c
   assert.equal(apiAfter.status, 200, "dispatch survives a drained art lane");
 });
 
+test("tile URLs carry the artwork variant generation marker (VELV-207)", () => {
+  const target = "https://image.tpdb.example/poster.jpg";
+  // imgSrc in src/components/shared.tsx builds every provider tile through
+  // catalogImageUrl: the v parameter is the variant generation, so a recipe
+  // change also changes the browser cache key. v0.43.0 shipped the
+  // marker-less URL and kept its pre-sharp bytes cached for up to a year.
+  assert.equal(
+    catalogImageUrl(target, 400),
+    `/api/catalog/image?url=${encodeURIComponent(target)}&w=400&v=c`,
+  );
+  // No width rung: the passthrough bytes never depend on the variant
+  // recipe, so the URL keeps the marker-less identity.
+  assert.equal(
+    catalogImageUrl(target),
+    `/api/catalog/image?url=${encodeURIComponent(target)}`,
+  );
+});
+
 test("catalog artwork width: ladder validation, variant headers, no-upscale passthrough, 304", async () => {
   resetRateBuckets();
   // A real resolvable source well above the ladder rung: the 400w request
@@ -4694,9 +5214,13 @@ test("catalog artwork width: ladder validation, variant headers, no-upscale pass
   const meta = await sharp(Buffer.from(await variant.arrayBuffer())).metadata();
   assert.equal(meta.width, 400);
   assert.equal(meta.format, "webp");
-  // The ETag is the variant file name: <sha256(source)>-<width>.
+  // The ETag is the variant file name: <sha256(source)>-<width>c. The
+  // marker rides with the bytes: v0.43.0 ETagged different 400w bytes as
+  // "<sha256>-<width>", and a browser that cached those bytes under
+  // immutable cache-control never asked again (VELV-207).
   const variantEtag = variant.headers.get("etag");
-  assert.match(variantEtag ?? "", /^"[0-9a-f]{64}-400"$/);
+  assert.match(variantEtag ?? "", /^"[0-9a-f]{64}-400c"$/);
+  assert.doesNotMatch(variantEtag ?? "", /^"[0-9a-f]{64}-400"$/);
   assert.equal(
     variant.headers.get("cache-control"),
     "private, max-age=31536000, immutable",
@@ -4770,6 +5294,96 @@ test("catalog artwork width: ladder validation, variant headers, no-upscale pass
   assert.equal(plain.headers.get("etag"), passthrough.headers.get("etag"));
 });
 
+test("catalog artwork width: cached passthrough preserves its index and skips expiry sweeps", async () => {
+  resetRateBuckets();
+  resetMetaCache();
+  const indexDir = join(apiDataDir, "artwork", "index");
+  const imageUrl = (name: string) => `${tpdbUrl}/artwork-warm-${name}.png`;
+  const requestPath = (url: string) =>
+    `/api/catalog/image?url=${encodeURIComponent(url)}&w=600`;
+  const indexPath = (url: string) =>
+    join(indexDir, createHash("sha256").update(url).digest("hex"));
+
+  // Both entries come from authenticated width requests to the local fixture.
+  const unrelatedUrl = imageUrl("expired");
+  const unrelated = await call("GET", requestPath(unrelatedUrl), {
+    cookie: member,
+  });
+  assert.equal(unrelated.status, 200);
+  const unrelatedIndex = indexPath(unrelatedUrl);
+  assert.ok(existsSync(unrelatedIndex));
+
+  const sourceUrl = imageUrl("tiny");
+  const callsBefore = tpdbFx.calls;
+  const initial = await call("GET", requestPath(sourceUrl), { cookie: member });
+  assert.equal(initial.status, 200);
+  assert.equal(initial.headers.get("content-type"), "image/png");
+  assert.deepEqual(new Uint8Array(await initial.arrayBuffer()), PNG_1PX);
+  const etag = initial.headers.get("etag");
+  assert.match(etag ?? "", /^"[A-Za-z0-9_-]{43}"$/);
+  const sourceIndex = indexPath(sourceUrl);
+  const indexContent = readFileSync(sourceIndex, "utf8");
+  assert.equal(
+    etag,
+    `"${Buffer.from(indexContent, "hex").toString("base64url")}"`,
+  );
+  assert.equal(
+    existsSync(
+      join(
+        apiDataDir,
+        "artwork",
+        indexContent.slice(0, 2),
+        `${indexContent}-600c.webp`,
+      ),
+    ),
+    false,
+    "a tiny source must not create a variant",
+  );
+
+  const fresh = new Date(Date.now() - 60 * 60_000);
+  utimesSync(sourceIndex, fresh, fresh);
+  const freshMtime = statSync(sourceIndex).mtimeMs;
+  const expired = new Date(Date.now() - 25 * 60 * 60_000);
+  utimesSync(unrelatedIndex, expired, expired);
+
+  for (let i = 0; i < 3; i += 1) {
+    const cached = await call("GET", requestPath(sourceUrl), {
+      cookie: member,
+    });
+    assert.equal(cached.status, 200);
+    assert.equal(cached.headers.get("content-type"), "image/png");
+    assert.deepEqual(new Uint8Array(await cached.arrayBuffer()), PNG_1PX);
+    assert.equal(cached.headers.get("etag"), etag);
+    assert.equal(
+      tpdbFx.calls - callsBefore,
+      1,
+      "the source cache avoids fetches",
+    );
+    assert.equal(readFileSync(sourceIndex, "utf8"), indexContent);
+    assert.equal(
+      statSync(sourceIndex).mtimeMs,
+      freshMtime,
+      "cached passthrough must not rewrite or refresh the index",
+    );
+    assert.ok(
+      existsSync(unrelatedIndex),
+      "cached passthrough must not sweep unrelated expired entries",
+    );
+  }
+
+  // A new URL needs a real index write, which must still sweep expired entries.
+  const newUrl = imageUrl("new");
+  const written = await call("GET", requestPath(newUrl), { cookie: member });
+  assert.equal(written.status, 200);
+  assert.deepEqual(new Uint8Array(await written.arrayBuffer()), PNG_1PX);
+  assert.ok(existsSync(indexPath(newUrl)));
+  assert.equal(
+    existsSync(unrelatedIndex),
+    false,
+    "an actual index write must sweep unrelated expired entries",
+  );
+});
+
 test("catalog artwork width: an evicted variant regenerates over HTTP", async () => {
   resetRateBuckets();
   // Three distinct resolvable sources: each upstream path answers its own
@@ -4796,7 +5410,7 @@ test("catalog artwork width: an evicted variant regenerates over HTTP", async ()
   });
   assert.equal(first.status, 200);
   const etag1 = first.headers.get("etag");
-  assert.match(etag1 ?? "", /^"[0-9a-f]{64}-400"$/);
+  assert.match(etag1 ?? "", /^"[0-9a-f]{64}-400c"$/);
 
   // Cap the store at zero spare bytes: the next variant write sweeps every
   // older entry except the one just written, evicting the first variant.
@@ -4826,6 +5440,206 @@ test("catalog artwork width: an evicted variant regenerates over HTTP", async ()
   } finally {
     setArtworkStoreBudgetForTest(null);
   }
+});
+
+test("catalog artwork proxy: URL spellings share one upstream fetch and index entry", async () => {
+  resetRateBuckets();
+  resetMetaCache();
+  const indexDir = join(apiDataDir, "artwork", "index");
+  const indexBefore = readdirSync(indexDir).length;
+  const callsBefore = tpdbFx.calls;
+  const dotted = await call(
+    "GET",
+    `/api/catalog/image?url=${encodeURIComponent(`${tpdbUrl}/a/./b.jpg`)}&w=400`,
+    { cookie: member },
+  );
+  const plain = await call(
+    "GET",
+    `/api/catalog/image?url=${encodeURIComponent(`${tpdbUrl}/a/b.jpg`)}&w=400`,
+    { cookie: member },
+  );
+  for (const response of [dotted, plain]) {
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get("content-type"), "image/png");
+    assert.deepEqual(new Uint8Array(await response.arrayBuffer()), PNG_1PX);
+  }
+  assert.equal(dotted.headers.get("etag"), plain.headers.get("etag"));
+  assert.equal(tpdbFx.calls - callsBefore, 1);
+  assert.equal(readdirSync(indexDir).length - indexBefore, 1);
+
+  // Without a width, only the source memory cache can avoid another fetch.
+  const memory = await call(
+    "GET",
+    `/api/catalog/image?url=${encodeURIComponent(`${tpdbUrl}/a/step/../b.jpg`)}`,
+    { cookie: member },
+  );
+  assert.equal(memory.status, 200);
+  assert.deepEqual(new Uint8Array(await memory.arrayBuffer()), PNG_1PX);
+  assert.equal(memory.headers.get("etag"), plain.headers.get("etag"));
+  assert.equal(tpdbFx.calls - callsBefore, 1);
+});
+
+test("catalog artwork proxy: each index entry costs at least 4096 bytes", async () => {
+  resetRateBuckets();
+  const indexDir = join(apiDataDir, "artwork", "index");
+  const indexBefore = readdirSync(indexDir).length;
+  const storeBefore = artworkStoreStateForTest();
+  const response = await call(
+    "GET",
+    `/api/catalog/image?url=${encodeURIComponent(`${tpdbUrl}/artwork-allocation.jpg`)}&w=400`,
+    { cookie: member },
+  );
+  assert.equal(response.status, 200);
+  assert.deepEqual(new Uint8Array(await response.arrayBuffer()), PNG_1PX);
+  assert.equal(readdirSync(indexDir).length - indexBefore, 1);
+  const store = artworkStoreStateForTest();
+  assert.equal(store.files - storeBefore.files, 1);
+  const counted = store.bytes - storeBefore.bytes;
+  assert.ok(
+    counted >= 4096,
+    `index file counted at ${counted} bytes, below one 4 KiB block`,
+  );
+});
+
+test("catalog artwork proxy: concurrent URL spellings share one miss charge", async () => {
+  resetRateBuckets();
+  resetMetaCache();
+  const indexDir = join(apiDataDir, "artwork", "index");
+  const indexBefore = readdirSync(indexDir).length;
+  const callsBefore = tpdbFx.calls;
+  let charges = 0;
+  const onMiss = () => {
+    charges += 1;
+    chargeRateBudget(MEMBER_ID, "artwork");
+  };
+  // Direct calls enter the source cache before either network read resolves.
+  const [dotted, plain] = await Promise.all([
+    fetchProviderArtwork(`${tpdbUrl}/concurrent/a/./b.jpg`, {
+      width: 400,
+      onMiss,
+    }),
+    fetchProviderArtwork(`${tpdbUrl}/concurrent/a/b.jpg`, {
+      width: 400,
+      onMiss,
+    }),
+  ]);
+  assert.equal(charges, 1);
+  assert.equal(tpdbFx.calls - callsBefore, 1);
+  assert.equal(readdirSync(indexDir).length - indexBefore, 1);
+  for (const result of [dotted, plain]) {
+    assert.equal(result.contentType, "image/png");
+    assert.deepEqual(result.bytes, PNG_1PX);
+  }
+  const memory = await fetchProviderArtwork(
+    `${tpdbUrl}/concurrent/a/step/../b.jpg`,
+    { onMiss },
+  );
+  assert.deepEqual(memory.bytes, PNG_1PX);
+  assert.equal(charges, 1);
+  assert.equal(tpdbFx.calls - callsBefore, 1);
+});
+
+test("catalog artwork proxy: another URL spelling reads the disk variant after a memory reset", async () => {
+  resetRateBuckets();
+  resetMetaCache();
+  artworkSources.set(
+    "/artwork-disk/a/b.jpg",
+    await sharp({
+      create: {
+        width: 810,
+        height: 1210,
+        channels: 3,
+        background: { r: 43, g: 91, b: 177 },
+      },
+    })
+      .png()
+      .toBuffer(),
+  );
+  const indexDir = join(apiDataDir, "artwork", "index");
+  const indexBefore = readdirSync(indexDir).length;
+  const callsBefore = tpdbFx.calls;
+  const first = await call(
+    "GET",
+    `/api/catalog/image?url=${encodeURIComponent(`${tpdbUrl}/artwork-disk/a/./b.jpg`)}&w=400`,
+    { cookie: member },
+  );
+  assert.equal(first.status, 200);
+  assert.equal(first.headers.get("content-type"), "image/webp");
+  const bytes = Buffer.from(await first.arrayBuffer());
+  // 810x1210 is a bit wider than 2:3: the 600 px cover height binds.
+  const meta = await sharp(bytes).metadata();
+  assert.deepEqual([meta.width, meta.height], [402, 600]);
+  assert.equal(tpdbFx.calls - callsBefore, 1);
+  resetMetaCache();
+  const stored = await call(
+    "GET",
+    `/api/catalog/image?url=${encodeURIComponent(`${tpdbUrl}/artwork-disk/a/step/../b.jpg?#`)}&w=400`,
+    { cookie: member },
+  );
+  assert.equal(stored.status, 200);
+  assert.equal(stored.headers.get("content-type"), "image/webp");
+  assert.equal(stored.headers.get("etag"), first.headers.get("etag"));
+  assert.equal(
+    stored.headers.get("cache-control"),
+    "private, max-age=31536000, immutable",
+  );
+  assert.deepEqual(Buffer.from(await stored.arrayBuffer()), bytes);
+  assert.equal(tpdbFx.calls - callsBefore, 1);
+  assert.equal(readdirSync(indexDir).length - indexBefore, 1);
+});
+
+test("catalog artwork proxy: generated equivalent URL spellings share source and index identity", async () => {
+  const archiveDir = testTempDir("velvarr-artwork-property-index-");
+  let sample = 0;
+  await fc.assert(
+    fc.asyncProperty(
+      fc.array(fc.constantFrom("./", "step/../", "./step/../"), {
+        minLength: 1,
+        maxLength: 8,
+      }),
+      fc.constantFrom("", "?", "#", "?#"),
+      async (segments, suffix) => {
+        resetRateBuckets();
+        resetMetaCache();
+        // A fresh path also keeps replay and shrink attempts independent.
+        const base = `${tpdbUrl}/artwork-property-${sample++}/a/`;
+        const canonical = `${base}b.jpg`;
+        const alternate = `${base}${segments.join("")}b.jpg${suffix}`;
+        const indexDir = join(apiDataDir, "artwork", "index");
+        const indexBefore = readdirSync(indexDir).length;
+        const storeBefore = artworkStoreStateForTest();
+        const callsBefore = tpdbFx.calls;
+        for (const url of [alternate, canonical]) {
+          const response = await call(
+            "GET",
+            `/api/catalog/image?url=${encodeURIComponent(url)}&w=400`,
+            { cookie: member },
+          );
+          assert.equal(response.status, 200);
+          assert.equal(response.headers.get("content-type"), "image/png");
+          assert.deepEqual(
+            new Uint8Array(await response.arrayBuffer()),
+            PNG_1PX,
+          );
+        }
+        const memory = await call(
+          "GET",
+          `/api/catalog/image?url=${encodeURIComponent(`${base}./b.jpg#`)}`,
+          { cookie: member },
+        );
+        assert.equal(memory.status, 200);
+        assert.deepEqual(new Uint8Array(await memory.arrayBuffer()), PNG_1PX);
+        assert.equal(tpdbFx.calls - callsBefore, 1);
+        assert.equal(readdirSync(indexDir).length - indexBefore, 1);
+        assert.ok(artworkStoreStateForTest().bytes - storeBefore.bytes >= 4096);
+        // Retain each sample outside the active store after all assertions pass.
+        // Later samples need no prior index, so their scans stay bounded.
+        const indexKey = createHash("sha256").update(canonical).digest("hex");
+        renameSync(join(indexDir, indexKey), join(archiveDir, indexKey));
+      },
+    ),
+    { examples: [[["./"], ""]] },
+  );
 });
 
 test("requests: lifecycle, autoApprove, privacy, roles, origin", async () => {
@@ -5446,6 +6260,116 @@ test("availability: distinct verdicts under the caller's own token", async () =>
   );
 });
 
+test("availability: a title grabbed in Whisparr directly is matched through Whisparr's folder", async () => {
+  // No Velvarr request exists for this id, so no acquisition carries a path:
+  // the folder must come from Whisparr's own list (the reported "Request
+  // this title" on a scene that was already in the library).
+  await boot();
+  const member = await loginAs("member");
+  fx.fail.items = 0;
+  const DIRECT = "7a1b2c3d-1111-4222-8333-0000000d1a1c";
+  const UNKNOWN = "7a1b2c3d-1111-4222-8333-0000000d1a1d";
+  // Written out in full: other tests swap whisparrMovies[0] in and out.
+  whisparrMovies.push({
+    id: 499,
+    title: "Grabbed Directly",
+    monitored: true,
+    path: `/data/whisparr/${ITEM_MOVIE}.mkv`,
+    hasFile: true,
+    movieFileId: 9,
+    sizeOnDisk: 1,
+    added: "2026-11-19T12:00:00Z",
+    tmdbId: 0,
+    tpdbId: DIRECT,
+    foreignId: `tpdbId:${DIRECT}`,
+    itemType: "movie",
+    statistics: { movieFileCount: 1, sizeOnDisk: 1 },
+  });
+  // Restore exactly what this test changes, so later tests see the same
+  // Whisparr settings.
+  const before = (
+    (await (
+      await call("GET", "/api/admin/integrations", { cookie: owner })
+    ).json()) as {
+      whisparr: { url: string; pathMappings: unknown[] } | null;
+    }
+  ).whisparr;
+  const save = (url: string, pathMappings: unknown[]) =>
+    call("PATCH", "/api/admin/integrations", {
+      cookie: owner,
+      body: {
+        jellyfinUrl,
+        jellyfinExternalUrl: jellyfinUrl,
+        whisparrUrl: url,
+        ...(url ? { whisparrApiKey: whisparrKey } : {}),
+        pathMappings,
+      },
+    });
+  const mappings = [
+    { whisparrPrefix: "/data/whisparr", jellyfinPrefix: "/media" },
+  ];
+  // Change the settings only when they differ: a URL move rotates the
+  // Whisparr identity, which later tests depend on.
+  const differs =
+    before?.url !== whisparrUrl ||
+    JSON.stringify(before.pathMappings) !== JSON.stringify(mappings);
+  try {
+    if (differs) assert.equal((await save(whisparrUrl, mappings)).status, 200);
+    resetMovieListCache();
+    resetSweepCache();
+    const outcome = async (id: string) =>
+      (await (
+        await call("GET", `/api/availability/tpdb/movie/${id}`, {
+          cookie: member,
+        })
+      ).json()) as { outcome: string; item?: { id: string } };
+    const direct = await outcome(DIRECT);
+    assert.equal(direct.outcome, "available");
+    assert.equal(direct.item?.id, ITEM_MOVIE);
+    // An id Whisparr does not hold gets no folder and stays missing.
+    assert.equal((await outcome(UNKNOWN)).outcome, "missing");
+  } finally {
+    whisparrMovies.pop();
+    resetMovieListCache();
+    if (differs) await save(before?.url ?? "", before?.pathMappings ?? []);
+  }
+});
+
+test("availability: a held-open Whisparr movie list cannot stall the badge past the hint deadline", async () => {
+  // The folder hint is optional: with the unfiltered list response held
+  // open, the badge must answer inside the short hint deadline (2 s) with
+  // a verdict — never wait out the upstream 15 s list timeout.
+  await boot();
+  const member = await loginAs("member");
+  fx.fail.items = 0;
+  resetMovieListCache();
+  resetSweepCache();
+  const UNKNOWN = "7a1b2c3d-1111-4222-8333-0000000d1a2b";
+  const release = Promise.withResolvers<void>();
+  fx.holdMovieList = release.promise;
+  try {
+    // The elapsed bound is the subject of this test: it asserts real
+    // latency against the platform clock, which deterministic time control
+    // cannot drive across the fixture server's HTTP round trip.
+    const started = Date.now();
+    const res = await call("GET", `/api/availability/tpdb/movie/${UNKNOWN}`, {
+      cookie: member,
+    });
+    const elapsedMs = Date.now() - started;
+    assert.equal(res.status, 200);
+    const body = (await res.json()) as { outcome: string };
+    assert.equal(body.outcome, "missing");
+    assert.ok(
+      elapsedMs < 10_000,
+      `availability answered in ${elapsedMs} ms; the folder hint must give up near its 2 s deadline instead of waiting for the held 15 s list fetch`,
+    );
+  } finally {
+    release.resolve();
+    resetMovieListCache();
+    resetSweepCache();
+  }
+});
+
 test("availability: the catalog year reaches the judgment; no detail read without a title hint", async () => {
   // Exact title "Alpha Movie", but the catalog record (fixture row date
   // 2024-02-03) contradicts the library item's ProductionYear 2020: the year
@@ -5977,14 +6901,14 @@ test("discover: mixed new releases, honest trending, facets, grants, not-configu
   const studiosShelf = byId.get("studios");
   const genresShelf = byId.get("genres");
   for (const shelf of [studiosShelf, genresShelf]) {
-    assert.equal(shelf?.kind, "facets", shelf?.id);
-    assert.equal(shelf?.source, "velvarr", shelf?.id);
+    assert.equal(shelf?.kind, "facets", String(shelf?.id));
+    assert.equal(shelf?.source, "velvarr", String(shelf?.id));
     // The headline arrows lead to the facet directory overview.
     assert.deepEqual(shelf?.browse, {
       view: "facets",
       params: { kind: shelf?.id },
     });
-    assert.equal(shelf?.error, undefined, shelf?.id);
+    assert.equal(shelf?.error, undefined, String(shelf?.id));
     assert.ok((shelf?.items?.length ?? 0) > 0, `${shelf?.id} carries items`);
   }
   // Projects each tile to the pinned wire fields and compares as an
@@ -6857,7 +7781,9 @@ interface BulkCounters {
   autoApproved: number;
   failed: { id: string; code: string }[];
   scanned: number;
-  capped: boolean;
+  /** Absent when a `request_limit` stop ends the pass: the body must not
+   * invite another pass while the account cannot hold one more request. */
+  capped?: boolean;
   error?: { code: string; message: string };
 }
 
@@ -7737,6 +8663,86 @@ test("a merge refusal never leaves the auto-followed survivor behind", async () 
   assert.deepEqual(await listedIds(), baseline);
 });
 
+test("a follow whose image url exceeds the pinned limit is refused at the storage root", async () => {
+  const sess = await loginAs("member2");
+  const listedIds = async () => {
+    const res = await call("GET", "/api/follows", { cookie: sess });
+    assert.equal(res.status, 200);
+    const body: { follows: FollowShape[] } = await res.json();
+    return body.follows.map((f) => f.reference.id);
+  };
+  const baseline = await listedIds();
+  // Shaped to pass the provider-artwork gate: the artwork check alone (the
+  // deliberate null-snapshot degradation) must not absorb an overlong url.
+  const long = `https://cdn.theporndb.net/${"a".repeat(FOLLOW_IMAGE_URL_MAX)}`;
+  const created = await call("POST", "/api/follows", {
+    cookie: sess,
+    body: {
+      performer: { provider: "tpdb", kind: "performer", id: randomUUID() },
+      name: "Overlong Snapshot",
+      imageUrl: long,
+    },
+  });
+  assert.equal(created.status, 400);
+  const createdBody = await errorShape(created);
+  assert.equal(createdBody.code, "invalid_field");
+  // The refusal stored nothing: the baseline is untouched.
+  assert.deepEqual(await listedIds(), baseline);
+});
+
+test("follows are capped per account: the follow past the cap is refused and the list stays at the cap", async () => {
+  const sess = await loginAs("member2");
+  const listed = async () => {
+    const res = await call("GET", "/api/follows", { cookie: sess });
+    assert.equal(res.status, 200);
+    const body: { follows: FollowShape[] } = await res.json();
+    return body.follows;
+  };
+  const me = await call("GET", "/api/me", { cookie: sess });
+  assert.equal(me.status, 200);
+  const meBody = (await me.json()) as { account: { id: string } };
+  const accountId = meBody.account.id;
+  const baseline = await listed();
+  // Seed through the storage root up to the cap: the cap is storage law for
+  // every writer; the route refusal below is the wire contract under test.
+  const ref = (i: number) => ({
+    provider: "tpdb" as const,
+    kind: "performer" as const,
+    id: `e1a7c3d9-4f2b-4c8e-a5d6-${String(i).padStart(12, "0")}`,
+  });
+  const seeded: string[] = [];
+  const room = FOLLOW_CAP_PER_ACCOUNT - baseline.length;
+  try {
+    for (let i = 0; i < room; i++) {
+      followPerformer(accountId, ref(i), "Cap Filler", null);
+      seeded.push(ref(i).id);
+    }
+    const refused = await call("POST", "/api/follows", {
+      cookie: sess,
+      body: {
+        performer: ref(FOLLOW_CAP_PER_ACCOUNT),
+        name: "One Too Many",
+      },
+    });
+    assert.equal(refused.status, 409);
+    const refusedBody = await errorShape(refused);
+    assert.equal(refusedBody.code, "follow_cap_reached");
+    // Rows can never exceed the cap, so the full-scan list answers at most
+    // the cap.
+    assert.equal((await listed()).length, FOLLOW_CAP_PER_ACCOUNT);
+  } finally {
+    // Restore the baseline every later test reads: unfollow exactly what
+    // this test seeded (the refusals above stored nothing).
+    for (const id of seeded) {
+      unfollowPerformer(accountId, "tpdb", id);
+    }
+  }
+  assert.deepEqual(
+    (await listed()).map((f) => f.id).sort(),
+    baseline.map((f) => f.id).sort(),
+  );
+});
+
 test("a merge refuses same-provider, unfollowed, and already-merged entries", async () => {
   assert.equal(
     (
@@ -8185,6 +9191,69 @@ test("a browse scan ceiling carries the query facts in the error details", async
   }
 });
 
+test("a worst-case fan-out browse stays at the request-level scan cap", async () => {
+  // VELV-240: 5 fan-out ids x 5 studio seeds once opened 25 TPDB streams,
+  // each free to walk MAX_SCAN_PAGES (40) pages — 1000 upstream reads for
+  // one browse charged a single rate token. The fan group rides native (5
+  // ids fit FANOUT_GROUP_CAP, the combined criterion fits
+  // TAG_FILTER_ID_CAP); the 6-id group misses the cap and re-checks
+  // locally against labels no fixture row carries, so every mapped row
+  // drops and each stream walks the provider `next` links. The browse's
+  // per-provider page pool caps the whole request at MAX_SCAN_PAGES reads.
+  resetMetaCache();
+  const studios = Array.from({ length: 5 }, (_, i) => ({
+    name: `Amplify Studio ${i + 1}`,
+    tpdb: amplificationStudioId(i + 1),
+  }));
+  const include = [
+    // The anchored id puts the plan on the fan-out branch (anchoredIds
+    // non-empty): one all-of stream per fan-group id, so the five studio
+    // seeds open 25 TPDB streams.
+    { name: "Fixture Tag A", tpdb: TAG_A },
+    Array.from({ length: 5 }, (_, i) => ({
+      name: `Amplify Fan ${i + 1}`,
+      tpdb: amplificationFanId(i + 1),
+    })),
+    Array.from({ length: 6 }, (_, i) => ({
+      name: `Amplify Off ${i + 1}`,
+      tpdb: amplificationOffId(i + 1),
+    })),
+  ];
+  const query =
+    `studios=${encodeURIComponent(JSON.stringify(studios))}` +
+    `&include=${encodeURIComponent(JSON.stringify(include))}` +
+    "&page=1&perPage=24";
+  tpdbFx.pageReads.delete("/movies");
+  tpdbFx.amplifyTags = true;
+  try {
+    const res = await call("GET", `/api/browse?type=movie&${query}`, {
+      cookie: member,
+    });
+    assert.equal(res.status, 200);
+    const body = (await res.json()) as BrowsePageBody;
+    // Every stream ended on the spent pool, so the page is the named
+    // partial answer, never an outage-shaped 502.
+    assert.deepEqual(
+      body.errors.map((e) => ({ provider: e.provider, code: e.code })),
+      [{ provider: "tpdb", code: "scan_ceiling" }],
+    );
+    assert.deepEqual(body.items, []);
+    assert.equal(body.hasMore, false);
+    const reads = tpdbFx.pageReads.get("/movies") ?? 0;
+    assert.ok(
+      reads > 0 && reads <= 40,
+      `worst-case browse read ${reads} TPDB pages; the request-level cap is 40 (MAX_SCAN_PAGES)`,
+    );
+  } finally {
+    tpdbFx.amplifyTags = false;
+    tpdbFx.pageReads.delete("/movies");
+    // The run cached the endless band pages for the full TTL; the bulk
+    // phases after this one count their own upstream reads, so they must
+    // start cold.
+    resetMetaCache();
+  }
+});
+
 test("a bulk scan stops at a provider page with no readable titles", async () => {
   const path = `/performers/${TPDB_PERFORMER_UNREADABLE}/movies`;
   tpdbFx.pageReads.delete(path);
@@ -8296,6 +9365,114 @@ test("a second bulk run files the titles past the first 100", async () => {
       (r) => r.media.id === bulkContinuationId(105) && r.decision === "pending",
     ),
   );
+});
+
+test("bulk requests pre-skip a mixed-case provider row and spend the cap on the backlog", async () => {
+  await boot();
+  member = await loginAs("member");
+  // The single-request route stores the lowercase spelling; the filmography
+  // row carries the uppercase one, so the pre-skip must fold case or the
+  // already-filed title eats one of the 100 cap slots.
+  const seeded = await call("POST", "/api/requests", {
+    cookie: member,
+    body: { media: { provider: "tpdb", kind: "movie", id: TPDB_MOVIE_MIXED } },
+  });
+  assert.equal(seeded.status, 201);
+
+  const bulk = await call("POST", "/api/requests/bulk", {
+    cookie: member,
+    body: {
+      performer: {
+        provider: "tpdb",
+        kind: "performer",
+        id: TPDB_PERFORMER_MIXED,
+      },
+      kind: "movie",
+    },
+  });
+  assert.equal(bulk.status, 200);
+  const counters = (await bulk.json()) as BulkCounters;
+  assert.deepEqual(counters, {
+    requested: 100,
+    skipped: 1,
+    autoApproved: 0,
+    failed: [],
+    scanned: 101,
+    capped: false,
+  });
+
+  // The backlog got reached past the mixed-case row, and that title still
+  // holds exactly one intent. Read the rows directly: member's HTTP list is
+  // paginated and the file's earlier tests push these rows past page one.
+  const db = new DatabaseSync(join(apiDataDir, "velvarr.sqlite"));
+  try {
+    const mixed = db
+      .prepare(
+        "SELECT COUNT(*) AS n FROM requests WHERE provider = 'tpdb' AND kind = 'movie' AND lower(external_id) = ?",
+      )
+      .get(TPDB_MOVIE_MIXED) as { n: number };
+    assert.equal(mixed.n, 1, "the mixed-case title holds exactly one intent");
+    const backlog = db
+      .prepare("SELECT COUNT(*) AS n FROM requests WHERE external_id = ?")
+      .get(bulkMixedBacklogId(100)) as { n: number };
+    assert.equal(
+      backlog.n,
+      1,
+      "the last backlog title got filed, so the cap was not spent on the duplicate",
+    );
+  } finally {
+    db.close();
+  }
+});
+
+test("a bulk pass at the pending cap stops at the first refusal and says why", async () => {
+  await boot();
+  const db = new DatabaseSync(join(apiDataDir, "velvarr.sqlite"));
+  const { pending } = db
+    .prepare(
+      "SELECT COUNT(*) AS pending FROM requests WHERE account_id = ? AND decision = 'pending'",
+    )
+    .get(MEMBER_ID) as { pending: number };
+  db.close();
+  const base = seedBase();
+  // Fill member's pending balance to the cap with rows the scan never
+  // touches; dropped again below so later phases keep their own budget.
+  const ids = seedRequests(
+    Array.from({ length: OPEN_REQUEST_CAP - pending }, (_, i) => ({
+      accountId: MEMBER_ID,
+      createdAt: base + i,
+    })),
+  );
+  const path = `/performers/${TPDB_PERFORMER_CAPFILL}/movies`;
+  tpdbFx.pageReads.delete(path);
+  try {
+    const res = await call("POST", "/api/requests/bulk", {
+      cookie: member,
+      body: {
+        performer: {
+          provider: "tpdb",
+          kind: "performer",
+          id: TPDB_PERFORMER_CAPFILL,
+        },
+        kind: "movie",
+      },
+    });
+    assert.equal(res.status, 200);
+    const counters = (await res.json()) as BulkCounters;
+    // The first refused filing ends the pass with the cap's own words:
+    // not a failed[] wall, and not a "press again" hint, because another
+    // pass can hold nothing while the account sits at the cap.
+    assert.equal(counters.error?.code, "request_limit");
+    assert.match(counters.error?.message ?? "", /500 requests waiting/);
+    assert.equal(counters.requested, 0);
+    assert.deepEqual(counters.failed, []);
+    assert.equal("capped" in counters, false);
+    // Five pages fill the pass's own 100-title cap; the refusal then stops
+    // everything, so not one further read happens after it.
+    assert.equal(tpdbFx.pageReads.get(path), 5);
+  } finally {
+    dropRequests(ids);
+  }
 });
 
 test("the autoApprove grant approves bulk requests and attaches the shared acquisition like the single path", async () => {
@@ -8414,6 +9591,154 @@ test("a grant revoked while the request body is read leaves the new request pend
     body: { decision: "cancelled" },
   });
   assert.equal(cancel.status, 200);
+});
+
+// VELV-190: admission snapshots the role before the body is read. An admin
+// demoted while its own body is still in flight must not finish that admin
+// write with the old role (and, on the user PATCH, restore its admin grant).
+test("an admin demoted while its request body is read gets 403 on every admin body route", async () => {
+  await boot();
+  const admin = await loginAs("owner");
+  const setNogrants = async (role: string) => {
+    const res = await call("PATCH", `/api/admin/users/${NOGRANT_ID}`, {
+      cookie: admin,
+      body: { enabled: true, role, libraryIds: [], autoApprove: true },
+    });
+    assert.equal(res.status, 200);
+  };
+  const roleOf = async () => {
+    const listed = await call("GET", "/api/admin/users", { cookie: admin });
+    const { accounts } = (await listed.json()) as {
+      accounts: { id: string; role: string; enabled: boolean }[];
+    };
+    return accounts.find((account) => account.id === NOGRANT_ID)!.role;
+  };
+  const integrations = async () =>
+    (await call("GET", "/api/admin/integrations", { cookie: admin })).json();
+  // Promote, sign in, start the request, demote during the body read, then
+  // let the body finish. Returns the in-flight request's status.
+  const demotedMidBody = async (
+    method: "POST" | "PATCH",
+    path: string,
+    payload: Record<string, unknown>,
+  ): Promise<number> => {
+    await setNogrants("admin");
+    const staleAdmin = await loginAs("nogrants");
+    let demoted = false;
+    // highWaterMark 0: pull runs only when the route reads the body, which
+    // is after admission has loaded the session's account as an admin.
+    const body = new ReadableStream<Uint8Array>(
+      {
+        async pull(controller) {
+          await setNogrants("requester");
+          demoted = (await roleOf()) === "requester";
+          controller.enqueue(new TextEncoder().encode(JSON.stringify(payload)));
+          controller.close();
+        },
+      },
+      { highWaterMark: 0 },
+    );
+    const res = await api[method](
+      new Request(`${ORIGIN}${path}`, {
+        method,
+        headers: {
+          origin: ORIGIN,
+          cookie: staleAdmin,
+          "content-type": "application/json",
+        },
+        body,
+        duplex: "half",
+      } as RequestInit),
+      { params: Promise.resolve({ path: segments(path) }) },
+    );
+    assert.ok(demoted, `${path}: the admin was demoted during the body read`);
+    return res.status;
+  };
+  try {
+    // The confirmed case: a self-promotion must not restore the admin role.
+    assert.deepEqual(
+      {
+        status: await demotedMidBody(
+          "PATCH",
+          `/api/admin/users/${NOGRANT_ID}`,
+          { enabled: true, role: "admin", libraryIds: [], autoApprove: true },
+        ),
+        role: await roleOf(),
+      },
+      { status: 403, role: "requester" },
+    );
+    // Every other admin route that reads a body after admission.
+    const before = await integrations();
+    const routes: ["POST" | "PATCH", string, Record<string, unknown>][] = [
+      ["PATCH", "/api/admin/integrations", { tpdbApiToken: "stale-admin" }],
+      ["POST", "/api/admin/users/import", {}],
+      ["POST", "/api/admin/providers/tpdb/test", {}],
+      ["POST", "/api/admin/jellyfin/test", { url: jellyfinUrl }],
+      ["POST", "/api/admin/whisparr/test", { url: whisparrUrl }],
+    ];
+    for (const [method, path, payload] of routes) {
+      assert.equal(await demotedMidBody(method, path, payload), 403, path);
+    }
+    assert.deepEqual(await integrations(), before);
+    assert.equal(await roleOf(), "requester");
+  } finally {
+    // Restore the grant state later tests share.
+    await setNogrants("requester");
+    nogrants = await loginAs("nogrants");
+  }
+});
+
+// VELV-244: readAdminJson's live-admin check predates the Jellyfin probe in
+// the integration save. An admin demoted while the probe holds must not land
+// the write with the old role.
+test("an admin demoted while the Jellyfin probe holds gets 403 and the save never lands", async () => {
+  await boot();
+  const admin = await loginAs("owner");
+  const setNogrants = async (role: string) => {
+    const res = await call("PATCH", `/api/admin/users/${NOGRANT_ID}`, {
+      cookie: admin,
+      body: { enabled: true, role, libraryIds: [] },
+    });
+    assert.equal(res.status, 200);
+  };
+  const storedUrl = async () => {
+    const res = await call("GET", "/api/admin/integrations", { cookie: admin });
+    assert.equal(res.status, 200);
+    const shape = (await res.json()) as { jellyfin: { url: string } };
+    return shape.jellyfin.url;
+  };
+  try {
+    await setNogrants("admin");
+    const staleAdmin = await loginAs("nogrants");
+    const before = await storedUrl();
+    const movedUrl = new URL("jf", `${jellyfinUrl}/`).toString();
+    assert.notEqual(movedUrl, before);
+    // The probe parks in the fixture; the actor loses admin while it waits.
+    const arrivedGate = Promise.withResolvers<void>();
+    fx.holdArrived = arrivedGate.resolve;
+    fx.holdPath = "/System/Info/Public";
+    const pending = call("PATCH", "/api/admin/integrations", {
+      cookie: staleAdmin,
+      body: { jellyfinUrl: movedUrl, jellyfinExternalUrl: movedUrl },
+    });
+    await arrivedGate.promise;
+    assert.ok(fx.holdRelease, "the probe never parked in the fixture");
+    await setNogrants("requester");
+    fx.holdRelease?.();
+    const res = await pending;
+    assert.equal(res.status, 403);
+    const err = await errorShape(res);
+    assert.equal(err.code, "forbidden");
+    assert.equal(await storedUrl(), before);
+  } finally {
+    fx.holdRelease?.();
+    fx.holdPath = null;
+    fx.holdArrived = null;
+    fx.holdRelease = null;
+    // Restore the grant state later tests share.
+    await setNogrants("requester");
+    nogrants = await loginAs("nogrants");
+  }
 });
 
 test("discover appends ONE followed rail across providers and isolates a provider outage", async () => {
@@ -8741,13 +10066,17 @@ test("global search: six isolated categories, auth, blank q 400", async () => {
     outStashPerformers,
     outStashStudios,
   ]) {
-    assert.ok(category?.error, category?.id);
-    assert.match(category?.error?.code ?? "", /unavailable/, category?.id);
-    assert.deepEqual(category?.items, [], category?.id);
+    assert.ok(category?.error, String(category?.id));
+    assert.match(
+      category?.error?.code ?? "",
+      /unavailable/,
+      String(category?.id),
+    );
+    assert.deepEqual(category?.items, [], String(category?.id));
   }
   for (const category of [outMovies, outPerformers, outStudios]) {
-    assert.equal(category?.error, undefined, category?.id);
-    assert.ok((category?.items.length ?? 0) > 0, category?.id);
+    assert.equal(category?.error, undefined, String(category?.id));
+    assert.ok((category?.items.length ?? 0) > 0, String(category?.id));
   }
   // A failed source carries no count at all — no total, no attestation.
   for (const category of [
@@ -8755,9 +10084,9 @@ test("global search: six isolated categories, auth, blank q 400", async () => {
     outStashPerformers,
     outStashStudios,
   ]) {
-    assert.equal(category?.totalCountKnown, false, category?.id);
-    assert.equal(category?.total, undefined, category?.id);
-    assert.equal(category?.hasMore, false, category?.id);
+    assert.equal(category?.totalCountKnown, false, String(category?.id));
+    assert.equal(category?.total, undefined, String(category?.id));
+    assert.equal(category?.hasMore, false, String(category?.id));
   }
 });
 
@@ -9990,7 +11319,7 @@ interface PreferencesBody {
 }
 
 interface BrowsePageBody {
-  items: FacetTile[];
+  items: (FacetTile & { releaseDate?: string })[];
   page: number;
   perPage: number;
   hasMore: boolean;
@@ -10461,6 +11790,81 @@ test("browse is the unified visible-catalog surface and counts the caller's hidd
   }
 });
 
+for (const type of ["movie", "scene"] as const) {
+  for (const range of [
+    {
+      name: "year window",
+      query: "year=2010&yearTo=2012",
+      years: [2012, 2011, 2010],
+    },
+    {
+      name: "date window",
+      query: "date=2011-01-01&date_operation=%3E%3D&dateTo=2011-12-31",
+      years: [2011],
+    },
+    ...(type === "scene"
+      ? [{ name: "lone year", query: "year=2011", years: [2011] }]
+      : []),
+  ]) {
+    test(`historical browse ranges: ${type} ${range.name}`, async () => {
+      await boot();
+      if (!member) member = await loginAs("member");
+      const previousMode = historicalBrowseMode;
+      historicalBrowseMode = { reads: { movie: 0, scene: 0 } };
+      const expected = range.years.flatMap((year) =>
+        Array.from({ length: 40 }, (_, i) => ({
+          id: historicalBrowseId(year, 39 - i),
+          date: historicalBrowseDate(year, 39 - i),
+        })),
+      );
+      try {
+        for (const page of expected.length === 120 ? [1, 3] : [1]) {
+          resetMetaCache();
+          historicalBrowseMode.reads[type] = 0;
+          const path =
+            `/api/browse?type=${type}&q=${HISTORICAL_BROWSE_QUERY}` +
+            `&${range.query}&page=${page}&perPage=50`;
+          const response = await call("GET", path, { cookie: member });
+          const text = await response.text();
+          assert.equal(response.status, 200, `${path}: ${text}`);
+          const body = JSON.parse(text) as BrowsePageBody;
+          const provider = type === "movie" ? "tpdb" : "stashdb";
+          assert.deepEqual(
+            body.items.map((item) => ({
+              reference: refOf(item),
+              date: item.releaseDate,
+            })),
+            expected.slice((page - 1) * 50, page * 50).map((row) => ({
+              reference: { provider, kind: type, id: row.id },
+              date: row.date,
+            })),
+          );
+          assert.equal(body.page, page);
+          assert.equal(body.perPage, 50);
+          assert.deepEqual(body.errors, []);
+          assert.ok(
+            historicalBrowseMode.reads[type] > 0 &&
+              historicalBrowseMode.reads[type] < 40,
+            `upstream reads: ${historicalBrowseMode.reads[type]}`,
+          );
+          if (expected.length === 120 && page === 1) {
+            assert.equal(body.hasMore, true);
+            assert.equal(body.totalCountKnown, false);
+            assert.equal(body.total, undefined);
+          } else {
+            assert.equal(body.hasMore, false);
+            assert.equal(body.totalCountKnown, true);
+            assert.equal(body.total, expected.length);
+          }
+        }
+      } finally {
+        historicalBrowseMode = previousMode;
+        resetMetaCache();
+      }
+    });
+  }
+}
+
 test("free-text terms that can never match are refused with no upstream call", async () => {
   const tpdbBefore = tpdbFx.calls;
   const stashBefore = stashdbFx.calls;
@@ -10634,6 +12038,151 @@ test("browse caps entity entries, keeps the old one-id URL, and reports notices 
     stashPage.items.every((item) => refOf(item)?.provider === "stashdb"),
     "only the knowing source ran",
   );
+});
+
+test("movie duplicates: session boundary, translated pairs, vetoes, hash caps and hidden tags", async (t) => {
+  await boot();
+  const cookie = await loginAs("member");
+  const path = `/api/catalog/tpdb/movie/${DUPLICATE_SOURCE}/duplicates`;
+  const before = tpdbFx.calls;
+  assert.equal((await call("GET", path)).status, 401);
+  for (const reference of [
+    `tpdb/scene/${DUPLICATE_SOURCE}`,
+    `stashdb/movie/${DUPLICATE_SOURCE}`,
+    `stashdb/scene/${DUPLICATE_SOURCE}`,
+    "tpdb/movie/not-a-uuid",
+  ]) {
+    const res = await call("GET", `/api/catalog/${reference}/duplicates`, {
+      cookie,
+    });
+    assert.equal(res.status, 400);
+    await errorShape(res);
+  }
+  assert.equal(tpdbFx.calls, before);
+  const realFetch = globalThis.fetch;
+  t.mock.method(
+    globalThis,
+    "fetch",
+    (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = input instanceof Request ? input.url : String(input);
+      return realFetch(
+        url === "https://cdn.theporndb.net/duplicate-poster.png"
+          ? `${tpdbUrl}/duplicate-poster.png`
+          : input,
+        init,
+      );
+    },
+  );
+  artworkSources.set(
+    "/duplicate-poster.png",
+    await sharp({
+      create: { width: 32, height: 48, channels: 3, background: "#506070" },
+    })
+      .png()
+      .toBuffer(),
+  );
+  const reset = () => {
+    resetMetaCache();
+    duplicateFixture = {
+      source: duplicateMovieRow(DUPLICATE_SOURCE),
+      candidates: [duplicateMovieRow(DUPLICATE_CANDIDATE)],
+      failMetadata: false,
+      hashReads: 0,
+    };
+    return duplicateFixture;
+  };
+  const check = async () => {
+    const response = await call("GET", path, { cookie });
+    assert.equal(response.status, 200);
+    return (await response.json()) as DuplicateMoviesResponse;
+  };
+  try {
+    await t.test(
+      "different titles and studios match, but self and repeated rows do not repeat",
+      async () => {
+        const fx = reset();
+        fx.candidates[0]!.site = {
+          name: "English distributor",
+          uuid: TPDB_STUDIO,
+        };
+        fx.candidates.push(fx.source, fx.candidates[0]!);
+        const result = await check();
+        assert.deepEqual(
+          result.matches.map((m) => m.reference.id),
+          [DUPLICATE_CANDIDATE],
+        );
+        assert.deepEqual(result.matches[0]!.rules, ["metadata"]);
+        assert.equal(result.matches[0]!.evidence.posterDistance, 0);
+        assert.equal(
+          result.selfUrl,
+          `https://theporndb.net/movies/${DUPLICATE_SOURCE}`,
+        );
+        assert.deepEqual(result.errors, []);
+        assert.equal(tpdbFx.imageAuth, "", "image requests carry no API token");
+      },
+    );
+    for (const [label, patch] of [
+      ["empty cast", { performers: [] }],
+      ["other cast", { performers: [{ id: TPDB_PERFORMER3, name: "Other" }] }],
+      ["other year", { date: "2023-02-03" }],
+      ["missing date", { date: null }],
+      ["no tags", { tags: [] }],
+      ["other tags", { tags: [{ id: 71, uuid: TAG_B, name: "Other tag" }] }],
+      ["duration veto", { duration: 899 }],
+      ["missing poster", { posters: {}, background: {} }],
+    ] as const) {
+      await t.test(label, async () => {
+        const fx = reset();
+        Object.assign(fx.candidates[0]!, patch);
+        assert.deepEqual((await check()).matches, []);
+      });
+    }
+    await t.test(
+      "hash matches survive metadata source failure and five-hash cap",
+      async () => {
+        const fx = reset();
+        const hashes = Array.from({ length: 6 }, (_, n) => ({
+          type: "OSHASH",
+          hash: (n + 10).toString(16).padStart(16, "0"),
+        }));
+        fx.source.hashes = hashes;
+        fx.candidates[0]!.hashes = [
+          { ...hashes[0], hash: hashes[0]!.hash.toUpperCase() },
+        ];
+        fx.failMetadata = true;
+        const result = await check();
+        assert.deepEqual(
+          result.matches.map((m) => m.reference.id),
+          [DUPLICATE_CANDIDATE],
+        );
+        assert.ok(result.matches[0]!.rules.includes("hash"));
+        assert.equal(fx.hashReads, 5);
+        assert.ok(
+          result.incomplete.some((reason) => reason.includes("5 of 6")),
+        );
+        assert.ok(result.errors.some((error) => error.provider === "tpdb"));
+      },
+    );
+    await t.test("hidden matches never reach the caller", async () => {
+      reset();
+      const save = await call("PATCH", "/api/me/preferences", {
+        cookie,
+        body: { hiddenTags: [{ name: "Fixture Tag A", tpdb: TAG_A }] },
+      });
+      assert.equal(save.status, 200);
+      const result = await check();
+      assert.deepEqual(result.matches, []);
+      assert.ok(!JSON.stringify(result).includes(DUPLICATE_CANDIDATE));
+    });
+  } finally {
+    duplicateFixture = undefined;
+    resetMetaCache();
+    const restored = await call("PATCH", "/api/me/preferences", {
+      cookie,
+      body: { hiddenTags: [] },
+    });
+    assert.equal(restored.status, 200);
+  }
 });
 
 test("related titles: admission, reference validation before upstream, rank vocabulary", async () => {
@@ -11405,6 +12954,12 @@ test("the known-device cookie stops counting after 30 days", async () => {
   } finally {
     Date.now = realNow;
     resetLoginBuckets();
+    // The +30d jump above makes the next issueSession's expiry sweep delete
+    // every real-clock session row: they are expired per the app's absolute
+    // timestamps. Re-establish the shared cookies the later suites read.
+    member = await loginAs("member");
+    member2 = await loginAs("member2");
+    owner = await loginAs("owner");
   }
 });
 
@@ -11550,6 +13105,146 @@ test("rate budget: artwork never charges the bucket; local reads still do", asyn
   // tests pin that direction).
   const across = await call("GET", "/api/discover", { cookie: member });
   await errorShape(across, 429);
+});
+
+// The merged walk reads its chunks serially, so one deep request used to
+// walk ~start/60 upstream reads on the single dispatch token (VELV-243).
+// Charging per chunk was tried first and rejected: the grid's endless scroll
+// (library.tsx load(items.length, "more")) then paid a growing share of the
+// walk again on every page and drained the bucket around page 28. The bound
+// is a per-request walk cap instead: past it a page refuses before its
+// first read, and normal scrolling keeps its one token per page.
+function useDeepLibraries(): () => void {
+  const movies = Array.from({ length: 5000 }, (_, i) => ({
+    Id: `${"3".repeat(28)}${i.toString(16).padStart(4, "0")}`,
+    Name: `Deep Movie ${String(i).padStart(5, "0")}`,
+    libraryId: MOVIES_LIB,
+  }));
+  const shows = Array.from({ length: 5000 }, (_, i) => ({
+    Id: `${"7".repeat(28)}${i.toString(16).padStart(4, "0")}`,
+    Name: `Deep Show ${String(i).padStart(5, "0")}`,
+    libraryId: SHOWS_LIB,
+  }));
+  const originalItems = fx.items;
+  const originalGrants = fx.grants.get(OWNER_ID);
+  fx.items = [...movies, ...shows];
+  fx.grants.set(OWNER_ID, [MOVIES_LIB, SHOWS_LIB]);
+  return () => {
+    fx.items = originalItems;
+    if (originalGrants === undefined) fx.grants.delete(OWNER_ID);
+    else fx.grants.set(OWNER_ID, originalGrants);
+  };
+}
+
+test("rate budget: a merged page past the walk cap refuses before its first refill", async (t) => {
+  // Frozen clock: no refill can land mid-test, so the bucket stays exact.
+  t.mock.timers.enable({ apis: ["Date"] });
+  const restore = useDeepLibraries();
+  try {
+    const readsBefore = fx.sweepHits;
+    const deep = await call("GET", "/api/library?start=9900&limit=24", {
+      cookie: owner,
+    });
+    assert.equal(deep.status, 400);
+    const refused = (await deep.json()) as { error: { code: string } };
+    assert.equal(refused.error.code, "pagination_too_deep");
+    // Fail fast: the refusal stops before the refill loop, so the walk
+    // costs only the per-library first chunks (the validated amplification
+    // of ~167 serial reads is gone) and the bucket only lost the one
+    // dispatch token the request itself costs.
+    assert.ok(
+      fx.sweepHits - readsBefore <= 2,
+      `expected at most the initial chunks, saw ${fx.sweepHits - readsBefore}`,
+    );
+    const after = await call("GET", "/api/library?start=0&limit=24", {
+      cookie: owner,
+    });
+    assert.equal(after.status, 200);
+  } finally {
+    restore();
+  }
+});
+
+test("rate budget: the walk cap boundary is exact; a scoped library keeps deep pages", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"] });
+  const restore = useDeepLibraries();
+  try {
+    const readsBefore = fx.sweepHits;
+    // Last window inside the cap: ceil(7080/60) + 2 libraries = 120.
+    const inside = await call("GET", "/api/library?start=7056&limit=24", {
+      cookie: owner,
+    });
+    assert.equal(inside.status, 200);
+    const insideBody = (await inside.json()) as {
+      items: unknown[];
+      total: number;
+    };
+    assert.equal(insideBody.total, 10000);
+    assert.equal(insideBody.items.length, 24);
+    const walked = fx.sweepHits - readsBefore;
+    assert.ok(walked > 50, `expected the real walk, saw ${walked} reads`);
+    assert.ok(walked <= 120, `expected <= 120 chunk reads, saw ${walked}`);
+    // One row deeper the cap refuses before any refill: initial chunks
+    // only, never the walk.
+    const before = fx.sweepHits;
+    const past = await call("GET", "/api/library?start=7057&limit=24", {
+      cookie: owner,
+    });
+    assert.equal(past.status, 400);
+    const pastBody = (await past.json()) as { error: { code: string } };
+    assert.equal(pastBody.error.code, "pagination_too_deep");
+    assert.ok(
+      fx.sweepHits - before <= 2,
+      `expected at most the initial chunks, saw ${fx.sweepHits - before}`,
+    );
+    // The scoped single-library path seeks straight into the library, so
+    // depth stays unlimited there: the remedy the error names is real.
+    const scoped = await call(
+      "GET",
+      `/api/library?libraryId=${SHOWS_LIB}&start=9000&limit=24`,
+      { cookie: owner },
+    );
+    assert.equal(scoped.status, 200);
+    const scopedBody = (await scoped.json()) as {
+      items: unknown[];
+      total: number;
+    };
+    assert.equal(scopedBody.total, 5000);
+    assert.equal(scopedBody.items.length, 0);
+  } finally {
+    restore();
+  }
+});
+
+test("rate budget: endless grid scroll pays one token a page, not one per chunk", async (t) => {
+  // The grid's scroll pattern (library.tsx load(items.length, "more")):
+  // sequential 24-row pages. Per-chunk charging made the accumulated cost
+  // quadratic and 429'd a member around page 28; the walk cap keeps every
+  // page at its one dispatch token.
+  t.mock.timers.enable({ apis: ["Date"] });
+  const restore = useDeepLibraries();
+  try {
+    const readsBefore = fx.sweepHits;
+    for (let page = 0; page < 30; page++) {
+      const res = await call(
+        "GET",
+        `/api/library?start=${page * 24}&limit=24`,
+        { cookie: owner },
+      );
+      assert.equal(res.status, 200, `scroll page ${page + 1} must pass`);
+    }
+    // The scroll stays cheap in total: 30 pages read a few thousand rows in
+    // 60-row chunks, never libraries' worth per page.
+    const reads = fx.sweepHits - readsBefore;
+    assert.ok(reads <= 240, `expected bounded scroll reads, saw ${reads}`);
+    // The bucket survived the scroll: one more page still passes.
+    const extra = await call("GET", "/api/library?start=720&limit=24", {
+      cookie: owner,
+    });
+    assert.equal(extra.status, 200);
+  } finally {
+    restore();
+  }
 });
 
 test("rate budget: the FIFO cap evicts only refilled buckets, never a drained one", (t) => {
@@ -11832,7 +13527,6 @@ const PROSE_SUMMER_DRAFT = {
 };
 const PROSE_KEY = "sk-test-key-123";
 const PROSE_MODEL = "test-model";
-const PROSE_CHECK_TEXT = "Vixen scenes from 2019 with Riley Reid, newest first";
 
 type ProseChatHit = {
   method: string;
@@ -11850,7 +13544,8 @@ type ProseChatFixture = {
     | "redirect"
     | "hold"
     | "echo_error"
-    | "echo_draft";
+    | "echo_draft"
+    | "no_temperature";
   hits: ProseChatHit[];
   /** Resolved when a request arrives; armed by the test that waits. */
   arrived?: PromiseWithResolvers<void>;
@@ -11897,6 +13592,28 @@ async function startProseChat(): Promise<ProseChatFixture> {
         error: {
           message: `Incorrect API key provided: ${auth}. It starts with ${key.slice(0, 9)}…`,
         },
+      });
+      return;
+    }
+    // A model that refuses `temperature` names it in a 400, like Anthropic.
+    if (state.reply === "no_temperature" && "temperature" in body) {
+      json(res, 400, {
+        error: { message: "`temperature` is deprecated for this model." },
+      });
+      return;
+    }
+    // The model list route (the free connection check reads it too): the
+    // configured model, ids with a duplicate, and one that no model name
+    // may carry (a control character), unsorted.
+    if ((req.url ?? "").endsWith("/models")) {
+      json(res, 200, {
+        data: [
+          { id: "zeta-model" },
+          { id: PROSE_MODEL },
+          { id: "alpha-model" },
+          { id: "zeta-model" },
+          { id: "bad\u0001model" },
+        ],
       });
       return;
     }
@@ -12311,7 +14028,10 @@ test("prose search: a URL move to another origin without the key is refused and 
   assert.equal(other.hits.length, otherHits, "the stored key never moved");
 });
 
-test("prose search: the admin connection check answers connected for a valid draft reply", async () => {
+// Contract move: the connection check used to send a real chat request with
+// a sample sentence, which a hosted server bills. It now reads the free
+// model list: connected means the key is accepted and the model is listed.
+test("prose search: the admin connection check is free: it reads the model list and sends no chat request", async () => {
   const { admin, chat } = await proseSetup();
   await proseOn(admin, chat);
   await setNograntsProseGrant(admin, true);
@@ -12328,15 +14048,135 @@ test("prose search: the admin connection check answers connected for a valid dra
   });
   assert.equal(check.status, 200, await check.clone().text());
   assert.deepEqual(await check.json(), { connected: true });
-  assert.equal(chat.hits.length, hits + 1);
-  const messages = (chat.hits.at(-1)?.body.messages ?? []) as {
-    role: string;
-    content: string;
-  }[];
-  assert.deepEqual(messages.at(-1), {
-    role: "user",
-    content: PROSE_CHECK_TEXT,
+  const sent = chat.hits.slice(hits);
+  assert.deepEqual(
+    sent.map((h) => `${h.method} ${h.path.replace(/^.*(\/[a-z]+)$/, "$1")}`),
+    ["GET /models"],
+  );
+  assert.equal(sent[0]?.headers.authorization, `Bearer ${PROSE_KEY}`);
+});
+
+test("prose search: a model the server does not list fails the check", async () => {
+  const { admin, chat } = await proseSetup();
+  await proseOn(admin, chat);
+  const check = await call("POST", "/api/admin/prose/test", {
+    cookie: admin,
+    body: { url: chat.url, model: "missing-model" },
   });
+  assert.equal(check.status, 200, await check.clone().text());
+  assert.deepEqual(await check.json(), {
+    connected: false,
+    error: 'The server does not list the model "missing-model".',
+  });
+});
+
+test("prose search: a model that refuses temperature gets the same request once more without it", async () => {
+  const { admin, chat } = await proseSetup();
+  await proseOn(admin, chat);
+  chat.reply = "no_temperature";
+  try {
+    const hits = chat.hits.length;
+    await proseSummerApplied(await proseSearchCall(admin, "summer"));
+    const sent = chat.hits.slice(hits).map((h) => "temperature" in h.body);
+    assert.deepEqual(sent, [true, false]);
+  } finally {
+    chat.reply = "draft";
+  }
+});
+
+test("prose search: the editor test uses the typed values, stores nothing, and keeps the stored key on its own origin", async () => {
+  const { admin, chat, other } = await proseSetup();
+  await proseOn(admin, chat);
+  const before = getConfig()?.providers;
+
+  // Typed values on another host, no key typed: that host gets no key.
+  const otherHits = other.hits.length;
+  const moved = await call("POST", "/api/admin/prose/test", {
+    cookie: admin,
+    body: { url: other.url, model: PROSE_MODEL },
+  });
+  assert.equal(moved.status, 200, await moved.clone().text());
+  assert.deepEqual(await moved.json(), { connected: true });
+  assert.equal(other.hits.length, otherHits + 1);
+  assert.equal(other.hits.at(-1)?.headers.authorization, undefined);
+  assert.ok(other.hits.at(-1)?.path.endsWith("/models"));
+
+  // The stored host, no key typed: the stored key is reused there.
+  const same = await call("POST", "/api/admin/prose/test", {
+    cookie: admin,
+    body: { url: chat.url, model: PROSE_MODEL },
+  });
+  assert.equal(same.status, 200, await same.clone().text());
+  assert.equal(chat.hits.at(-1)?.headers.authorization, `Bearer ${PROSE_KEY}`);
+
+  // A typed key wins.
+  await call("POST", "/api/admin/prose/test", {
+    cookie: admin,
+    body: { url: other.url, model: PROSE_MODEL, apiKey: "sk-typed" },
+  });
+  assert.equal(other.hits.at(-1)?.headers.authorization, "Bearer sk-typed");
+
+  // Nothing of the draft was stored.
+  assert.deepEqual(getConfig()?.providers, before);
+});
+
+test("prose search: the editor test and model list refuse bad input and non-admins", async () => {
+  const { admin, chat } = await proseSetup();
+  const cases: [string, Record<string, unknown>, string][] = [
+    ["/api/admin/prose/test", { url: "not a url", model: "m" }, "invalid_url"],
+    ["/api/admin/prose/test", { url: chat.url, model: "" }, "invalid_field"],
+    [
+      "/api/admin/prose/test",
+      { url: chat.url, model: "m", apiKey: "has space" },
+      "invalid_field",
+    ],
+    ["/api/admin/prose/models", { url: "not a url" }, "invalid_url"],
+  ];
+  for (const [path, body, code] of cases) {
+    const res = await call("POST", path, { cookie: admin, body });
+    assert.equal(res.status, 400, `${path} ${JSON.stringify(body)}`);
+    assert.equal((await errorShape(res)).code, code);
+  }
+  for (const path of ["/api/admin/prose/test", "/api/admin/prose/models"]) {
+    const denied = await call("POST", path, {
+      cookie: nogrants,
+      body: { url: chat.url, model: "m" },
+    });
+    assert.equal(denied.status, 403);
+  }
+});
+
+test("prose search: the model list is the server's ids, valid names only, deduplicated and sorted", async () => {
+  const { admin, chat } = await proseSetup();
+  const listed = await call("POST", "/api/admin/prose/models", {
+    cookie: admin,
+    body: { url: chat.url, apiKey: "sk-typed" },
+  });
+  assert.equal(listed.status, 200, await listed.clone().text());
+  assert.deepEqual(await listed.json(), {
+    models: ["alpha-model", PROSE_MODEL, "zeta-model"],
+  });
+  const hit = chat.hits.at(-1);
+  assert.equal(hit?.method, "GET");
+  assert.ok(hit?.path.endsWith("/models"));
+  assert.equal(hit?.headers.authorization, "Bearer sk-typed");
+
+  // A rejected key is an empty list with the server's words, key redacted.
+  chat.reply = "echo_error";
+  try {
+    const refused = await call("POST", "/api/admin/prose/models", {
+      cookie: admin,
+      body: { url: chat.url, apiKey: "sk-typed" },
+    });
+    assert.equal(refused.status, 200, await refused.clone().text());
+    const wire = await refused.text();
+    const shape = JSON.parse(wire) as { models: string[]; error: string };
+    assert.deepEqual(shape.models, []);
+    assert.match(shape.error, /^The server answered HTTP 401/);
+    assert.equal(wire.includes("sk-typed"), false);
+  } finally {
+    chat.reply = "draft";
+  }
 });
 
 test("prose search: the connection check hides the stored key when the chat server repeats it", async () => {
@@ -12354,7 +14194,7 @@ test("prose search: the connection check hides the stored key when the chat serv
     assert.deepEqual(JSON.parse(wire), {
       connected: false,
       error:
-        "The chat server answered HTTP 401: Incorrect API key provided: Bearer [redacted]. It starts with [redacted]…",
+        "The server answered HTTP 401: Incorrect API key provided: Bearer [redacted]. It starts with [redacted]…",
     });
     assert.equal(wire.includes(PROSE_KEY.slice(0, 8)), false);
   } finally {
@@ -12372,15 +14212,8 @@ test("prose search: a reply that repeats the stored key fails, and nothing from 
     assert.equal((await res.clone().text()).includes(PROSE_KEY), false);
     const error = await errorShape(res, 502);
     assert.equal(error.code, "prose_search_bad_reply");
-    // The check reads the same reply rule.
-    const check = await call("POST", "/api/admin/prose/check", {
-      cookie: admin,
-      body: {},
-    });
-    assert.deepEqual(await check.json(), {
-      connected: false,
-      error: error.message,
-    });
+    // The connection check sends no chat request any more (the free model
+    // list), so only member searches meet this reply rule.
     // Text the member typed is theirs: the reply repeats it, nothing more.
     const typed = await proseSearchCall(admin, `summer ${PROSE_KEY}`);
     assert.equal(typed.status, 200, await typed.clone().text());
@@ -12439,3 +14272,433 @@ test("prose search: the block restores the chat settings, the grant and the fixt
     proseRestore = undefined;
   }
 });
+
+// These URLs and tokens are synthetic. The fetch fixture matches them exactly.
+const DISCORD_SAVED =
+  "https://discord.com/api/webhooks/123456789/fixture_saved_token";
+const DISCORD_ENV =
+  "https://discordapp.com/api/webhooks/987654321/fixture_env_token";
+const DISCORD_DRAFT =
+  "https://discord.com/api/webhooks/456789123/fixture_draft_token";
+
+test("Discord settings require admin admission and same-origin mutations", async () => {
+  await boot();
+  const admin = await loginAs("owner");
+  const requester = await loginAs("member");
+  const original = getConfig()!;
+  try {
+    for (const [method, path, body] of [
+      ["GET", "/api/admin/discord", undefined],
+      ["POST", "/api/admin/discord/test", {}],
+      ["PATCH", "/api/admin/integrations", { discordIncludeTitles: false }],
+    ] as const) {
+      for (const [cookie, status] of [
+        [undefined, 401],
+        [requester, 403],
+      ] as const) {
+        const response = await call(method, path, { cookie, body });
+        assert.equal(response.status, status);
+        await errorShape(response);
+      }
+      if (method !== "GET") {
+        for (const origin of [null, "https://foreign.example.test"]) {
+          const response = await call(method, path, {
+            cookie: admin,
+            origin,
+            body,
+          });
+          assert.equal(response.status, 403);
+          await errorShape(response);
+        }
+      }
+    }
+    assert.deepEqual(getConfig(), original);
+  } finally {
+    saveConfig(original);
+  }
+});
+
+test("Discord settings validate strict URLs and types without secret echoes", async () => {
+  await boot();
+  const admin = await loginAs("owner");
+  const original = getConfig()!;
+  const invalidUrls: unknown[] = [
+    null,
+    false,
+    12,
+    {},
+    [],
+    "http://discord.com/api/webhooks/123/fixture_secret",
+    "https://discord.com.evil.test/api/webhooks/123/fixture_secret",
+    "https://user:fixture_secret@discord.com/api/webhooks/123/token",
+    "https://discord.com:444/api/webhooks/123/fixture_secret",
+    `${DISCORD_SAVED}?fixture_secret=1`,
+    `${DISCORD_SAVED}#fixture_secret`,
+    `${DISCORD_SAVED}/extra`,
+    "https://discord.com/api/webhooks/notnumeric/fixture_secret",
+    "https://discord.com/api/webhooks/123/fixture%2Fsecret",
+    `https://discord.com/api/webhooks/123/${"x".repeat(2048)}`,
+  ];
+  try {
+    for (const value of invalidUrls) {
+      resetRateBuckets();
+      for (const [method, path, field] of [
+        ["PATCH", "/api/admin/integrations", "discordWebhookUrl"],
+        ["POST", "/api/admin/discord/test", "webhookUrl"],
+      ] as const) {
+        const response = await call(method, path, {
+          cookie: admin,
+          body: { [field]: value },
+        });
+        assert.equal(response.status, 400);
+        const error = await errorShape(response);
+        assert.equal(error.code, "invalid_field");
+        assert.equal(JSON.stringify(error).includes("fixture_secret"), false);
+        assert.equal(
+          JSON.stringify(error).includes("fixture_saved_token"),
+          false,
+        );
+      }
+    }
+    for (const value of [0, 1, "false", [], {}]) {
+      const response = await call("PATCH", "/api/admin/integrations", {
+        cookie: admin,
+        body: { discordIncludeTitles: value },
+      });
+      assert.equal(response.status, 400);
+      assert.equal((await errorShape(response)).code, "invalid_field");
+    }
+    await fc.assert(
+      fc.asyncProperty(fc.stringMatching(/^[a-z]{1,16}$/), async (suffix) => {
+        resetRateBuckets();
+        const response = await call("PATCH", "/api/admin/integrations", {
+          cookie: admin,
+          body: {
+            discordWebhookUrl: `https://discord.com.${suffix}/api/webhooks/123/fixture_secret`,
+          },
+        });
+        assert.equal(response.status, 400);
+        assert.equal((await errorShape(response)).code, "invalid_field");
+      }),
+      { seed: 248, numRuns: 100 },
+    );
+    assert.deepEqual(getConfig(), original);
+  } finally {
+    saveConfig(original);
+  }
+});
+
+test("Discord independent overrides, GET-only draft checks, redaction and other service saves", async () => {
+  await boot();
+  const admin = await loginAs("owner");
+  const original = getConfig()!;
+  const previousUrl = process.env.VELVARR_DISCORD_WEBHOOK_URL;
+  const previousDetail = process.env.VELVARR_DISCORD_DETAIL;
+  const originalFetch = globalThis.fetch;
+  const hits: {
+    url: string;
+    method: string;
+    redirect: RequestRedirect | undefined;
+  }[] = [];
+  let failure: "http" | "network" | "malformed" | undefined;
+  globalThis.fetch = (async (input, init) => {
+    const url = input instanceof Request ? input.url : String(input);
+    if (![DISCORD_SAVED, DISCORD_ENV, DISCORD_DRAFT].includes(url))
+      return originalFetch(input, init);
+    hits.push({ url, method: init?.method ?? "GET", redirect: init?.redirect });
+    if (failure === "network") throw new Error(`private fetch failure ${url}`);
+    if (failure === "http")
+      return new Response(`private upstream ${url}`, { status: 401 });
+    if (failure === "malformed") return Response.json({ privateMetadata: url });
+    return Response.json({
+      id: new URL(url).pathname.split("/")[3],
+      type: 1,
+      token: new URL(url).pathname.split("/")[4],
+      channel_id: "123456789",
+      name: "private_name",
+    });
+  }) as typeof fetch;
+  const patch = (body: Record<string, unknown>) =>
+    call("PATCH", "/api/admin/integrations", { cookie: admin, body });
+  const summary = async (response: Response) => {
+    assert.equal(response.status, 200);
+    const text = await response.text();
+    for (const secret of [
+      DISCORD_SAVED,
+      DISCORD_ENV,
+      DISCORD_DRAFT,
+      "fixture_saved_token",
+      "fixture_env_token",
+      "fixture_draft_token",
+    ])
+      assert.equal(text.includes(secret), false);
+    const body = JSON.parse(text) as { discord: DiscordSettingsInfo };
+    return body.discord;
+  };
+  const check = async (
+    path = "/api/admin/discord",
+    body?: Record<string, unknown>,
+  ) => {
+    const response = await call(body ? "POST" : "GET", path, {
+      cookie: admin,
+      body,
+    });
+    assert.equal(response.status, 200);
+    const text = await response.text();
+    for (const secret of [
+      "fixture_saved_token",
+      "fixture_env_token",
+      "fixture_draft_token",
+      "private_channel",
+      "private_name",
+      "private fetch",
+    ])
+      assert.equal(text.includes(secret), false);
+    return JSON.parse(text) as DiscordCheck;
+  };
+  try {
+    process.env.VELVARR_DISCORD_WEBHOOK_URL = DISCORD_ENV;
+    process.env.VELVARR_DISCORD_DETAIL = "1";
+    saveConfig({ ...original, discord: undefined });
+    assert.deepEqual(
+      await summary(
+        await call("GET", "/api/admin/integrations", { cookie: admin }),
+      ),
+      {
+        configured: true,
+        source: "environment",
+        stored: false,
+        includeTitles: true,
+        includeTitlesSource: "environment",
+      },
+    );
+    fx.journal.length = 0;
+    fx.journalOn = true;
+    const titleOnly = await summary(
+      await patch({ discordIncludeTitles: false }),
+    );
+    fx.journalOn = false;
+    assert.equal(titleOnly.includeTitles, false);
+    assert.equal(titleOnly.includeTitlesSource, "stored");
+    assert.equal(titleOnly.source, "environment");
+    assert.deepEqual(getConfig()!.discord, { includeTitles: false });
+    assert.deepEqual(
+      fx.journal.filter(
+        (r) =>
+          r.path === "/Users" ||
+          r.path.startsWith("/System/Info") ||
+          r.path.startsWith("/api/v3/"),
+      ),
+      [],
+    );
+    assert.equal(hits.length, 0, "a save does not probe any Discord endpoint");
+
+    const stored = await summary(
+      await patch({ discordWebhookUrl: DISCORD_SAVED }),
+    );
+    assert.equal(stored.source, "stored");
+    assert.equal(stored.includeTitles, false);
+    const savedDiscord = getConfig()!.discord;
+    for (const body of [
+      { tpdbApiToken: "fixture_provider_value" },
+      { whisparrUrl, whisparrApiKey: whisparrKey },
+      { jellyfinUrl, jellyfinExternalUrl: jellyfinUrl },
+      {
+        jellyfinUrl,
+        jellyfinExternalUrl: jellyfinUrl,
+        whisparrUrl,
+        whisparrApiKey: whisparrKey,
+        tpdbApiToken: "fixture_provider_value",
+      },
+    ]) {
+      await summary(await patch(body));
+      assert.deepEqual(getConfig()!.discord, savedDiscord);
+    }
+    assert.deepEqual(await check(), { configured: true });
+    assert.equal(hits.at(-1)?.url, DISCORD_SAVED);
+    const beforeDraft = getConfig();
+    assert.deepEqual(
+      await check("/api/admin/discord/test", { webhookUrl: DISCORD_DRAFT }),
+      { configured: true },
+    );
+    assert.equal(hits.at(-1)?.url, DISCORD_DRAFT);
+    assert.deepEqual(getConfig(), beforeDraft);
+    for (const body of [{}, { webhookUrl: "" }]) {
+      assert.deepEqual(await check("/api/admin/discord/test", body), {
+        configured: true,
+      });
+      assert.equal(hits.at(-1)?.url, DISCORD_SAVED);
+    }
+    for (const mode of ["http", "network", "malformed"] as const) {
+      failure = mode;
+      const result = await check();
+      assert.ok(result.error?.code);
+      assert.ok(result.error?.message);
+      assert.deepEqual(getConfig(), beforeDraft);
+    }
+    failure = undefined;
+    const titleReset = await summary(
+      await patch({ discordIncludeTitles: null }),
+    );
+    assert.equal(titleReset.source, "stored");
+    assert.equal(titleReset.includeTitlesSource, "environment");
+    assert.equal(titleReset.includeTitles, true);
+    assert.deepEqual(getConfig()!.discord, { webhookUrl: DISCORD_SAVED });
+    const titleOn = await summary(await patch({ discordIncludeTitles: true }));
+    assert.equal(titleOn.includeTitlesSource, "stored");
+    assert.equal(titleOn.includeTitles, true);
+    await summary(await patch({ discordIncludeTitles: false }));
+    const cleared = await summary(await patch({ discordWebhookUrl: "" }));
+    assert.equal(cleared.source, "environment");
+    assert.equal(cleared.includeTitles, false);
+    assert.equal(cleared.includeTitlesSource, "stored");
+    assert.deepEqual(getConfig()!.discord, { includeTitles: false });
+    await check();
+    assert.equal(hits.at(-1)?.url, DISCORD_ENV);
+    await patch({ discordWebhookUrl: DISCORD_SAVED });
+    const reset = await summary(
+      await patch({ discordWebhookUrl: "", discordIncludeTitles: null }),
+    );
+    assert.equal(reset.source, "environment");
+    assert.equal(reset.includeTitles, true);
+    assert.equal(reset.includeTitlesSource, "environment");
+    assert.equal(reset.stored, false);
+    assert.equal(getConfig()!.discord, undefined);
+    delete process.env.VELVARR_DISCORD_WEBHOOK_URL;
+    const absent = await check();
+    assert.deepEqual(absent, { configured: false });
+    assert.ok(hits.length > 0);
+    assert.ok(
+      hits.every((hit) => hit.method === "GET" && hit.redirect === "error"),
+    );
+  } finally {
+    fx.journalOn = false;
+    globalThis.fetch = originalFetch;
+    if (previousUrl === undefined)
+      delete process.env.VELVARR_DISCORD_WEBHOOK_URL;
+    else process.env.VELVARR_DISCORD_WEBHOOK_URL = previousUrl;
+    if (previousDetail === undefined) delete process.env.VELVARR_DISCORD_DETAIL;
+    else process.env.VELVARR_DISCORD_DETAIL = previousDetail;
+    saveConfig(original);
+  }
+});
+
+for (const scenario of [
+  {
+    name: "title Off",
+    initialTitles: true,
+    patch: { discordIncludeTitles: false },
+    stored: { webhookUrl: DISCORD_SAVED, includeTitles: false },
+    effective: {
+      configured: true,
+      source: "stored",
+      stored: true,
+      includeTitles: false,
+      includeTitlesSource: "stored",
+    },
+  },
+  {
+    name: "webhook clear retains the title override",
+    initialTitles: false,
+    patch: { discordWebhookUrl: "" },
+    stored: { includeTitles: false },
+    effective: {
+      configured: true,
+      source: "environment",
+      stored: true,
+      includeTitles: false,
+      includeTitlesSource: "stored",
+    },
+  },
+  {
+    name: "environment reset clears both overrides",
+    initialTitles: false,
+    patch: { discordWebhookUrl: "", discordIncludeTitles: null },
+    stored: undefined,
+    effective: {
+      configured: true,
+      source: "environment",
+      stored: false,
+      includeTitles: true,
+      includeTitlesSource: "environment",
+    },
+  },
+] as const) {
+  test(`a held Jellyfin PATCH preserves a later Discord change: ${scenario.name}`, async () => {
+    await boot();
+    const admin = await loginAs("owner");
+    const original = getConfig()!;
+    const previousUrl = process.env.VELVARR_DISCORD_WEBHOOK_URL;
+    const previousDetail = process.env.VELVARR_DISCORD_DETAIL;
+    let pending: Promise<Response> | undefined;
+    try {
+      process.env.VELVARR_DISCORD_WEBHOOK_URL = DISCORD_ENV;
+      process.env.VELVARR_DISCORD_DETAIL = "1";
+      saveConfig({
+        ...original,
+        discord: {
+          webhookUrl: DISCORD_SAVED,
+          includeTitles: scenario.initialTitles,
+        },
+      });
+      const movedUrl = new URL("jf", `${jellyfinUrl}/`).toString();
+      assert.notEqual(movedUrl, getConfig()!.jellyfin.url);
+      const arrived = Promise.withResolvers<void>();
+      fx.holdPath = "/System/Info/Public";
+      fx.holdArrived = arrived.resolve;
+      pending = call("PATCH", "/api/admin/integrations", {
+        cookie: admin,
+        body: { jellyfinUrl: movedUrl, jellyfinExternalUrl: movedUrl },
+      });
+      await arrived.promise;
+      assert.ok(
+        fx.holdRelease,
+        "the Jellyfin probe holds before the Discord save",
+      );
+      const later = await call("PATCH", "/api/admin/integrations", {
+        cookie: admin,
+        body: scenario.patch,
+      });
+      assert.equal(later.status, 200);
+      assert.deepEqual(getConfig()!.discord, scenario.stored);
+      const laterBody = (await later.json()) as {
+        discord: DiscordSettingsInfo;
+      };
+      assert.deepEqual(laterBody.discord, scenario.effective);
+
+      fx.holdRelease();
+      const response = await pending;
+      assert.equal(response.status, 200);
+      assert.deepEqual(
+        getConfig()!.discord,
+        scenario.stored,
+        `the later Discord change survives the held Jellyfin PATCH: ${scenario.name}`,
+      );
+      const body = (await response.json()) as {
+        discord: DiscordSettingsInfo;
+        jellyfin: { url: string; externalUrl: string };
+      };
+      assert.deepEqual(body.discord, scenario.effective);
+      assert.equal(getConfig()!.jellyfin.url, movedUrl);
+      assert.equal(getConfig()!.jellyfin.externalUrl, movedUrl);
+      assert.equal(body.jellyfin.url, movedUrl);
+      assert.equal(body.jellyfin.externalUrl, movedUrl);
+    } finally {
+      fx.holdRelease?.();
+      try {
+        if (pending) await pending;
+      } finally {
+        fx.holdPath = null;
+        fx.holdArrived = null;
+        fx.holdRelease = null;
+        if (previousUrl === undefined)
+          delete process.env.VELVARR_DISCORD_WEBHOOK_URL;
+        else process.env.VELVARR_DISCORD_WEBHOOK_URL = previousUrl;
+        if (previousDetail === undefined)
+          delete process.env.VELVARR_DISCORD_DETAIL;
+        else process.env.VELVARR_DISCORD_DETAIL = previousDetail;
+        saveConfig(original);
+      }
+    }
+  });
+}

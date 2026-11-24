@@ -13,7 +13,7 @@ import {
   type ReactNode,
 } from "react";
 import { useRouter } from "next/navigation";
-import { isDeliverableMedia } from "../lib/contracts.ts";
+import { catalogImageUrl, isDeliverableMedia } from "../lib/contracts.ts";
 import type {
   Account,
   BrowseEntity,
@@ -311,6 +311,30 @@ export const PREFERENCES_CHANGED = "velvarr:preferences-changed";
  * dispatchers. */
 export const OPEN_PREFERENCES = "velvarr:open-preferences";
 
+/** Endless scroll's sentinel: true while the element the returned ref is
+ * attached to (placed below a grid) is within 800px of the viewport, so the
+ * next page starts loading before the user reaches the bottom. `mounted`
+ * re-attaches the observer when the sentinel first renders (it exists only
+ * under a filled grid). Callers fetch on true, while idle and with more to
+ * have; the effect re-running after each append chains short pages. */
+export function useNearEnd(
+  mounted: boolean,
+): [RefObject<HTMLDivElement | null>, boolean] {
+  const ref = useRef<HTMLDivElement | null>(null);
+  const [near, setNear] = useState(false);
+  useEffect(() => {
+    const el = ref.current;
+    if (!el || typeof IntersectionObserver === "undefined") return;
+    const io = new IntersectionObserver(
+      (entries) => setNear(entries.some((e) => e.isIntersecting)),
+      { rootMargin: "800px 0px" },
+    );
+    io.observe(el);
+    return () => io.disconnect();
+  }, [mounted]);
+  return [ref, near];
+}
+
 /** The items a grid shows while more pages exist: whole rows only, so a
  * column change (sidebar collapse, resize) never leaves a ragged last row
  * and never refetches. The held-back items show once the next page lands;
@@ -506,6 +530,8 @@ export type CatalogSummary = {
   durationSeconds?: number;
   /** Studio name only. */
   studio?: string;
+  /** Credited performer names, in provider order. */
+  performers?: string[];
 };
 
 /**
@@ -548,6 +574,7 @@ export function useCatalogSummary(
           releaseDate: d.detail.releaseDate,
           durationSeconds: d.detail.durationSeconds,
           studio: d.detail.studio?.name,
+          performers: d.detail.credits.map((c) => c.name),
         };
         catalogSummaryCache.set(key, s);
         if (live) setSummary(s);
@@ -761,6 +788,41 @@ export function Icon({
   );
 }
 
+/** One page-toolbar control in its own small panel with its name inside
+ * (DESIGN.md Toolbar groups; CSS `.toolbar-group` in globals.css). Every
+ * page toolbar uses it, so a layout change lands everywhere at once. Give
+ * `htmlFor` when the caption labels one field (a select, an input), or
+ * `captionId` when it titles a `role="group"` (segments) that points at it
+ * with aria-labelledby. */
+export function ToolbarGroup({
+  caption,
+  htmlFor,
+  captionId,
+  className,
+  children,
+}: {
+  caption: string;
+  htmlFor?: string;
+  captionId?: string;
+  className?: string;
+  children: ReactNode;
+}) {
+  return (
+    <div className={className ? `toolbar-group ${className}` : "toolbar-group"}>
+      {htmlFor !== undefined ? (
+        <label className="filter-group-name" htmlFor={htmlFor}>
+          {caption}
+        </label>
+      ) : (
+        <span className="filter-group-name" id={captionId}>
+          {caption}
+        </span>
+      )}
+      {children}
+    </div>
+  );
+}
+
 /** A small "i" chip that opens a field's rule text in a native popover.
  * A click or tap toggles it (no hover, so it works on touch); Escape or a
  * click elsewhere closes it. Browsers with CSS anchor positioning place it
@@ -953,8 +1015,7 @@ export function imgSrc(
 ): string | undefined {
   if (!url) return undefined;
   if (url.startsWith("/")) return url;
-  const width = w !== undefined ? `&w=${w}` : "";
-  return `/api/catalog/image?url=${encodeURIComponent(url)}${width}`;
+  return catalogImageUrl(url, w);
 }
 
 /** srcset over the proxy's width ladder for one provider URL. Undefined for
@@ -962,6 +1023,60 @@ export function imgSrc(
 export function artSrcSet(url: string | undefined): string | undefined {
   if (!url || url.startsWith("/")) return undefined;
   return ARTWORK_WIDTHS.map((w) => `${imgSrc(url, w)} ${w}w`).join(", ");
+}
+
+/** Literal classes, so Tailwind generates both clamps. */
+const CLAMP_CLASS = { 2: "line-clamp-2", 5: "line-clamp-5" } as const;
+
+/** Provider prose (a bio, a title's description) clamped to a few lines so
+ * a long text never stretches its section. "Read more" appears only when the
+ * text really overflows, and the full text stays in the DOM for search and
+ * assistive tech. */
+export function ClampedText({
+  text,
+  lines,
+  className,
+  textClassName = "text-sm leading-relaxed text-muted",
+}: {
+  text: string;
+  lines: keyof typeof CLAMP_CLASS;
+  className?: string;
+  textClassName?: string;
+}) {
+  const ref = useRef<HTMLParagraphElement>(null);
+  const [open, setOpen] = useState(false);
+  const [overflows, setOverflows] = useState(false);
+  useEffect(() => {
+    const el = ref.current;
+    if (!el || typeof ResizeObserver === "undefined") return;
+    const measure = () => {
+      if (!open) setOverflows(el.scrollHeight > el.clientHeight + 1);
+    };
+    measure();
+    const ro = new ResizeObserver(measure);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [open, text]);
+  return (
+    <div className={className}>
+      <p
+        ref={ref}
+        className={`${textClassName}${open ? "" : ` ${CLAMP_CLASS[lines]}`}`}
+      >
+        {text}
+      </p>
+      {(overflows || open) && (
+        <button
+          type="button"
+          className="cat-inline-link mt-1 text-sm"
+          aria-expanded={open}
+          onClick={() => setOpen((v) => !v)}
+        >
+          {open ? "Show less" : "Read more"}
+        </button>
+      )}
+    </div>
+  );
 }
 
 /**

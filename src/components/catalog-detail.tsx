@@ -14,6 +14,7 @@ import {
   EnlargeableImage,
   ErrorPanel,
   FileFacts,
+  ClampedText,
   Icon,
   imgSrc,
   ItemImage,
@@ -23,6 +24,7 @@ import {
   SceneCard,
   spaClick,
   useApiGet,
+  useGridColumns,
   useParamsSetter,
 } from "./shared";
 import { isDeliverableMedia } from "../lib/contracts";
@@ -33,6 +35,7 @@ import type {
   CatalogProvider,
   CatalogReference,
   CrossProviderLink,
+  LibraryItem,
   MediaKind,
   PlaybackAccess,
   RequestDecision,
@@ -46,6 +49,7 @@ import { seedDetail } from "../lib/names";
 // Pure URL policy from lib: the runtime graph stays one-way (catalog.tsx
 // renders catalog-detail.tsx, never the reverse).
 import { browseFilterHref, type BrowseFilter } from "../lib/browse-url";
+import { MovieDuplicates } from "./movie-duplicates";
 
 export type DetailTarget = {
   provider: CatalogProvider;
@@ -301,18 +305,25 @@ function MediaActions({
 const UUID_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-function DetailBody({
+/** The title page: hero (poster, title, studio, actions, facts panel) and
+ * the detail sections. Shared with the library item page, so a matched
+ * library item reads exactly like its catalog title. */
+export function DetailBody({
   payload,
   target,
   onNavigate,
   onBrowse,
   onRefetch,
+  libraryItem,
 }: {
   payload: CatalogDetailResponse;
   target: DetailTarget;
   onNavigate: (r: CatalogReference) => void;
   onBrowse: (filter: BrowseFilter) => void;
   onRefetch: () => void;
+  /** The Jellyfin item this page was opened from (the library page). It is
+   * the playable fact itself, so no availability check runs. */
+  libraryItem?: LibraryItem;
 }) {
   const d = payload.detail;
   const mediaKind = asMediaKind(target.kind);
@@ -334,7 +345,18 @@ function DetailBody({
     mediaKind !== null
       ? { provider: target.provider, kind: mediaKind, id: target.id }
       : null;
-  const { availability, checking } = useAvailability(mediaTarget);
+  // A playable library item is the verdict itself; anything else (no
+  // playable source) still asks the server, which names the reason.
+  const known = libraryItem?.canPlay ? libraryItem : undefined;
+  const checked = useAvailability(known ? null : mediaTarget);
+  const availability: PlaybackAccess | null = known
+    ? {
+        outcome: "available",
+        item: known,
+        ...(known.watchUrl ? { watchUrl: known.watchUrl } : {}),
+      }
+    : checked.availability;
+  const checking = known ? false : checked.checking;
   // The year jump is offered for TPDB movies only; other targets keep
   // their date as plain text. (Browse itself filters StashDB scenes by
   // year locally and by date natively.)
@@ -362,7 +384,10 @@ function DetailBody({
           />
           <div className="cat-hero-copy">
             {availability?.outcome === "available" && (
-              <span className="cat-badge cat-badge-available">Available</span>
+              <span className="cat-badge cat-badge-available">
+                <Icon name="check" />
+                In your library
+              </span>
             )}
             {availability?.outcome === "denied" && (
               <span className="cat-badge">No playback access</span>
@@ -561,6 +586,9 @@ export function DetailSections({
   }, [studioRef, tagBrowse, d, target.provider]);
   return (
     <>
+      {d.reference.provider === "tpdb" && d.reference.kind === "movie" && (
+        <MovieDuplicates key={d.reference.id} movie={d} />
+      )}
       <div className="cat-cols">
         <div>
           {(d.description || d.aliases.length > 0) && (
@@ -570,9 +598,12 @@ export function DetailSections({
             >
               <h2 className="cat-section-title">Overview</h2>
               {d.description && (
-                <p className="cat-overview mt-2 text-sm leading-relaxed text-muted">
-                  {d.description}
-                </p>
+                <ClampedText
+                  text={d.description}
+                  lines={5}
+                  className="mt-2"
+                  textClassName="cat-overview text-sm leading-relaxed text-muted"
+                />
               )}
               {d.aliases.length > 0 && (
                 <p className="mt-2 text-xs text-muted">
@@ -722,31 +753,38 @@ export function DetailSections({
             </section>
           )}
 
-          <section className="cat-section" aria-label="Cross-provider link">
-            <h2 className="cat-section-title">Cross-provider link</h2>
-            {linked ? (
-              <a
-                className="filter-chip mt-2"
-                href={detailHref(linked)}
-                onClick={spaClick(() => onNavigate(linked))}
-              >
-                Open the linked {providerLabel(linked.provider)} record
-                <Icon name="arrow-right" className="filter-chip-mark" />
-              </a>
-            ) : linkFailure ? (
-              <ErrorPanel
-                title="Cross-provider lookup failed"
-                message={`Pairing with ${providerLabel(linkFailure.provider)} is unknown: ${linkFailure.message}. This is not a confirmed absence — retry, or merge the two entries on the performer page.`}
-                onRetry={onRetryLink}
-              />
-            ) : (
-              <p className="mt-2 text-xs text-muted">
-                {"unlinkedReason" in payload.link
-                  ? payload.link.unlinkedReason
-                  : "No cross-provider link."}
-              </p>
-            )}
-          </section>
+          {/* Movies and scenes are never linked across providers, so their
+              "no link" explanation is noise here; the section stays for a
+              real link or a failed lookup, and for performers and studios. */}
+          {(linked ||
+            linkFailure ||
+            (target.kind !== "movie" && target.kind !== "scene")) && (
+            <section className="cat-section" aria-label="Cross-provider link">
+              <h2 className="cat-section-title">Cross-provider link</h2>
+              {linked ? (
+                <a
+                  className="filter-chip mt-2"
+                  href={detailHref(linked)}
+                  onClick={spaClick(() => onNavigate(linked))}
+                >
+                  Open the linked {providerLabel(linked.provider)} record
+                  <Icon name="arrow-right" className="filter-chip-mark" />
+                </a>
+              ) : linkFailure ? (
+                <ErrorPanel
+                  title="Cross-provider lookup failed"
+                  message={`Pairing with ${providerLabel(linkFailure.provider)} is unknown: ${linkFailure.message}. This is not a confirmed absence — retry, or merge the two entries on the performer page.`}
+                  onRetry={onRetryLink}
+                />
+              ) : (
+                <p className="mt-2 text-xs text-muted">
+                  {"unlinkedReason" in payload.link
+                    ? payload.link.unlinkedReason
+                    : "No cross-provider link."}
+                </p>
+              )}
+            </section>
+          )}
 
           {(d.links.length > 0 || showSourceUrl) && (
             <section className="cat-section" aria-label="Links">
@@ -836,8 +874,23 @@ export function RelatedTitles({
     `/api/catalog/${target.provider}/${target.kind}/${encodeURIComponent(target.id)}/related?rank=${rank}`,
     [target.provider, target.kind, target.id, rank, reload],
   );
+  // Up to two full rows: whole rows once a row is filled, so the grid never
+  // ends on a half row; fewer than one row shows them all (as the
+  // performer page's "Often appears with").
+  const [probeRef, cols] = useGridColumns();
+  const items = data?.items ?? [];
+  const shown =
+    cols > 0 && items.length >= cols
+      ? items.slice(0, Math.min(2, Math.floor(items.length / cols)) * cols)
+      : items;
   return (
     <section className="cat-section" aria-label="Similar titles">
+      <div
+        ref={probeRef}
+        className="poster-grid"
+        aria-hidden="true"
+        style={{ height: 0, overflow: "hidden", visibility: "hidden" }}
+      />
       <div className="flex flex-wrap items-baseline justify-between gap-2">
         <h2 className="cat-section-title">Similar titles</h2>
         {data?.canRefine === true && rank === "tags" && (
@@ -887,7 +940,7 @@ export function RelatedTitles({
         <p className="cat-note">No shared tags — nothing similar yet.</p>
       ) : (
         <div className="poster-grid mt-3">
-          {data.items.map((it) =>
+          {shown.map((it) =>
             it.reference.kind === "scene" ? (
               <SceneCard
                 key={`${it.reference.provider}:${it.reference.id}`}

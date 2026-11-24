@@ -58,6 +58,13 @@ const initial = () => ({
     stashdb: { configured: true, source: "stored" },
     typesafe: { configured: true, source: "stored" },
   },
+  discord: {
+    configured: true,
+    source: "environment",
+    includeTitles: false,
+    includeTitlesSource: "environment",
+    stored: false,
+  },
   proseChat: {
     enabled: false,
     url: "",
@@ -76,7 +83,26 @@ const initial = () => ({
 let config = initial(),
   mode = {},
   requests = [],
-  generation = 0;
+  generation = 0,
+  discordOverrides = {};
+const updateDiscord = () => {
+  const environment = mode.environmentDiscord ?? {
+    configured: true,
+    includeTitles: false,
+  };
+  config.discord = {
+    configured: Boolean(
+      discordOverrides.webhookStored || environment.configured,
+    ),
+    source: discordOverrides.webhookStored ? "stored" : "environment",
+    includeTitles: discordOverrides.includeTitles ?? environment.includeTitles,
+    includeTitlesSource:
+      discordOverrides.includeTitles !== undefined ? "stored" : "environment",
+    stored:
+      Boolean(discordOverrides.webhookStored) ||
+      discordOverrides.includeTitles !== undefined,
+  };
+};
 const heldConfig = new Set(),
   heldPatch = new Set(),
   heldProbe = new Set();
@@ -85,6 +111,11 @@ const release = (pending) => {
   pending.clear();
 };
 const hold = (pending) => new Promise((resolve) => pending.add(resolve));
+// holdProbe: true holds every probe; a path substring holds only the
+// matching probes, so one card can stay pending while its peers settle.
+const probeHeld = (path) =>
+  mode.holdProbe === true ||
+  (typeof mode.holdProbe === "string" && path.includes(mode.holdProbe));
 const json = (res, code, body) => {
   res.writeHead(code, {
     "content-type": "application/json",
@@ -105,6 +136,7 @@ const server = http.createServer(async (req, res) => {
         generation++;
         config = initial();
         mode = {};
+        discordOverrides = {};
         requests = [];
         release(heldConfig);
         release(heldPatch);
@@ -112,6 +144,7 @@ const server = http.createServer(async (req, res) => {
       }
       if (update.config) config = update.config;
       Object.assign(mode, update);
+      if ("environmentDiscord" in update || !config.discord) updateDiscord();
       if (!mode.holdConfig) release(heldConfig);
       if (!mode.holdPatch) release(heldPatch);
       if (!mode.holdProbe) release(heldProbe);
@@ -132,6 +165,9 @@ const server = http.createServer(async (req, res) => {
     for await (const c of req) body += c;
     const request = {
       path,
+      query: Object.fromEntries(
+        new URL(req.url, "http://127.0.0.1").searchParams,
+      ),
       method: req.method,
       body: body ? JSON.parse(body) : null,
       started: Date.now(),
@@ -166,6 +202,20 @@ const server = http.createServer(async (req, res) => {
         updateAvailable: false,
       });
     if (path === "/api/requests") return json(res, 200, { requests: [] });
+    if (path === "/api/libraries")
+      return json(res, 200, {
+        libraries: [{ id: "review-library", name: "Review library" }],
+      });
+    if (path === "/api/library") {
+      const library = mode.library;
+      if (!library)
+        return error(res, 404, "Unexpected test API route: " + path);
+      const url = new URL(req.url, "http://127.0.0.1");
+      const start = Number(url.searchParams.get("start") || 0);
+      const limit = Number(url.searchParams.get("limit") || 24);
+      const items = start === 0 ? library.page0 : library.pageN;
+      return json(res, 200, { items, total: library.total, start, limit });
+    }
     if (path === "/api/admin/integrations") {
       if (req.method === "GET" && mode.holdConfig) await hold(heldConfig);
       if (requestGeneration !== generation)
@@ -220,6 +270,12 @@ const server = http.createServer(async (req, res) => {
               configured: Boolean(b[key] || mode.environmentProviders?.[id]),
               source: b[key] ? "stored" : "environment",
             };
+        if ("discordWebhookUrl" in b)
+          discordOverrides.webhookStored = Boolean(b.discordWebhookUrl);
+        if ("discordIncludeTitles" in b)
+          discordOverrides.includeTitles = b.discordIncludeTitles ?? undefined;
+        if ("discordWebhookUrl" in b || "discordIncludeTitles" in b)
+          updateDiscord();
         if ("judgmentProvider" in b)
           config.judgment = {
             ...config.judgment,
@@ -264,9 +320,32 @@ const server = http.createServer(async (req, res) => {
         );
       return json(res, 200, config);
     }
+    if (path === "/api/admin/discord" || path === "/api/admin/discord/test") {
+      const draftTest = path.endsWith("/test");
+      if (probeHeld(path)) await hold(heldProbe);
+      if (requestGeneration !== generation)
+        return error(res, 409, "Obsolete test request.");
+      if (mode.discord403) return error(res, 403, "Administrators only.");
+      if (mode.discordHttpFail)
+        return error(res, 503, "The synthetic Discord check is unavailable.");
+      const configured = Boolean(
+        (draftTest && request.body?.webhookUrl?.trim()) ||
+        config.discord?.configured,
+      );
+      if (!configured) return json(res, 200, { configured: false });
+      if (draftTest ? mode.discordDraftFail : mode.discordFail)
+        return json(res, 200, {
+          configured: true,
+          error: {
+            code: "upstream_auth",
+            message: "The synthetic Discord webhook was rejected.",
+          },
+        });
+      return json(res, 200, { configured: true });
+    }
     if (/^\/api\/admin\/(jellyfin|whisparr)\/test$/.test(path)) {
       const service = path.split("/")[3];
-      if (mode.holdProbe) await hold(heldProbe);
+      if (probeHeld(path)) await hold(heldProbe);
       if (requestGeneration !== generation)
         return error(res, 409, "Obsolete test request.");
       if (mode[service + "403"]) return error(res, 403, "Administrators only.");
@@ -294,7 +373,7 @@ const server = http.createServer(async (req, res) => {
     }
     if (path === "/api/admin/jellyfin" || path === "/api/admin/whisparr") {
       const service = path.split("/").at(-1);
-      if (mode.holdProbe) await hold(heldProbe);
+      if (probeHeld(path)) await hold(heldProbe);
       if (requestGeneration !== generation)
         return error(res, 409, "Obsolete test request.");
       if (mode[service + "403"]) return error(res, 403, "Administrators only.");
@@ -337,7 +416,7 @@ const server = http.createServer(async (req, res) => {
     if (path.startsWith("/api/admin/providers/")) {
       const provider = path.split("/")[4];
       const draftTest = path.endsWith("/test");
-      if (mode.holdProbe) await hold(heldProbe);
+      if (probeHeld(path)) await hold(heldProbe);
       if (requestGeneration !== generation)
         return error(res, 409, "Obsolete test request.");
       if (mode[provider + "403"])
@@ -401,7 +480,7 @@ const server = http.createServer(async (req, res) => {
       );
     }
     if (path === "/api/admin/prose/check") {
-      if (mode.holdProbe) await hold(heldProbe);
+      if (probeHeld(path)) await hold(heldProbe);
       if (requestGeneration !== generation)
         return error(res, 409, "Obsolete test request.");
       if (mode.prose403) return error(res, 403, "Administrators only.");
@@ -412,8 +491,32 @@ const server = http.createServer(async (req, res) => {
           : {}),
       });
     }
+    // The editor's draft check (typed values, nothing stored) and the model
+    // list behind its suggestions; same failure modes as the saved check.
+    if (path === "/api/admin/prose/test") {
+      if (probeHeld(path)) await hold(heldProbe);
+      if (requestGeneration !== generation)
+        return error(res, 409, "Obsolete test request.");
+      if (mode.prose403) return error(res, 403, "Administrators only.");
+      return json(res, 200, {
+        connected: !mode.proseFail,
+        ...(mode.proseFail
+          ? { error: "The synthetic chat server is unavailable." }
+          : {}),
+      });
+    }
+    if (path === "/api/admin/prose/models") {
+      if (mode.prose403) return error(res, 403, "Administrators only.");
+      return json(
+        res,
+        200,
+        mode.proseFail
+          ? { models: [], error: "The synthetic chat server is unavailable." }
+          : { models: ["synthetic-model"] },
+      );
+    }
     if (path === "/api/admin/judgment/check") {
-      if (mode.holdProbe) await hold(heldProbe);
+      if (probeHeld(path)) await hold(heldProbe);
       if (requestGeneration !== generation)
         return error(res, 409, "Obsolete test request.");
       if (mode.judgment403) return error(res, 403, "Administrators only.");

@@ -45,6 +45,7 @@ import {
 } from "../src/lib/browse-entities.ts";
 import {
   browseTitles,
+  includeIdsForSide,
   parseBrowseQuery,
   planBrowseSides,
   searchBrowseTags,
@@ -934,8 +935,12 @@ const ready = (ids: string[]) => ({ complete: true, dropped: false, ids });
 
 test("resolveIncludeCriteria joins singleton expansions with anchored ids in the all-of criterion", () => {
   // The single-tag all-of rule: a singleton group is as good as an anchored
-  // id (an AND match carries it), and multi-id terms keep the local
-  // re-check.
+  // id (an AND match carries it). A complete multi-id group beside an
+  // anchored id (or a singleton) no longer re-checks locally: it fans out
+  // into one native all-of stream per id (VELV-204), so its term leaves
+  // the local re-check and freeTextNative follows the fan-out.
+  // Moved pin: the multi-id group planned localTermIndexes [1]; it now
+  // plans the fan-out group instead.
   assert.deepEqual(
     resolveIncludeCriteria(
       [uuid(1)],
@@ -944,19 +949,23 @@ test("resolveIncludeCriteria joins singleton expansions with anchored ids in the
     {
       allOf: [uuid(1), uuid(9)],
       anyOf: [],
-      localTermIndexes: [1],
+      fanoutIds: [uuid(2), uuid(3)],
+      localTermIndexes: [],
       freeTextNative: true,
       provablyEmpty: false,
     },
   );
-  // Anchored ids alone: the all-of path with nothing free riding native.
+  // Moved pin: without a singleton the multi group re-checked locally and
+  // freeTextNative stayed false; the anchored+group mix now fans out, and
+  // a non-empty fan-out group alone keeps the soft ceiling.
   assert.deepEqual(
     resolveIncludeCriteria([uuid(1)], [ready([uuid(2), uuid(3)])]),
     {
       allOf: [uuid(1)],
       anyOf: [],
-      localTermIndexes: [0],
-      freeTextNative: false,
+      fanoutIds: [uuid(2), uuid(3)],
+      localTermIndexes: [],
+      freeTextNative: true,
       provablyEmpty: false,
     },
   );
@@ -966,8 +975,12 @@ test("resolveIncludeCriteria joins singleton expansions with anchored ids in the
     [ready([uuid(7)]), ready([uuid(8), uuid(9)])],
   );
   assert.deepEqual(deduped.allOf, [uuid(7)]);
-  assert.deepEqual(deduped.localTermIndexes, [1]);
+  // Moved pin: the {8,9} group used to re-check locally (localTermIndexes
+  // [1]); it now rides the fan-out streams (allOf ∪ {8}, allOf ∪ {9}), so
+  // it leaves the local re-check entirely.
+  assert.deepEqual(deduped.localTermIndexes, []);
   assert.equal(deduped.freeTextNative, true);
+  assert.deepEqual(deduped.fanoutIds, [uuid(8), uuid(9)]);
 });
 
 test("resolveIncludeCriteria rides the smallest group as any-of and keeps the rest local", () => {
@@ -981,6 +994,7 @@ test("resolveIncludeCriteria rides the smallest group as any-of and keeps the re
     {
       allOf: [],
       anyOf: [uuid(4), uuid(5)],
+      fanoutIds: [],
       localTermIndexes: [0],
       freeTextNative: true,
       provablyEmpty: false,
@@ -1002,8 +1016,10 @@ test("resolveIncludeCriteria routes a union past the native id cap to local filt
   );
   assert.equal(atCap.anyOf.length, TAG_FILTER_ID_CAP);
   assert.equal(atCap.freeTextNative, true);
+  assert.deepEqual(atCap.fanoutIds, []);
   // One id more and the criterion would silently ignore its tail upstream:
-  // the whole group filters locally instead.
+  // the whole group filters locally instead. A 26-id group also exceeds the
+  // fan-out cap (FANOUT_GROUP_CAP = 5), so it never fans out either way.
   assert.deepEqual(
     resolveIncludeCriteria(
       [],
@@ -1016,6 +1032,7 @@ test("resolveIncludeCriteria routes a union past the native id cap to local filt
     {
       allOf: [],
       anyOf: [],
+      fanoutIds: [],
       localTermIndexes: [0],
       freeTextNative: false,
       provablyEmpty: false,
@@ -1035,6 +1052,7 @@ test("resolveIncludeCriteria routes a union past the native id cap to local filt
     {
       allOf: [uuid(9)],
       anyOf: [],
+      fanoutIds: [],
       localTermIndexes: [0],
       freeTextNative: false,
       provablyEmpty: false,
@@ -1045,6 +1063,7 @@ test("resolveIncludeCriteria routes a union past the native id cap to local filt
   assert.deepEqual(resolveIncludeCriteria([], []), {
     allOf: [],
     anyOf: [],
+    fanoutIds: [],
     localTermIndexes: [],
     freeTextNative: false,
     provablyEmpty: false,
@@ -1061,6 +1080,7 @@ test("resolveIncludeCriteria keeps the whole group local when any term expands i
       {
         allOf: [uuid(9)],
         anyOf: [],
+        fanoutIds: [],
         localTermIndexes: [0, 1],
         freeTextNative: false,
         provablyEmpty: false,
@@ -1071,6 +1091,7 @@ test("resolveIncludeCriteria keeps the whole group local when any term expands i
   assert.deepEqual(resolveIncludeCriteria([uuid(9)], []), {
     allOf: [uuid(9)],
     anyOf: [],
+    fanoutIds: [],
     localTermIndexes: [],
     freeTextNative: false,
     provablyEmpty: false,
@@ -1087,6 +1108,7 @@ test("resolveIncludeCriteria reads a complete empty expansion as a provably empt
     {
       allOf: [],
       anyOf: [],
+      fanoutIds: [],
       localTermIndexes: [0],
       freeTextNative: false,
       provablyEmpty: true,
@@ -1102,6 +1124,7 @@ test("resolveIncludeCriteria reads a complete empty expansion as a provably empt
     {
       allOf: [uuid(9)],
       anyOf: [],
+      fanoutIds: [],
       localTermIndexes: [0],
       freeTextNative: false,
       provablyEmpty: true,
@@ -1132,7 +1155,10 @@ test("resolveIncludeCriteria reads a complete empty expansion as a provably empt
   );
 });
 
-test("softCeilingFor degrades only a native free-text term that still re-checks locally", () => {
+test("softCeilingFor degrades a native free-text re-check and a fan-out stream", () => {
+  // Moved pin: the name said "only a native free-text term that still
+  // re-checks locally" — a fan-out stream now degrades too (fanoutNative),
+  // even when no term re-checks locally.
   assert.equal(
     softCeilingFor({ localInclude: [{}], freeTextNative: true }),
     true,
@@ -1149,6 +1175,52 @@ test("softCeilingFor degrades only a native free-text term that still re-checks 
     softCeilingFor({ localInclude: [], freeTextNative: false }),
     false,
   );
+  // A fan-out stream degrades: its pages were productive all-of reads even
+  // when no term re-checks locally, so the matches found are a real
+  // partial answer.
+  assert.equal(
+    softCeilingFor({
+      localInclude: [],
+      freeTextNative: false,
+      fanoutNative: true,
+    }),
+    true,
+  );
+  assert.equal(
+    softCeilingFor({
+      localInclude: [{}],
+      freeTextNative: false,
+      fanoutNative: true,
+    }),
+    true,
+  );
+});
+
+test("resolveIncludeCriteria fans out the smallest fitting group beside anchored ids", () => {
+  // Beside an anchored id, a complete 2..FANOUT_GROUP_CAP group fans out:
+  // one native all-of stream per id. A group above the fan-out cap (7 > 5)
+  // stays local; the pick takes the fewest ids, ties first in input order.
+  const fanned = resolveIncludeCriteria(
+    [uuid(9)],
+    [
+      ready([uuid(1), uuid(2), uuid(3)]),
+      ready([uuid(4), uuid(5), uuid(6), uuid(7), uuid(8), uuid(10), uuid(11)]),
+    ],
+  );
+  assert.deepEqual(fanned.fanoutIds, [uuid(1), uuid(2), uuid(3)]);
+  assert.deepEqual(fanned.localTermIndexes, [1]);
+  assert.equal(fanned.freeTextNative, true);
+  // Native-cap fit guard: 24 anchored ids + a 2-id group is 26 ids, past
+  // TAG_FILTER_ID_CAP (25) — the native criterion would silently ignore
+  // its tail, so nothing fans out and both groups keep the local
+  // re-check; no singleton exists, so nothing rides free-text native.
+  const noFit = resolveIncludeCriteria(
+    Array.from({ length: 24 }, (_, i) => uuid(30 + i)),
+    [ready([uuid(1), uuid(2)]), ready([uuid(3), uuid(4), uuid(5)])],
+  );
+  assert.deepEqual(noFit.fanoutIds, []);
+  assert.deepEqual(noFit.localTermIndexes, [0, 1]);
+  assert.equal(noFit.freeTextNative, false);
 });
 
 test("scanCeilingOutcome throws hard ceilings and degrades soft ones to scan_ceiling", () => {
@@ -2600,7 +2672,7 @@ test("searchBrowseTags never returns a non-UUID tpdb id", async () => {
   );
 });
 
-test("a multi-match free-text AND pre-filters natively, ANDs locally, and degrades at the scan ceiling instead of erroring", async () => {
+test("a singleton free-text term beside a multi-match term fans out and degrades at the scan ceiling instead of erroring", async () => {
   const TAG_XYZ_A = { id: 11, uuid: uuid(101), name: "XYZ Special" };
   const TAG_XYZ_B = { id: 12, uuid: uuid(102), name: "XYZ Thing" };
   const TAG_ABC = { id: 13, uuid: uuid(103), name: "ABC Thing" };
@@ -2609,11 +2681,12 @@ test("a multi-match free-text AND pre-filters natively, ANDs locally, and degrad
   await runBrowse(
     scriptedUpstream({
       tagRows: [TAG_XYZ_A, TAG_XYZ_B, TAG_ABC],
-      // abc's expansion is the singleton tag 13: it rides the all-of
-      // criterion and xyz keeps the local re-check. The fixture returns
-      // every row regardless of the native filter; the endless abc-only
-      // rows are what a faithful upstream would return, and their missing
-      // xyz tag never fills the page, so the stream runs to its ceiling.
+      // abc's expansion is the singleton tag 13: it joins the all-of
+      // criterion and the xyz pair fans out beside it — one native
+      // all-of stream per xyz id. The fixture returns every row
+      // regardless of the native filter, so the abc-only row reaches
+      // both streams; the shared dedupe set surfaces it once, and with
+      // no local re-check left both streams refill until the ceiling.
       moviePages: [
         {
           rows: [tpdbRow(uuid(2), "Only abc", "2024-02-01", [TAG_ABC])],
@@ -2642,20 +2715,98 @@ test("a multi-match free-text AND pre-filters natively, ANDs locally, and degrad
         },
         [],
       );
-      // The smallest term's expansion is a single tag: it rides the
-      // all-of criterion alone and the other term ANDs locally; the
-      // ceiling degrades the browse instead of 422ing.
+      // Moved pin: abc rode the all-of criterion alone and xyz kept the
+      // local re-check, so one stream starved to the ceiling (40 reads,
+      // empty page). xyz now fans out beside the abc anchor: both
+      // streams carry abc plus one xyz id, degrade softly at the
+      // ceiling, and the fixture's only row still surfaces — deduped to
+      // one entry.
       assert.match(movieUrls.join("\n"), /tags%5B13%5D=1|tags\[13\]=1/);
       assert.match(movieUrls.join("\n"), /tag_and=1/);
-      assert.doesNotMatch(movieUrls.join("\n"), /tags%5B11%5D=1|tags\[11\]=1/);
+      assert.match(movieUrls.join("\n"), /tags%5B11%5D=1|tags\[11\]=1/);
+      assert.match(movieUrls.join("\n"), /tags%5B12%5D=1|tags\[12\]=1/);
+      // Moved pin (VELV-240): the request's per-provider page pool caps the
+      // whole browse at MAX_SCAN_PAGES (40) reads, so the fan-out's two
+      // streams share one 40-read budget instead of doubling it.
       assert.equal(moviesCalled, 40);
-      assert.deepEqual(page.items, []);
+      assert.deepEqual(
+        page.items.map((d) => d.reference.id),
+        [uuid(2)],
+      );
       assert.equal(page.totalCountKnown, false);
       assert.equal(page.hasMore, false);
       assert.deepEqual(
         page.errors.map((e) => [e.provider, e.code]),
         [["tpdb", "scan_ceiling"]],
       );
+    },
+  );
+});
+
+test("fan-out streams share 40 reads per provider, not 40 reads across providers", async () => {
+  const tags = [
+    { id: 11, uuid: uuid(101), name: "XYZ Special" },
+    { id: 12, uuid: uuid(102), name: "XYZ Thing" },
+    { id: 13, uuid: uuid(103), name: "ABC Thing" },
+  ];
+  const sceneTags = tags.map((tag) => ({ id: tag.uuid, name: tag.name }));
+  let movieReads = 0;
+  let sceneReads = 0;
+  await runBrowse(
+    scriptedUpstream({
+      tagRows: tags,
+      stashQueryTagRows: sceneTags,
+      moviePages: [
+        {
+          rows: [tpdbRow(uuid(1), "Movie", "2024-02-01", tags)],
+          next: "x",
+          total: 10000,
+        },
+      ],
+      scenes: {
+        count: 10000,
+        rows: [stashRow(uuid(1), "Scene", "2024-01-01", sceneTags)],
+      },
+      onMovieRequest: () => {
+        movieReads += 1;
+      },
+      onScenesRequest: () => {
+        sceneReads += 1;
+      },
+    }),
+    async () => {
+      const page = await browseTitles(
+        {
+          type: "all",
+          include: [{ name: "xyz" }, { name: "abc" }],
+          exclude: [],
+          studioMode: "exact",
+          performers: [],
+          studios: [],
+          performerMode: "all",
+          page: 1,
+          perPage: 10,
+        },
+        [],
+      );
+      assert.equal(movieReads, 40);
+      assert.equal(sceneReads, 40);
+      assert.deepEqual(
+        page.items.map((item) => [item.reference.provider, item.reference.id]),
+        [
+          ["tpdb", uuid(1)],
+          ["stashdb", uuid(1)],
+        ],
+      );
+      assert.deepEqual(
+        page.errors.map((error) => [error.provider, error.code]).sort(),
+        [
+          ["stashdb", "scan_ceiling"],
+          ["tpdb", "scan_ceiling"],
+        ],
+      );
+      assert.equal(page.totalCountKnown, false);
+      assert.equal(page.hasMore, false);
     },
   );
 });
@@ -2678,9 +2829,7 @@ test("a multi-match free-text AND returns the partial matches beside the ceiling
           total: 10000,
         },
         {
-          // The endless continuation only ever carries the abc tag (what
-          // the native tag_and pre-filter would return), so the local xyz
-          // AND never fills the page again.
+          // The endless continuation only ever carries the abc tag.
           rows: [tpdbRow(uuid(2), "Only abc", "2024-02-01", [TAG_ABC])],
           next: "x",
           total: 10000,
@@ -2703,10 +2852,16 @@ test("a multi-match free-text AND returns the partial matches beside the ceiling
         },
         [],
       );
-      // The one real AND match survives beside the named incompleteness.
+      // Moved pin: with xyz re-checking locally only the full AND match
+      // survived ([uuid(1)]). xyz now fans out beside the abc anchor, so
+      // no term re-checks locally and the fixture's abc-only row — which
+      // the fixture returns regardless of the native tag filter —
+      // surfaces too, once, via the shared dedupe set. Both fan-out
+      // streams then run to the soft ceiling: the matches found are a
+      // real partial answer beside the named incompleteness.
       assert.deepEqual(
         page.items.map((d) => d.reference.id),
-        [uuid(1)],
+        [uuid(1), uuid(2)],
       );
       assert.equal(page.totalCountKnown, false);
       assert.deepEqual(
@@ -2724,10 +2879,9 @@ test("a scan-ceiling side beside a real outage returns the partial page, not a 5
   await runBrowse(
     scriptedUpstream({
       tagRows: [TAG_XYZ_A, TAG_XYZ_B, TAG_ABC],
-      // Endless pages of abc-only rows (what the native tag_and pre-filter
-      // would return): the local xyz AND never fills the page, so the TPDB
-      // stream runs to its ceiling — a bounded matchless answer, not an
-      // outage.
+      // Endless pages of abc-only rows: the xyz pair fans out beside the
+      // abc anchor, no term re-checks locally, and both fan-out streams
+      // refill until their ceiling — a bounded answer, not an outage.
       moviePages: [
         {
           rows: [tpdbRow(uuid(2), "Only abc", "2024-02-01", [TAG_ABC])],
@@ -2756,9 +2910,15 @@ test("a scan-ceiling side beside a real outage returns the partial page, not a 5
         },
         [],
       );
-      // Ceiling beside outage is a partial (matchless) page with both
+      // Moved pin: the page was empty while the local xyz re-check kept
+      // every row out; the fan-out removed that re-check, so the
+      // fixture's abc-only row surfaces once (deduped across the two
+      // streams). Ceiling beside outage stays a partial page with both
       // errors named, never a 502 provider_unavailable.
-      assert.deepEqual(page.items, []);
+      assert.deepEqual(
+        page.items.map((d) => d.reference.id),
+        [uuid(2)],
+      );
       assert.equal(page.totalCountKnown, false);
       assert.equal(page.hasMore, false);
       assert.deepEqual(
@@ -2980,6 +3140,131 @@ test("a multi-match free-text AND with no singleton sends the smallest expansion
       assert.equal(page.total, 1);
       assert.equal(page.totalCountKnown, true);
       assert.deepEqual(page.errors, []);
+    },
+  );
+});
+
+// --- the or-group union at walk scale: VELV-241 perf regression ---
+
+// 25 one-letter terms are the route's group cap (MAX_HIDDEN_TAGS) and the
+// listing walk caps at 5000 rows, so this is the worst union a legal group
+// can build: the deduped set holds all 5000 ids. The union build must keep
+// the same deduped set and push order after the Set rewrite (VELV-241:
+// validation #VELV-247 timed the Array.includes dedupe at 565 ms per warm
+// side on a 1-vCPU sandbox; the dev box timed the same call at ~50 ms).
+const UNION_LETTERS = "abcdefghijklmnopqrstuvwxy".split("");
+
+function unionListingPages(buildName: (i: number) => string): TpdbPage[] {
+  const rows = Array.from({ length: 5000 }, (_, i) => ({
+    id: i + 1,
+    uuid: uuid(i),
+    name: buildName(i),
+  }));
+  // Page 50 ends with next: null, so the walk completes at exactly the
+  // 5000-row cap instead of degrading to an incomplete listing.
+  return Array.from({ length: 50 }, (_, p) => ({
+    rows: rows.slice(p * 100, p * 100 + 100),
+    next: p === 49 ? null : `next-${p}`,
+    total: 5000,
+  }));
+}
+
+test("an or-group of 25 one-letter terms over a 5000-row listing keeps the deduped union ids and routes past the native cap locally", async () => {
+  // Every row matches exactly one letter, so the union holds all 5000 ids:
+  // past TAG_FILTER_ID_CAP, the whole group filters locally.
+  await runBrowse(
+    scriptedUpstream({
+      tagRows: [],
+      moviePages: [],
+      scenes: { count: 0, rows: [] },
+      tpdbTagPages: unionListingPages((i) => `${UNION_LETTERS[i % 25]}${i}`),
+    }),
+    async () => {
+      const group = UNION_LETTERS.map((name) => ({ name }));
+      const resolved = await includeIdsForSide([group], "tpdb", true);
+      assert.deepEqual(resolved, {
+        allOf: [],
+        anyOf: [],
+        localInclude: [group],
+        localFree: [group],
+        freeTextNative: false,
+        fanoutIds: [],
+      });
+    },
+  );
+  resetMetaCache();
+  // Overlapping rows: "ab0" matches both "a" and "b", so the union dedupe
+  // skips repeats; the 25 distinct ids sit at TAG_FILTER_ID_CAP and ride the
+  // native any-of. The pinned order is the union's first-seen order: a's
+  // rows (0, 24), then each later letter's one new row (1..23).
+  await runBrowse(
+    scriptedUpstream({
+      tagRows: [],
+      moviePages: [],
+      scenes: { count: 0, rows: [] },
+      tpdbTagPages: unionListingPages((i) =>
+        i < 25
+          ? `${UNION_LETTERS[i]}${UNION_LETTERS[(i + 1) % 25]}${i}`
+          : `z${i}`,
+      ),
+    }),
+    async () => {
+      const group = UNION_LETTERS.map((name) => ({ name }));
+      const resolved = await includeIdsForSide([group], "tpdb", true);
+      assert.ok(resolved !== undefined);
+      assert.deepEqual(resolved.anyOf, [
+        uuid(0),
+        uuid(24),
+        ...Array.from({ length: 23 }, (_, k) => uuid(k + 1)),
+      ]);
+      assert.deepEqual(resolved, {
+        allOf: [],
+        anyOf: [
+          uuid(0),
+          uuid(24),
+          ...Array.from({ length: 23 }, (_, k) => uuid(k + 1)),
+        ],
+        localInclude: [],
+        localFree: [],
+        freeTextNative: true,
+        fanoutIds: [],
+      });
+    },
+  );
+});
+
+test("an or-group dedupes direct, expanded, and counterpart ids in first-seen order", async () => {
+  const tags = [
+    { id: 11, uuid: uuid(101), name: "Alpha" },
+    { id: 12, uuid: uuid(102), name: "Beta" },
+    { id: 13, uuid: uuid(103), name: "Gamma" },
+  ];
+  await runBrowse(
+    scriptedUpstream({
+      tagRows: tags,
+      moviePages: [],
+      scenes: { count: 0, rows: [] },
+    }),
+    async () => {
+      const resolved = await includeIdsForSide(
+        [
+          [
+            { name: "Alpha", tpdb: uuid(101) },
+            { name: "alpha" },
+            { name: "beta" },
+            { name: "Beta", tpdb: uuid(102) },
+            { name: "Beta", stashdb: uuid(202) },
+            { name: "Gamma", stashdb: uuid(203) },
+            { name: "Gamma", tpdb: uuid(103) },
+            { name: "Gamma", stashdb: uuid(203) },
+          ],
+        ],
+        "tpdb",
+        true,
+      );
+      assert.ok(resolved !== undefined);
+      assert.deepEqual(resolved.anyOf, [uuid(101), uuid(102), uuid(103)]);
+      assert.deepEqual(resolved.localInclude, []);
     },
   );
 });
@@ -3789,21 +4074,381 @@ test("an anchored tag beside a matchless free-text term answers provably empty",
   );
 });
 
-test("an anchored tag beside a multi-match free-text term keeps the hard ceiling error", async () => {
-  // The ceiling contract the test above moved: when the free term DOES
-  // match published tags — several, so it re-checks locally beside the
-  // native anchor — absence is not provable, and the endless source
-  // meets the documented 40-page ceiling.
+test("an anchored tag beside a multi-match free-text term fans out into all-of streams instead of starving", async () => {
+  // Moved pin: this test held the hard 422 here — the multi-match term
+  // re-checked locally beside the native anchor and the one stream starved
+  // into the 40-page scan ceiling. The side now fans out: one native
+  // all-of stream per matched tag id, so both streams exhaust in one page
+  // each and a title carrying two of the matched ids surfaces once.
   const TAG_ANCHOR = { id: 15, uuid: uuid(105), name: "Anchor Tag" };
   const TAG_XYZ_A = { id: 16, uuid: uuid(106), name: "XYZ Alpha" };
   const TAG_XYZ_B = { id: 17, uuid: uuid(107), name: "XYZ Beta" };
+  const BOTH_ROW = tpdbRow(uuid(3), "Both xyz tags", "2025-06-01", [
+    TAG_ANCHOR,
+    TAG_XYZ_A,
+    TAG_XYZ_B,
+  ]);
   let moviesCalled = 0;
+  const movieQs: string[] = [];
   await runBrowse(
     scriptedUpstream({
       tagRows: [TAG_ANCHOR, TAG_XYZ_A, TAG_XYZ_B],
+      // Request order = fan-out stream order: stream A carries
+      // [ANCHOR, XYZ Alpha], stream B [ANCHOR, XYZ Beta]. Both pages also
+      // return the title tagged with BOTH matched ids: the shared dedupe
+      // set must surface it exactly once.
       moviePages: [
         {
-          rows: [tpdbRow(uuid(9), "Anchor only", "2024-01-01", [TAG_ANCHOR])],
+          rows: [
+            BOTH_ROW,
+            tpdbRow(uuid(1), "Anchor alpha", "2025-05-01", [
+              TAG_ANCHOR,
+              TAG_XYZ_A,
+            ]),
+          ],
+          next: null,
+          total: 2,
+        },
+        {
+          rows: [
+            BOTH_ROW,
+            tpdbRow(uuid(2), "Anchor beta", "2025-04-01", [
+              TAG_ANCHOR,
+              TAG_XYZ_B,
+            ]),
+          ],
+          next: null,
+          total: 2,
+        },
+      ],
+      scenes: { count: 0, rows: [] },
+      onMovieRequest: (_page, qs) => {
+        moviesCalled += 1;
+        movieQs.push(qs.toString());
+      },
+    }),
+    async () => {
+      const page = await browseTitles(
+        {
+          type: "movie",
+          include: [
+            { name: TAG_ANCHOR.name, tpdb: TAG_ANCHOR.uuid },
+            { name: "xyz" },
+          ],
+          exclude: [],
+          studioMode: "exact",
+          performers: [],
+          studios: [],
+          performerMode: "all",
+          page: 1,
+          perPage: 10,
+        },
+        [],
+      );
+      assert.deepEqual(
+        [...page.items.map((d) => d.reference.id)].sort(),
+        [uuid(1), uuid(2), uuid(3)].sort(),
+      );
+      assert.equal(
+        page.items.filter((d) => d.reference.id === uuid(3)).length,
+        1,
+      );
+      assert.equal(page.totalCountKnown, true);
+      assert.equal(page.hasMore, false);
+      assert.equal(moviesCalled, 2);
+      // Stream A's read carries the anchored id and the first matched id;
+      // stream B's carries the anchored id and the second.
+      assert.match(movieQs[0]!, /tag_and=1/);
+      assert.match(movieQs[0]!, /tags%5B15%5D=1/);
+      assert.match(movieQs[0]!, /tags%5B16%5D=1/);
+      assert.doesNotMatch(movieQs[0]!, /tags%5B17%5D=1/);
+      assert.match(movieQs[1]!, /tag_and=1/);
+      assert.match(movieQs[1]!, /tags%5B15%5D=1/);
+      assert.match(movieQs[1]!, /tags%5B17%5D=1/);
+      assert.doesNotMatch(movieQs[1]!, /tags%5B16%5D=1/);
+    },
+  );
+});
+
+test("an anchored chip beside two multi-match free terms fills the page by fanning out instead of 422ing", async () => {
+  const TAG_ANCHOR = { id: 15, uuid: uuid(105), name: "Anchor Tag" };
+  const TAG_YOUNG = { id: 11, uuid: uuid(111), name: "Young" };
+  const TAG_YOUNG_W = { id: 12, uuid: uuid(112), name: "Young Woman" };
+  const TAG_OLD = { id: 13, uuid: uuid(113), name: "Old" };
+  const TAG_OLD_M = { id: 14, uuid: uuid(114), name: "Old Man" };
+  let moviesCalled = 0;
+  await runBrowse(
+    scriptedUpstream({
+      tagRows: [TAG_ANCHOR, TAG_YOUNG, TAG_YOUNG_W, TAG_OLD, TAG_OLD_M],
+      // "young" and "old" both expand to two published tags; the size tie
+      // keeps the first group, so "young" fans out (stream 1 carries
+      // [ANCHOR, Young], stream 2 [ANCHOR, Young Woman]) and the old
+      // group re-checks locally.
+      moviePages: [
+        {
+          rows: [
+            tpdbRow(uuid(1), "Young and old", "2025-06-01", [
+              TAG_ANCHOR,
+              TAG_YOUNG,
+              TAG_OLD,
+              TAG_OLD_M,
+            ]),
+            // Carries the young half only: the local old re-check drops it.
+            tpdbRow(uuid(2), "Young only", "2025-05-01", [
+              TAG_ANCHOR,
+              TAG_YOUNG,
+            ]),
+          ],
+          next: null,
+          total: 2,
+        },
+        {
+          rows: [
+            tpdbRow(uuid(3), "Young woman and old", "2024-06-01", [
+              TAG_ANCHOR,
+              TAG_YOUNG_W,
+              TAG_OLD,
+            ]),
+          ],
+          next: null,
+          total: 1,
+        },
+      ],
+      scenes: { count: 0, rows: [] },
+      onMovieRequest: () => {
+        moviesCalled += 1;
+      },
+    }),
+    async () => {
+      // Before the fan-out both free terms re-checked locally beside the
+      // native anchor; on an endless non-matching listing that shape
+      // starved into the 422 (the moved pin above). Here the young group
+      // fans out into productive native streams, and the guard is the
+      // call count: an uncapped fan-out or an extra read breaks this pin.
+      const page = await browseTitles(
+        {
+          type: "movie",
+          include: [
+            { name: TAG_ANCHOR.name, tpdb: TAG_ANCHOR.uuid },
+            { name: "young" },
+            { name: "old" },
+          ],
+          exclude: [],
+          studioMode: "exact",
+          performers: [],
+          studios: [],
+          performerMode: "all",
+          page: 1,
+          perPage: 10,
+        },
+        [],
+      );
+      // Both kept rows surface in stream order (stream 1's row is newer),
+      // and the totals are exhaustion-exact.
+      assert.deepEqual(
+        page.items.map((d) => d.reference.id),
+        [uuid(1), uuid(3)],
+      );
+      assert.equal(page.totalCountKnown, true);
+      assert.equal(page.total, 2);
+      assert.equal(page.hasMore, false);
+      assert.equal(moviesCalled, 2);
+    },
+  );
+});
+
+test("a fan-out browse pages the merged union without repeats or gaps", async () => {
+  const TAG_ANCHOR = { id: 15, uuid: uuid(105), name: "Anchor Tag" };
+  const TAG_YOUNG = { id: 11, uuid: uuid(111), name: "Young" };
+  const TAG_YOUNG_W = { id: 12, uuid: uuid(112), name: "Young Woman" };
+  // One free term beside the anchored chip fans out into two native
+  // all-of streams: anchor ∧ young, then anchor ∧ young woman. Each
+  // stream buffers exactly one exhausted page (next null), so the
+  // ordered recency merge interleaves them fairly: page 1 pops the two
+  // newest rows (one per stream), page 2 the two remaining. The rows
+  // model the native criteria — stream 1's page carries [anchor, young],
+  // stream 2's [anchor, young woman] — because a fan-out stream never
+  // re-checks its own group locally.
+  const youngPage = {
+    rows: [
+      tpdbRow(uuid(1), "Young r1", "2024-03-01", [TAG_ANCHOR, TAG_YOUNG]),
+      tpdbRow(uuid(2), "Young r2", "2024-01-01", [TAG_ANCHOR, TAG_YOUNG]),
+    ],
+    next: null,
+    total: 2,
+  };
+  const youngWomanPage = {
+    rows: [
+      tpdbRow(uuid(3), "Young woman r3", "2024-02-01", [
+        TAG_ANCHOR,
+        TAG_YOUNG_W,
+      ]),
+      tpdbRow(uuid(4), "Young woman r4", "2023-12-01", [
+        TAG_ANCHOR,
+        TAG_YOUNG_W,
+      ]),
+    ],
+    next: null,
+    total: 2,
+  };
+  let moviesCalled = 0;
+  await runBrowse(
+    scriptedUpstream({
+      tagRows: [TAG_ANCHOR, TAG_YOUNG, TAG_YOUNG_W],
+      // Per-call streams restart at upstream page 1 while the fixture's
+      // request counter advances across the whole test: entries 1 and 2
+      // serve the first call's streams, entries 3 and 4 the second
+      // call's streams — the same two listings, because the provider's
+      // upstream page 1 has not changed between calls. resetMetaCache
+      // between the calls defeats the process-lifetime upstream read
+      // cache, so the second call's page reads really reach the fixture.
+      moviePages: [youngPage, youngWomanPage, youngPage, youngWomanPage],
+      scenes: { count: 0, rows: [] },
+      onMovieRequest: () => {
+        moviesCalled += 1;
+      },
+    }),
+    async () => {
+      const query = {
+        type: "movie" as const,
+        include: [
+          { name: TAG_ANCHOR.name, tpdb: TAG_ANCHOR.uuid },
+          { name: "young" },
+        ],
+        exclude: [],
+        studioMode: "exact" as const,
+        performers: [],
+        studios: [],
+        performerMode: "all" as const,
+        perPage: 2,
+      };
+      // Page 1: the ordered merge pops the true recency minima across
+      // both streams — 2024-03 (stream 1), then 2024-02 (stream 2,
+      // newer than stream 1's 2024-01 row). Each stream still holds a
+      // buffered row, so the browse continues.
+      const page1 = await browseTitles({ ...query, page: 1 }, []);
+      assert.deepEqual(
+        page1.items.map((d) => d.reference.id),
+        [uuid(1), uuid(3)],
+      );
+      assert.equal(page1.hasMore, true);
+      resetMetaCache();
+      // Page 2: fresh streams re-read upstream page 1 (requests 3 and
+      // 4), so the merge replays the union's prefix past the start
+      // offset and slices the next two: 2024-01 (stream 1), 2023-12
+      // (stream 2). Both streams exhausted with empty buffers, so the
+      // browse ends.
+      const page2 = await browseTitles({ ...query, page: 2 }, []);
+      assert.deepEqual(
+        page2.items.map((d) => d.reference.id),
+        [uuid(2), uuid(4)],
+      );
+      assert.equal(page2.hasMore, false);
+      // No repeats, no gaps: pages 1 and 2 are exactly the merged
+      // union's four rows, each surfaced once.
+      const union = [...page1.items, ...page2.items].map((d) => d.reference.id);
+      assert.deepEqual(union, [uuid(1), uuid(3), uuid(2), uuid(4)]);
+      assert.equal(new Set(union).size, union.length);
+      // One upstream read per stream per browseTitles call.
+      assert.equal(moviesCalled, 4);
+    },
+  );
+});
+
+test("a provider outage across fan-out streams stays one named error beside stream 1's rows", async () => {
+  const TAG_ANCHOR = { id: 15, uuid: uuid(105), name: "Anchor Tag" };
+  const TAG_XYZ_A = { id: 16, uuid: uuid(106), name: "XYZ Alpha" };
+  const TAG_XYZ_B = { id: 17, uuid: uuid(107), name: "XYZ Beta" };
+  let movieReads = 0;
+  // scriptedUpstream cannot script per-request statuses: this handler
+  // mirrors its /tags and /movies response shapes and answers 500 for
+  // every /movies read after the first.
+  const handler: FixtureHandler = (req, res) => {
+    const path = pathOf(req.url ?? "");
+    if (path === "/tags") {
+      sendJson(res, 200, {
+        data: [TAG_ANCHOR, TAG_XYZ_A, TAG_XYZ_B],
+        links: { next: null },
+      });
+      return;
+    }
+    if (path === "/movies") {
+      movieReads += 1;
+      if (movieReads === 1) {
+        // Stream 1's first page delivers a real match, then continues.
+        sendJson(res, 200, {
+          data: [
+            tpdbRow(uuid(1), "Kept match", "2025-01-01", [
+              TAG_ANCHOR,
+              TAG_XYZ_A,
+            ]),
+          ],
+          links: { next: "x" },
+          meta: { total: 100 },
+        });
+        return;
+      }
+      // Every later read dies: stream 1's continuation and stream 2's
+      // first page — both fan-out streams of the one provider fail.
+      sendJson(res, 500, { message: "upstream down" });
+      return;
+    }
+    sendJson(res, 404, { message: `fixture has no ${path}` });
+  };
+  await runBrowse(handler, async () => {
+    const page = await browseTitles(
+      {
+        type: "movie",
+        include: [
+          { name: TAG_ANCHOR.name, tpdb: TAG_ANCHOR.uuid },
+          { name: "xyz" },
+        ],
+        exclude: [],
+        studioMode: "exact",
+        performers: [],
+        studios: [],
+        performerMode: "all",
+        page: 1,
+        perPage: 10,
+      },
+      [],
+    );
+    // Stream 1's delivered row survives beside ONE named error: several
+    // failing streams of one provider are one story, first failure wins.
+    assert.deepEqual(
+      page.items.map((d) => d.reference.id),
+      [uuid(1)],
+    );
+    assert.deepEqual(
+      page.errors.map((e) => [e.provider, e.code]),
+      [["tpdb", "upstream_unavailable"]],
+    );
+    assert.equal(page.totalCountKnown, false);
+    assert.equal(page.hasMore, false);
+  });
+});
+
+test("a fan-out that never fills degrades to the named scan_ceiling instead of erroring", async () => {
+  const TAG_ANCHOR = { id: 15, uuid: uuid(105), name: "Anchor Tag" };
+  const TAG_YOUNG = { id: 11, uuid: uuid(111), name: "Young" };
+  const TAG_YOUNG_W = { id: 12, uuid: uuid(112), name: "Young Woman" };
+  const TAG_OLD = { id: 13, uuid: uuid(113), name: "Old" };
+  const TAG_OLD_M = { id: 14, uuid: uuid(114), name: "Old Man" };
+  let moviesCalled = 0;
+  await runBrowse(
+    scriptedUpstream({
+      tagRows: [TAG_ANCHOR, TAG_YOUNG, TAG_YOUNG_W, TAG_OLD, TAG_OLD_M],
+      // Every page carries the young half but never the old tag: the local
+      // old re-check drops every row, so both fan-out streams scan to the
+      // ceiling — a bounded matchless answer, never a 422.
+      moviePages: [
+        {
+          rows: [
+            tpdbRow(uuid(2), "Young only", "2024-01-01", [
+              TAG_ANCHOR,
+              TAG_YOUNG,
+            ]),
+          ],
           next: "x",
           total: 10000,
         },
@@ -3814,26 +4459,35 @@ test("an anchored tag beside a multi-match free-text term keeps the hard ceiling
       },
     }),
     async () => {
-      await assert.rejects(
-        browseTitles(
-          {
-            type: "movie",
-            include: [
-              { name: TAG_ANCHOR.name, tpdb: TAG_ANCHOR.uuid },
-              { name: "xyz" },
-            ],
-            exclude: [],
-            studioMode: "exact",
-            performers: [],
-            studios: [],
-            performerMode: "all",
-            page: 1,
-            perPage: 10,
-          },
-          [],
-        ),
-        appError(422, "query_too_broad"),
+      const page = await browseTitles(
+        {
+          type: "movie",
+          include: [
+            { name: TAG_ANCHOR.name, tpdb: TAG_ANCHOR.uuid },
+            { name: "young" },
+            { name: "old" },
+          ],
+          exclude: [],
+          studioMode: "exact",
+          performers: [],
+          studios: [],
+          performerMode: "all",
+          page: 1,
+          perPage: 10,
+        },
+        [],
       );
+      assert.deepEqual(page.items, []);
+      assert.deepEqual(
+        page.errors.map((e) => [e.provider, e.code]),
+        [["tpdb", "scan_ceiling"]],
+      );
+      assert.equal(page.totalCountKnown, false);
+      assert.equal(page.hasMore, false);
+      // Moved pin (VELV-240): the request's per-provider page pool caps the
+      // whole browse at MAX_SCAN_PAGES (40; module-private in
+      // src/server/browse.ts) reads — the two fan-out streams share that
+      // budget instead of each walking its own 40 (80 before).
       assert.equal(moviesCalled, 40);
     },
   );
@@ -3906,10 +4560,11 @@ test("a free-text AND starved by hidden tags still degrades at the ceiling", asy
       tagRows: [TAG_XYZ_A, TAG_XYZ_B, TAG_ABC],
       moviePages: [
         {
-          // Rows the native abc all-of still returns (the fixture ignores the
-          // native filter) and the local xyz re-check keeps: the account's
-          // hidden tag then filters them all, so the visible yield starves and
-          // this stays the soft degrade with its named error.
+          // Rows the [abc + one xyz id] all-of streams return (the fixture
+          // ignores the native filter): the account's hidden tag filters
+          // them all on arrival, so the visible yield starves and the
+          // fan-out streams still end in the soft degrade with its named
+          // error.
           rows: [
             tpdbRow(uuid(2), "Hidden xyz", "2024-02-01", [
               TAG_XYZ_A,
@@ -5696,8 +6351,9 @@ test("parseBrowseQuery validates dateTo as the inclusive tail of a date>= range"
   assert.equal(range.dateTo, "2021-12-31");
 });
 
-test("a date>= + dateTo range filters both providers locally past the native lower bound", async () => {
+test("a descending date>= + dateTo range sends the native upper bound and checks both bounds locally", async () => {
   const movieUrls: string[] = [];
+  const sceneInputs: Record<string, unknown>[] = [];
   await runBrowse(
     scriptedUpstream({
       tagRows: [],
@@ -5708,19 +6364,22 @@ test("a date>= + dateTo range filters both providers locally past the native low
             tpdbRow(uuid(11), "Late Movie", "2022-06-01"),
             // A bogus date maps to no releaseDate, like a missing one.
             tpdbRow(uuid(12), "Undated Movie", "garbage"),
+            tpdbRow(uuid(13), "Early Movie", "2018-12-31"),
           ],
           next: null,
-          total: 3,
+          total: 4,
         },
       ],
       scenes: {
-        count: 2,
+        count: 3,
         rows: [
           stashRow(uuid(30), "Inside Scene", "2021-03-03"),
           stashRow(uuid(31), "Late Scene", "2022-03-03"),
+          stashRow(uuid(32), "Early Scene", "2018-12-31"),
         ],
       },
       onMovieRequest: (_page, qs) => movieUrls.push(qs.toString()),
+      onScenesRequest: (input) => sceneInputs.push(input),
     }),
     async () => {
       const page = await browseTitles(
@@ -5731,12 +6390,15 @@ test("a date>= + dateTo range filters both providers locally past the native low
         }),
         [],
       );
-      // The lower bound keeps its native ride on both providers; `dateTo`
-      // is the local inclusive upper bound, like `yearTo`.
-      assert.match(movieUrls[0]!, /date=2019-01-01/);
-      assert.match(movieUrls[0]!, /date_operation=%3E%3D/);
-      // Only in-range titles show: the late pair drops and the undated
-      // movie drops (a missing release date cannot prove the window).
+      // Deliberate flip: newest-first scans send the upper bound natively.
+      // Both local checks still exclude rows outside the inclusive window.
+      assert.match(movieUrls[0]!, /date=2021-12-31/);
+      assert.match(movieUrls[0]!, /date_operation=%3C%3D/);
+      assert.deepEqual(sceneInputs[0]!.date, {
+        value: "2022-01-01",
+        modifier: "LESS_THAN",
+      });
+      // Early, late, and undated titles cannot satisfy the window.
       assert.deepEqual(page.items.map((d) => d.title).sort(), [
         "Inside Movie",
         "Inside Scene",
@@ -5746,6 +6408,265 @@ test("a date>= + dateTo range filters both providers locally past the native low
     },
   );
 });
+
+/** HTTP fixture with native date filters, date order, and real page offsets.
+ * Equal durations preserve catalog order for the non-date cases. */
+function rangeScanUpstream(
+  catalog: { id: string; date: string }[],
+  inputs: Record<string, unknown>[],
+): FixtureHandler {
+  return (req, res, body) => {
+    const path = pathOf(req.url ?? "");
+    const movie = path === "/movies";
+    if (!movie && path !== "/graphql") {
+      sendJson(res, 404, { message: `fixture has no ${path}` });
+      return;
+    }
+    let input: Record<string, unknown>;
+    if (movie) {
+      input = Object.fromEntries(queryOf(req.url ?? ""));
+    } else {
+      const gql: { variables: { f: Record<string, unknown> } } =
+        JSON.parse(body);
+      input = gql.variables.f;
+    }
+    inputs.push(input);
+    const date = movie
+      ? undefined
+      : (input.date as { value: string; modifier: string } | undefined);
+    const cutoff = movie ? (input.date as string | undefined) : date?.value;
+    const operation = movie
+      ? input.date_operation
+      : date?.modifier === "LESS_THAN"
+        ? "<"
+        : date?.modifier === "GREATER_THAN"
+          ? ">"
+          : "=";
+    const rows = catalog.filter((row) => {
+      if (cutoff === undefined) return true;
+      switch (operation) {
+        case "<":
+          return row.date < cutoff;
+        case "<=":
+          return row.date <= cutoff;
+        case ">":
+          return row.date > cutoff;
+        case ">=":
+          return row.date >= cutoff;
+        case "=":
+          return row.date === cutoff;
+        default:
+          assert.fail(`Unexpected date operation: ${operation}`);
+      }
+    });
+    const ordered = movie
+      ? ["former_released", "recently_released"].includes(String(input.orderBy))
+      : input.sort === "DATE";
+    if (ordered) {
+      const asc = movie
+        ? input.orderBy === "former_released"
+        : input.direction === "ASC";
+      rows.sort((a, b) => (asc ? 1 : -1) * a.date.localeCompare(b.date));
+    }
+    const page = Number(input.page);
+    const perPage = Number(input.per_page);
+    const makeRow = movie ? tpdbRow : stashRow;
+    const items = rows
+      .slice((page - 1) * perPage, page * perPage)
+      .map((row) => makeRow(row.id, `Title ${row.id}`, row.date));
+    sendJson(
+      res,
+      200,
+      movie
+        ? {
+            data: items,
+            links: { next: page * perPage < rows.length ? "next" : null },
+            meta: { total: rows.length },
+          }
+        : { data: { queryScenes: { count: rows.length, scenes: items } } },
+    );
+  };
+}
+
+const rangeScanOrders = [
+  { type: "movie", sort: "recency", direction: "asc" },
+  { type: "scene", sort: "date", direction: "asc" },
+  { type: "scene", sort: "date", direction: "desc" },
+] as const;
+
+for (const order of rangeScanOrders) {
+  test(`range scan order ${order.type} ${order.sort} ${order.direction} stops past the terminal date with an exact total`, async () => {
+    const terminalDate =
+      order.direction === "asc" ? "2012-01-01" : "2010-12-31";
+    const inputs: Record<string, unknown>[] = [];
+    const catalog = [
+      { id: uuid(1), date: "2011-01-01" },
+      { id: uuid(2), date: "2011-06-01" },
+      { id: uuid(3), date: "2011-12-31" },
+      ...Array.from({ length: 2100 }, (_, i) => ({
+        id: uuid(100 + i),
+        date: terminalDate,
+      })),
+    ];
+    await runBrowse(rangeScanUpstream(catalog, inputs), async () => {
+      const page = await browseTitles(
+        planQuery({
+          ...order,
+          date: "2011-01-01",
+          dateOperation: ">=",
+          dateTo: "2011-12-31",
+          perPage: 50,
+          page: 2,
+        }),
+        [],
+      );
+      assert.deepEqual(page.items, []);
+      assert.equal(page.totalCountKnown, true);
+      assert.equal(page.total, 3);
+      assert.equal(page.hasMore, false);
+      assert.deepEqual(page.errors, []);
+      assert.ok(inputs.length < 5, `upstream reads: ${inputs.length}`);
+    });
+  });
+
+  test(`range scan order ${order.type} ${order.sort} ${order.direction} keeps inclusive terminal ties across pages`, async () => {
+    const edge = order.direction === "asc" ? "2011-12-31" : "2011-01-01";
+    const outside = order.direction === "asc" ? "2012-01-01" : "2010-12-31";
+    const inputs: Record<string, unknown>[] = [];
+    const catalog = [
+      { id: uuid(1), date: "2011-06-01" },
+      { id: uuid(2), date: edge },
+      { id: uuid(3), date: edge },
+      { id: uuid(4), date: edge },
+      { id: uuid(5), date: outside },
+    ];
+    await runBrowse(rangeScanUpstream(catalog, inputs), async () => {
+      const ids: string[] = [];
+      for (let page = 1; page <= 3; page += 1) {
+        const result = await browseTitles(
+          planQuery({
+            ...order,
+            date: "2011-01-01",
+            dateOperation: ">=",
+            dateTo: "2011-12-31",
+            perPage: 2,
+            page,
+          }),
+          [],
+        );
+        ids.push(...result.items.map((item) => item.reference.id));
+        if (page === 3) {
+          assert.equal(result.totalCountKnown, true);
+          assert.equal(result.total, 4);
+          assert.equal(result.hasMore, false);
+        }
+      }
+      assert.deepEqual(ids.sort(), [uuid(1), uuid(2), uuid(3), uuid(4)].sort());
+    });
+  });
+}
+
+for (const type of ["movie", "scene"] as const) {
+  test(`range scan order ${type} duration does not stop before a later in-range page`, async () => {
+    const inputs: Record<string, unknown>[] = [];
+    // Equal durations form a valid duration order, but not a date order.
+    const catalog = [
+      { id: uuid(1), date: "2012-01-01" },
+      { id: uuid(2), date: "2012-02-01" },
+      { id: uuid(3), date: "2011-06-01" },
+    ];
+    await runBrowse(rangeScanUpstream(catalog, inputs), async () => {
+      const page = await browseTitles(
+        planQuery({
+          type,
+          sort: "duration",
+          direction: "asc",
+          date: "2011-01-01",
+          dateOperation: ">=",
+          dateTo: "2011-12-31",
+          perPage: 2,
+        }),
+        [],
+      );
+      assert.deepEqual(
+        page.items.map((item) => item.reference.id),
+        [uuid(3)],
+      );
+      assert.equal(page.totalCountKnown, true);
+      assert.equal(page.total, 1);
+      assert.equal(page.hasMore, false);
+      assert.equal(inputs.length, 2);
+      if (type === "movie") {
+        assert.equal(inputs[0]!.date, "2011-01-01");
+        assert.equal(inputs[0]!.date_operation, ">=");
+      } else {
+        assert.deepEqual(inputs[0]!.date, {
+          value: "2010-12-31",
+          modifier: "GREATER_THAN",
+        });
+      }
+    });
+  });
+
+  test(`range scan order ${type} does not infer exhaustion from a missing terminal date`, async () => {
+    const scenes = {
+      count: 4,
+      rows: [
+        stashRow(uuid(1), "First", "2011-12-31"),
+        stashRow(uuid(9), "Undated", "garbage"),
+      ],
+    };
+    await runBrowse(
+      scriptedUpstream({
+        tagRows: [],
+        moviePages: [
+          {
+            rows: [
+              tpdbRow(uuid(1), "First", "2011-12-31"),
+              tpdbRow(uuid(9), "Undated", "garbage"),
+            ],
+            next: "next",
+            total: 4,
+          },
+          {
+            rows: [
+              tpdbRow(uuid(2), "Last", "2011-01-01"),
+              tpdbRow(uuid(3), "Outside", "2010-12-31"),
+            ],
+            next: null,
+            total: 4,
+          },
+        ],
+        scenes,
+        onScenesRequest: (input) => {
+          if (input.page === 2) {
+            scenes.rows = [
+              stashRow(uuid(2), "Last", "2011-01-01"),
+              stashRow(uuid(3), "Outside", "2010-12-31"),
+            ];
+          }
+        },
+      }),
+      async () => {
+        const page = await browseTitles(
+          planQuery({
+            type,
+            date: "2011-01-01",
+            dateOperation: ">=",
+            dateTo: "2011-12-31",
+            perPage: 2,
+            page: 2,
+          }),
+          [],
+        );
+        assert.deepEqual(page.items, []);
+        assert.equal(page.totalCountKnown, true);
+        assert.equal(page.total, 2);
+        assert.equal(page.hasMore, false);
+      },
+    );
+  });
+}
 
 // --- or-groups and entities at the fixture level ---
 
@@ -6025,8 +6946,9 @@ test("withChildren with two StashDB studios sends two parentStudio searches and 
   );
 });
 
-test("a year range rides its lower bound on the TPDB date pair; a lone year stays native", async () => {
+test("a descending year range sends the native upper date bound; a lone TPDB year stays native", async () => {
   const movieUrls: string[] = [];
+  const sceneInputs: Record<string, unknown>[] = [];
   await runBrowse(
     scriptedUpstream({
       tagRows: [],
@@ -6037,9 +6959,10 @@ test("a year range rides its lower bound on the TPDB date pair; a lone year stay
             tpdbRow(uuid(11), "Inside Movie", "2020-06-01"),
             tpdbRow(uuid(12), "Upper Movie", "2021-06-01"),
             tpdbRow(uuid(13), "Late Movie", "2022-06-01"),
+            tpdbRow(uuid(14), "Early Movie", "2018-12-31"),
           ],
           next: null,
-          total: 4,
+          total: 5,
         },
         // The second page serves the second browse (each browse reads one
         // page; the scripted upstream hands pages out in request order).
@@ -6060,22 +6983,23 @@ test("a year range rides its lower bound on the TPDB date pair; a lone year stay
         ],
       },
       onMovieRequest: (_page, qs) => movieUrls.push(qs.toString()),
+      onScenesRequest: (input) => sceneInputs.push(input),
     }),
     async () => {
       const ranged = await browseTitles(
         planQuery({ year: 2019, yearTo: 2021 }),
         [],
       );
-      // Contract fix (VELV-166 send-back): TPDB `year` is an EXACT one-year
-      // filter upstream, so the range's lower bound rides the native date
-      // pair (>= the first year's January 1) and `year` itself never rides.
-      // `yearTo` stays the local upper bound on BOTH sources.
-      assert.match(movieUrls[0]!, /date=2019-01-01/);
-      assert.match(movieUrls[0]!, /date_operation=%3E%3D/);
+      // Deliberate flip: newest-first scans send the upper date bound.
+      // TPDB's exact-year filter must not clip a multi-year window.
+      assert.match(movieUrls[0]!, /date=2021-12-31/);
+      assert.match(movieUrls[0]!, /date_operation=%3C%3D/);
       assert.doesNotMatch(movieUrls[0]!, /year=/);
-      // Every year of the range shows — 2019 through 2021 — and only the
-      // year past the upper bound drops. The local upper bound keeps the
-      // totals exact at exhaustion.
+      assert.deepEqual(sceneInputs[0]!.date, {
+        value: "2022-01-01",
+        modifier: "LESS_THAN",
+      });
+      // Both local year bounds exclude early and late rows.
       assert.deepEqual(ranged.items.map((d) => d.title).sort(), [
         "First-Year Movie",
         "Inside Movie",
@@ -6085,13 +7009,16 @@ test("a year range rides its lower bound on the TPDB date pair; a lone year stay
       assert.equal(ranged.totalCountKnown, true);
       assert.equal(ranged.total, 4);
 
-      // A lone year keeps today's behavior: the year rides TPDB's native
-      // query (the fixture ignores it, so both rows survive locally) while
-      // StashDB's year is a local exact-match (2022 drops).
+      // TPDB keeps its native exact-year filter. This fixture ignores it.
+      // StashDB sends an upper date bound and checks the year locally.
       movieUrls.length = 0;
       const lone = await browseTitles(planQuery({ year: 2020 }), []);
       assert.match(movieUrls[0]!, /year=2020/);
       assert.doesNotMatch(movieUrls[0]!, /date=/);
+      assert.deepEqual(sceneInputs[1]!.date, {
+        value: "2021-01-01",
+        modifier: "LESS_THAN",
+      });
       assert.deepEqual(lone.items.map((d) => d.title).sort(), [
         "Inside Movie",
         "Inside Scene",
@@ -6122,16 +7049,21 @@ test("an or-group include matches either member, ANDs with plains, and drops mat
           next: null,
           total: 4,
         },
-        // The second page serves the second browse (group + plain).
+        // The second and third pages serve the second browse's fan-out
+        // streams: the or-group beside the anchored plain fans out into
+        // one all-of stream per member (C∧A, then C∧B), so each scripted
+        // page models what its stream's native criterion really returns.
+        {
+          rows: [tpdbRow(uuid(10), "Blonde And Lesbian", "2024-03-01", [A, C])],
+          next: null,
+          total: 1,
+        },
         {
           rows: [
-            tpdbRow(uuid(10), "Blonde And Lesbian", "2024-03-01", [A, C]),
-            tpdbRow(uuid(11), "Redhead Only", "2024-02-01", [B]),
-            tpdbRow(uuid(12), "Lesbian Only", "2024-01-01", [C]),
-            tpdbRow(uuid(13), "Untagged", "2023-01-01"),
+            tpdbRow(uuid(14), "Redhead And Lesbian", "2023-12-01", [B, C]),
           ],
           next: null,
-          total: 4,
+          total: 1,
         },
       ],
       scenes: { count: 0, rows: [] },
@@ -6167,10 +7099,12 @@ test("an or-group include matches either member, ANDs with plains, and drops mat
       ]);
       assert.equal(either.totalCountKnown, true);
       assert.equal(either.total, 4);
-      // Group + plain AND together: the plain rides the native all-of
-      // criterion (the fixture cannot enforce it, so the URL carries it)
-      // while the group re-checks locally — a C-only title drops because
-      // it lacks both group members.
+      // Group + plain AND together: the or-group beside an anchored plain
+      // now fans out into one all-of stream per member (C∧A, C∧B) instead
+      // of re-checking the group locally. The matchless titles ("Lesbian
+      // Only", "Untagged") never surface because the scripted pages model
+      // what the native criteria actually return — and the C-only or
+      // untagged rows never ride a C∧A or C∧B listing.
       const both = await browseTitles(
         planQuery({
           type: "movie",
@@ -6184,18 +7118,68 @@ test("an or-group include matches either member, ANDs with plains, and drops mat
         }),
         [],
       );
+      // One row per fan-out stream; the ordered merge sorts them by
+      // recency. Totals stay exhaustion-exact: fan-out streams mark
+      // themselves locally filtered (the streams' lists overlap in
+      // principle), so the count is the consumed rows, and both streams
+      // exhausted with empty buffers.
       assert.deepEqual(both.items.map((d) => d.title).sort(), [
         "Blonde And Lesbian",
-        "Redhead Only",
+        "Redhead And Lesbian",
       ]);
       assert.equal(both.totalCountKnown, true);
       assert.equal(both.total, 2);
-      // The plain term rides the native all-of criterion (tag_and with the
-      // anchored id); the group never travels as a native tag.
+      // Each fan-out stream carries the plain in its native all-of
+      // criterion (tag_and) beside its own group member: stream 1 = C∧A,
+      // stream 2 = C∧B.
       assert.match(movieUrls[1]!, /tag_and=1/);
       assert.match(movieUrls[1]!, /tags%5B13%5D=1|tags\[13\]=1/);
-      assert.doesNotMatch(movieUrls[1]!, /tags%5B11%5D=1|tags\[11\]=1/);
-      assert.doesNotMatch(movieUrls[1]!, /tags%5B12%5D=1|tags\[12\]=1/);
+      assert.match(movieUrls[1]!, /tags%5B11%5D=1|tags\[11\]=1/);
+      assert.match(movieUrls[2]!, /tag_and=1/);
+      assert.match(movieUrls[2]!, /tags%5B13%5D=1|tags\[13\]=1/);
+      assert.match(movieUrls[2]!, /tags%5B12%5D=1|tags\[12\]=1/);
+    },
+  );
+});
+
+test("an or-group whose other member is absent on a side still matches by its present member", async () => {
+  // The grounded describe repair builds groups like TPDB "Anal" or StashDB
+  // "Anal Sex": the StashDB-only member has no TPDB label, which must add
+  // nothing on TPDB, never mark the whole TPDB side as "cannot match".
+  const A = { id: 11, uuid: uuid(101), name: "Anal" };
+  const movieUrls: string[] = [];
+  await runBrowse(
+    scriptedUpstream({
+      tagRows: [A],
+      moviePages: [
+        {
+          rows: [tpdbRow(uuid(10), "Anal Movie", "2024-03-01", [A])],
+          next: null,
+          total: 1,
+        },
+      ],
+      scenes: { count: 0, rows: [] },
+      onMovieRequest: (_page, qs) => movieUrls.push(qs.toString()),
+    }),
+    async () => {
+      const page = await browseTitles(
+        planQuery({
+          type: "movie",
+          include: [
+            [
+              { name: A.name, tpdb: A.uuid },
+              { name: "Anal Sex", stashdb: uuid(202) },
+            ],
+          ],
+        }),
+        [],
+      );
+      assert.deepEqual(
+        page.items.map((d) => d.title),
+        ["Anal Movie"],
+      );
+      // The present member travels natively.
+      assert.match(movieUrls[0]!, /tags%5B11%5D=1|tags\[11\]=1/);
     },
   );
 });

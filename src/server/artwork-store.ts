@@ -1,6 +1,6 @@
 // On-disk store for resized provider-artwork variants (VELV-170). Variants
 // are content-addressed by the sha256 of the source bytes:
-// <dataDir>/artwork/<hash[0:2]>/<hash>-<width>.webp. Originals stay
+// <dataDir>/artwork/<hash[0:2]>/<hash>-<width>c.webp. Originals stay
 // memory-only in providers.ts; only regenerable derivatives are persisted,
 // per operator approval (VELV-169, 2026-11-15). This module must stay
 // SQLite-free for the image path, so it never imports storage.ts and reads
@@ -18,6 +18,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import path from "node:path";
+import { ARTWORK_VARIANT } from "../lib/contracts.ts";
 import sharp from "sharp";
 
 export const ARTWORK_WIDTHS = [200, 400, 600] as const;
@@ -48,6 +49,13 @@ const ARTWORK_STORE_TTL_MS = 30 * 24 * 60 * 60_000;
 // memory cache would.
 const ARTWORK_INDEX_TTL_MS = 24 * 60 * 60_000;
 
+// Count allocation with a 4 KiB floor, including small URL index entries.
+const MIN_FILE_DISK_BYTES = 4096;
+
+function countedFileBytes(st: { size: number; blocks: number }): number {
+  return Math.max(MIN_FILE_DISK_BYTES, st.size, st.blocks * 512);
+}
+
 // Set (and un-set with null) by tests only; it survives for the process
 // lifetime because a restart keeps the disk and the store has no other
 // module state to clear.
@@ -59,8 +67,19 @@ function artworkRootDir(): string {
   return path.join(process.env.VELVARR_DATA_DIR || "./data", "artwork");
 }
 
+// Cards crop with object-fit: cover into frames from 2:3 portrait to wide, so
+// a w variant must cover a w × 1.5w box: a 16:9 scene still at w=200 needs
+// 300 px of height, not the 113 px a plain width resize gives (VELV-170
+// tiles went blurry). The "c" suffix retires the old width-only files; they
+// age out by the store TTL.
+const COVER_HEIGHT_RATIO = 1.5;
+
 function variantPath(hash: string, width: ArtworkWidth): string {
-  return path.join(artworkRootDir(), hash.slice(0, 2), `${hash}-${width}.webp`);
+  return path.join(
+    artworkRootDir(),
+    hash.slice(0, 2),
+    `${hash}-${width}${ARTWORK_VARIANT}.webp`,
+  );
 }
 
 /** Best-effort read of a fresh non-empty variant; null means "miss". */
@@ -127,9 +146,8 @@ function writeFileAtomic(file: string, bytes: Buffer): void {
   }
 }
 
-/** One sweep per write: drop expired and zero-byte entries, then evict by
- * oldest mtime until the total fits the budget. The file just written is
- * never an eviction candidate. */
+/** Drop expired and empty files after each write, then evict by oldest mtime.
+ * Keep the newest file even when it alone exceeds the budget. */
 function sweepArtworkStore(justWritten: string): void {
   const root = artworkRootDir();
   let walked: string[];
@@ -159,7 +177,8 @@ function sweepArtworkStore(justWritten: string): void {
     if (!st.isFile()) continue;
     // Index entries are shortcuts living by the index TTL; the variants
     // themselves live by the store TTL. Both count toward the budget.
-    const ttl = rel.startsWith("index/")
+    // readdirSync returns native separators: "index\<hash>" on Windows.
+    const ttl = rel.startsWith(`index${path.sep}`)
       ? ARTWORK_INDEX_TTL_MS
       : ARTWORK_STORE_TTL_MS;
     if (st.size === 0 || now - st.mtimeMs >= ttl) {
@@ -170,8 +189,9 @@ function sweepArtworkStore(justWritten: string): void {
       }
       continue;
     }
-    total += st.size;
-    kept.push({ file, mtimeMs: st.mtimeMs, size: st.size });
+    const diskBytes = countedFileBytes(st);
+    total += diskBytes;
+    kept.push({ file, mtimeMs: st.mtimeMs, size: diskBytes });
   }
   // Oldest first: budget pressure always evicts the least recently used.
   kept.sort((a, b) => a.mtimeMs - b.mtimeMs);
@@ -267,8 +287,14 @@ export function lookupArtworkVariant(
  * refetch on the next width request. */
 export function rememberArtworkVariant(url: string, hash: string): void {
   if (hash.length === 0) return;
+  // Passthroughs return here on every memory hit. An unchanged fresh index
+  // needs neither a rewrite nor an uncharged full-tree sweep.
+  if (readIndexHash(url) === hash) return;
   try {
-    writeFileAtomic(indexFilePath(url), Buffer.from(hash, "utf8"));
+    const file = indexFilePath(url);
+    writeFileAtomic(file, Buffer.from(hash, "utf8"));
+    // New or refreshed entries still need budget and expiry enforcement.
+    sweepArtworkStore(file);
   } catch (err) {
     console.error(
       `artwork-store: could not write artwork index entry: ${
@@ -280,8 +306,10 @@ export function rememberArtworkVariant(url: string, hash: string): void {
 
 /** Return the WebP variant of `source` at `width`, reading it from the disk
  * store when present, generating and storing it otherwise. Sources too small
- * to downscale and sources sharp cannot read come back unchanged (no file,
- * source contentType); a stored variant always comes back as image/webp. */
+ * to downscale (measured on the EXIF-oriented axis) and sources sharp cannot
+ * read come back unchanged (no file, source contentType); a stored variant
+ * always comes back as image/webp and upright: WebP output drops the EXIF
+ * orientation tag, so the pixels are pre-rotated at generation time. */
 export async function artworkVariantFor(
   source: { bytes: Uint8Array; contentType: string },
   width: ArtworkWidth,
@@ -299,8 +327,17 @@ export async function artworkVariantFor(
   } catch (err) {
     return passthroughDegrade(source, hash, width, err);
   }
-  // Never upscale: at or below the ladder rung the source is the answer.
-  if (meta.width !== undefined && meta.width <= width) {
+  // Never upscale: when either oriented axis is already at or below the
+  // cover box, no downscale keeps the cover, so the source is the answer.
+  // Rotated sources count on the oriented axes (EXIF 6 stores an upright
+  // portrait as landscape pixels), else the upright image gets upscaled.
+  const orientedWidth = meta.autoOrient?.width ?? meta.width;
+  const orientedHeight = meta.autoOrient?.height ?? meta.height;
+  const height = Math.round(width * COVER_HEIGHT_RATIO);
+  if (
+    (orientedWidth !== undefined && orientedWidth <= width) ||
+    (orientedHeight !== undefined && orientedHeight <= height)
+  ) {
     return {
       bytes: source.bytes,
       contentType: source.contentType,
@@ -312,7 +349,8 @@ export async function artworkVariantFor(
   let variant: Buffer;
   try {
     variant = await sharp(source.bytes)
-      .resize({ width, withoutEnlargement: true })
+      .autoOrient()
+      .resize({ width, height, fit: "outside", withoutEnlargement: true })
       .webp({ quality: 80 })
       .toBuffer();
   } catch (err) {
@@ -357,7 +395,7 @@ export function artworkStoreStateForTest(): {
     }
     if (!st.isFile()) continue;
     files += 1;
-    bytes += st.size;
+    bytes += countedFileBytes(st);
   }
   return {
     files,

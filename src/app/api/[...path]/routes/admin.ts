@@ -8,7 +8,7 @@ import {
   requireId,
   optionalBool,
 } from "../parse.ts";
-import { type AuthContext, json } from "../admission.ts";
+import { type AuthContext, json, requireLiveAdmin } from "../admission.ts";
 import type {
   AdminAccount,
   IntegrationConfig,
@@ -25,6 +25,7 @@ import {
 import {
   countRequestsByAccount,
   getAccount,
+  getConfig,
   importAccounts,
   listAccounts,
   saveConfig,
@@ -55,9 +56,17 @@ import {
 } from "../../../../server/judgment.ts";
 import {
   checkProseChat,
+  listProseModels,
   proseChatConfiguration,
+  testProseChat,
 } from "../../../../server/prose-chat.ts";
 import { getWhisparrStatus } from "../../../../server/whisparr.ts";
+import {
+  discordConfiguration,
+  parseDiscordWebhook,
+  type DiscordCheck,
+} from "../../../../lib/discord-settings.ts";
+import { checkDiscordConnection } from "../../../../server/notify.ts";
 
 export function integrationsShape(config: IntegrationConfig) {
   return {
@@ -78,6 +87,7 @@ export function integrationsShape(config: IntegrationConfig) {
       : null,
     judgment: judgmentConfiguration(config.providers),
     proseChat: proseChatConfiguration(config.providers),
+    discord: discordConfiguration(config.discord),
     providers: {
       tpdb: providerShape(config.providers?.tpdbApiToken, "TPDB_API_TOKEN"),
       stashdb: providerShape(
@@ -104,6 +114,18 @@ export function providerShape(
     configured: typeof env === "string" && env !== "",
     source: "environment",
   };
+}
+
+/** Every admin route reads its body through here: admission checked the
+ *  role before the body arrived, so the live session is checked again after
+ *  the read (an admin demoted or disabled mid-body gets 403). */
+async function readAdminJson(
+  request: Request,
+  ctx: AuthContext,
+): Promise<Record<string, unknown>> {
+  const body = await readJson(request);
+  requireLiveAdmin(ctx);
+  return body;
 }
 
 export async function adminUsers(ctx: AuthContext): Promise<Response> {
@@ -143,7 +165,7 @@ export async function adminImport(
   request: Request,
   ctx: AuthContext,
 ): Promise<Response> {
-  await readJson(request);
+  await readAdminJson(request, ctx);
   const imported = importAccounts(await listUsers(ctx.config));
   return json({ accounts: imported });
 }
@@ -153,7 +175,7 @@ export async function adminUpdateUser(
   ctx: AuthContext,
   id: string,
 ): Promise<Response> {
-  const body = await readJson(request);
+  const body = await readAdminJson(request, ctx);
   const target = getAccount(requireId(id));
   if (!target) throw new AppError(404, "not_found", "Account not found.");
   const enabled = fieldBool(body, "enabled");
@@ -397,6 +419,39 @@ function savedKeyForUrl(input: {
   );
 }
 
+/** The URL and key of a natural-language search draft (editor check, model
+ * list). The key is optional for this server: a typed key wins; a blank one
+ * reuses the stored key only on the stored URL's origin, so the stored
+ * secret never reaches another host; otherwise no key is sent. */
+async function proseDraftTarget(
+  request: Request,
+  ctx: AuthContext,
+): Promise<{
+  body: Record<string, unknown>;
+  url: string;
+  apiKey: string | undefined;
+}> {
+  const body = await readAdminJson(request, ctx);
+  const url = fieldUrl(body, "url");
+  const typed = optionalText(body, "apiKey", 512)?.trim();
+  if (typed && !/^[\x21-\x7E]{1,512}$/.test(typed)) {
+    throw new AppError(
+      400,
+      "invalid_field",
+      "The API key must be printable ASCII without spaces.",
+    );
+  }
+  const saved = ctx.config.providers;
+  const apiKey = typed
+    ? typed
+    : saved?.proseChatApiKey &&
+        saved.proseChatUrl &&
+        new URL(saved.proseChatUrl).origin === new URL(url).origin
+      ? saved.proseChatApiKey
+      : undefined;
+  return { body, url, apiKey };
+}
+
 /** The upstream half of a Jellyfin connection change, shared by the save path
  * and the draft test: the endpoint must answer for the stored server identity
  * (public /System/Info/Public, no key needed) and the key must enumerate
@@ -638,27 +693,88 @@ function guardProviderClear(body: Record<string, unknown>): void {
   }
 }
 
+const DISCORD_SAVE_FIELDS = ["discordWebhookUrl", "discordIncludeTitles"];
+
+function discordWebhookField(
+  body: Record<string, unknown>,
+  key: string,
+): string | undefined {
+  const value = body[key];
+  if (value === undefined) return undefined;
+  if (
+    typeof value !== "string" ||
+    value.length > 2048 ||
+    (value !== "" && !parseDiscordWebhook(value))
+  )
+    throw new AppError(400, "invalid_field", "Invalid Discord webhook URL.");
+  return value;
+}
+
+function nextDiscord(
+  current: IntegrationConfig["discord"],
+  body: Record<string, unknown>,
+): IntegrationConfig["discord"] {
+  const webhookUrl = discordWebhookField(body, "discordWebhookUrl");
+  const includeTitles = body.discordIncludeTitles;
+  if (
+    includeTitles !== undefined &&
+    includeTitles !== null &&
+    typeof includeTitles !== "boolean"
+  )
+    throw new AppError(
+      400,
+      "invalid_field",
+      "Include titles must be a boolean or null.",
+    );
+  const discord = { ...current };
+  if (webhookUrl === "") delete discord.webhookUrl;
+  else if (webhookUrl !== undefined) discord.webhookUrl = webhookUrl;
+  if (includeTitles === null) delete discord.includeTitles;
+  else if (includeTitles !== undefined) discord.includeTitles = includeTitles;
+  return Object.keys(discord).length ? discord : undefined;
+}
+
+async function adminDiscordTest(
+  request: Request,
+  ctx: AuthContext,
+): Promise<Response> {
+  const body = await readAdminJson(request, ctx);
+  const webhookUrl = discordWebhookField(body, "webhookUrl");
+  const result: DiscordCheck = await checkDiscordConnection(
+    ctx.config.discord,
+    webhookUrl || undefined,
+  );
+  return json(result);
+}
+
 export async function adminUpdateIntegrations(
   request: Request,
   ctx: AuthContext,
 ): Promise<Response> {
-  const body = await readJson(request);
+  const body = await readAdminJson(request, ctx);
+  let current = getConfig();
+  if (!current)
+    throw new AppError(409, "not_initialized", "Setup has not been completed.");
+  let discord = nextDiscord(current.discord, body);
   // Before any write: the guard compares against the live stored key and
   // must sit directly next to the synchronous provider-only saveConfig.
   guardProviderClear(body);
-  // Provider-only saves never touch Jellyfin/Whisparr: the provider card
-  // sends just its fields, and re-validating the Jellyfin connection would
-  // make provider keys uneditable whenever Jellyfin is briefly down.
+  // Provider and Discord saves need no Jellyfin/Whisparr probe.
+  // These cards must stay editable when another service is down.
   const bodyKeys = Object.keys(body);
   if (
     bodyKeys.length > 0 &&
-    bodyKeys.every((k) => PROVIDER_SAVE_FIELDS.includes(k))
+    bodyKeys.every(
+      (k) =>
+        PROVIDER_SAVE_FIELDS.includes(k) || DISCORD_SAVE_FIELDS.includes(k),
+    )
   ) {
-    const providers = nextProviderCredentials(ctx.config.providers, body);
+    const providers = nextProviderCredentials(current.providers, body);
     const patched: IntegrationConfig = {
-      jellyfin: ctx.config.jellyfin,
-      ...(ctx.config.whisparr ? { whisparr: ctx.config.whisparr } : {}),
+      jellyfin: current.jellyfin,
+      ...(current.whisparr ? { whisparr: current.whisparr } : {}),
       ...(providers ? { providers } : {}),
+      ...(discord ? { discord } : {}),
     };
     saveConfig(patched);
     return json(integrationsShape(patched));
@@ -673,22 +789,34 @@ export async function adminUpdateIntegrations(
       ["whisparrUrl", "whisparrApiKey", "delivery", "pathMappings"].includes(k),
     )
   ) {
-    const whisparr = nextWhisparr(ctx.config.whisparr, body);
+    const whisparr = nextWhisparr(current.whisparr, body);
     const patched: IntegrationConfig = {
-      jellyfin: ctx.config.jellyfin,
+      jellyfin: current.jellyfin,
       ...(whisparr ? { whisparr } : {}),
-      ...(ctx.config.providers ? { providers: ctx.config.providers } : {}),
+      ...(current.providers ? { providers: current.providers } : {}),
+      ...(discord ? { discord } : {}),
     };
     saveConfig(patched);
     return json(integrationsShape(patched));
   }
-  const jellyfin = await nextJellyfin(ctx.config.jellyfin, body);
-  const whisparr = nextWhisparr(ctx.config.whisparr, body);
-  const providers = nextProviderCredentials(ctx.config.providers, body);
+  const jellyfin = await nextJellyfin(current.jellyfin, body);
+  // The Jellyfin probe can hold this request for seconds, and readAdminJson's
+  // live-admin check predates it. Re-check so a demotion or disable during
+  // the probe cannot land the write with stale rights (VELV-244).
+  requireLiveAdmin(ctx);
+  current = getConfig();
+  if (!current)
+    throw new AppError(409, "not_initialized", "Setup has not been completed.");
+  // No await separates this read from the save. Omitted fields stay current.
+  const whisparr = nextWhisparr(current.whisparr, body);
+  const providers = nextProviderCredentials(current.providers, body);
+  discord = nextDiscord(current.discord, body);
   const config: IntegrationConfig = {
-    jellyfin,
+    // Keep the probed address and key together, but preserve live library ids.
+    jellyfin: { ...jellyfin, libraryIds: current.jellyfin.libraryIds },
     ...(whisparr ? { whisparr } : {}),
     ...(providers ? { providers } : {}),
+    ...(discord ? { discord } : {}),
   };
   saveConfig(config);
   return json(integrationsShape(config));
@@ -778,13 +906,14 @@ export async function adminProviderCheck(
 
 export async function adminProviderTest(
   request: Request,
+  ctx: AuthContext,
   raw: string,
 ): Promise<Response> {
   if (raw !== "tpdb" && raw !== "stashdb") {
     throw new AppError(400, "invalid_provider", "Unknown credential provider.");
   }
   const provider = raw;
-  const body = await readJson(request);
+  const body = await readAdminJson(request, ctx);
   // The save path's token rules: the same caps as nextProviderCredentials,
   // and a trimmed value. Blank or omitted tests the saved credential.
   const key = optionalText(body, "key", provider === "tpdb" ? 1024 : 512);
@@ -801,7 +930,7 @@ export async function adminJellyfinTest(
   request: Request,
   ctx: AuthContext,
 ): Promise<Response> {
-  const body = await readJson(request);
+  const body = await readAdminJson(request, ctx);
   const url = fieldUrl(body, "url");
   const suppliedExternal = optionalText(body, "externalUrl", 2048);
   // The same origin rule as the save path: a blank key reuses the saved one
@@ -853,7 +982,7 @@ export async function adminWhisparrTest(
   request: Request,
   ctx: AuthContext,
 ): Promise<Response> {
-  const body = await readJson(request);
+  const body = await readAdminJson(request, ctx);
   const rawUrl = optionalText(body, "url", 2048);
   const suppliedKey = optionalText(body, "apiKey", 512);
   // The save path's rule: a key without a URL is a malformed draft.
@@ -922,6 +1051,18 @@ export const routes: RouteDef[] = [
   },
   {
     method: "GET",
+    segments: ["admin", "discord"],
+    auth: "admin",
+    run: async (ctx) => json(await checkDiscordConnection(ctx.config.discord)),
+  },
+  {
+    method: "POST",
+    segments: ["admin", "discord", "test"],
+    auth: "admin",
+    run: async (ctx, request) => adminDiscordTest(request, ctx),
+  },
+  {
+    method: "GET",
     segments: ["admin", "whisparr"],
     auth: "admin",
     run: async (ctx) => adminWhisparr(ctx),
@@ -967,9 +1108,36 @@ export const routes: RouteDef[] = [
   },
   {
     method: "POST",
+    segments: ["admin", "prose", "test"],
+    auth: "admin",
+    run: async (ctx, request) => {
+      const { body, url, apiKey } = await proseDraftTarget(request, ctx);
+      const model = optionalText(body, "model", 128)?.trim();
+      if (!isProseChatModel(model)) {
+        throw new AppError(
+          400,
+          "invalid_field",
+          "The model name must have 1 to 128 characters and no control characters.",
+        );
+      }
+      return json(await testProseChat({ url, model, apiKey }));
+    },
+  },
+  {
+    method: "POST",
+    segments: ["admin", "prose", "models"],
+    auth: "admin",
+    run: async (ctx, request) => {
+      const { url, apiKey } = await proseDraftTarget(request, ctx);
+      return json(await listProseModels(url, apiKey));
+    },
+  },
+  {
+    method: "POST",
     segments: ["admin", "providers", ":provider", "test"],
     auth: "admin",
-    run: async (_ctx, request, p) => adminProviderTest(request, p.provider!),
+    run: async (ctx, request, p) =>
+      adminProviderTest(request, ctx, p.provider!),
   },
   {
     method: "POST",

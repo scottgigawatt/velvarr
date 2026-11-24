@@ -1,12 +1,12 @@
 {
   "name": "velvarr",
-  "version": "0.42.0",
+  "version": "0.45.0",
   "private": true,
   "type": "module",
   "engines": {
     "node": ">=24.21.0"
   },
-  "packageManager": "bun@1.3.14",
+  "packageManager": "bun@1.4.5",
   "scripts": {
     "dev": "next dev --hostname 127.0.0.1 --port 6699",
     "build": "next build",
@@ -17,15 +17,16 @@
     "test:mutation:delta": "node scripts/mutation-delta.mjs",
     "setup": "node scripts/setup.mjs",
     "backup": "node scripts/backup.mjs",
+    "shots": "node scripts/screenshots/shots.mjs",
     "format": "prettier --write \"src/**/*.{ts,tsx,css}\" \"*.{ts,tsx,json,mjs}\" \"tests/**/*.{ts,mjs}\" \"scripts/**/*.mjs\"",
     "format:check": "prettier --check \"src/**/*.{ts,tsx,css}\" \"*.{ts,tsx,json,mjs}\" \"tests/**/*.{ts,mjs}\" \"scripts/**/*.mjs\"",
     "test:ui": "playwright test"
   },
   "dependencies": {
-    "@typesafe-ai/sdk": "^0.6.0",
+    "@typesafe-ai/sdk": "^0.7.0",
     "next": "16.4.6",
-    "react": "19.3.0",
-    "react-dom": "19.3.0",
+    "react": "19.3.1",
+    "react-dom": "19.3.1",
     "sharp": "0.35.5"
   },
   "overrides": {
@@ -36,17 +37,17 @@
     "zod": "^4.6.6"
   },
   "devDependencies": {
-    "@playwright/test": "1.65.0",
-    "@stryker-mutator/core": "^10.0.0",
-    "@stryker-mutator/tap-runner": "10.0.0",
-    "@tailwindcss/postcss": "4.3.3",
-    "@types/node": "24.13.4",
+    "@playwright/test": "1.65.1",
+    "@stryker-mutator/core": "^10.1.1",
+    "@stryker-mutator/tap-runner": "10.1.1",
+    "@tailwindcss/postcss": "4.3.5",
+    "@types/node": "26.6.6",
     "@types/react": "19.3.0",
     "@types/react-dom": "19.3.0",
     "fast-check": "4.10.2",
-    "postcss": "8.5.28",
-    "prettier": "3.9.6",
-    "tailwindcss": "4.3.3",
+    "postcss": "8.5.33",
+    "prettier": "3.10.1",
+    "tailwindcss": "4.3.5",
     "typescript": "7.0.2"
   },
   "license": "MIT"

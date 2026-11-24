@@ -1,4 +1,4 @@
-import { readdirSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -17,12 +17,36 @@ const tapExcludedSuites = new Set([
   "notify.test.ts",
   "setup-script.test.ts",
   "shelf-error.test.ts",
+  // These lifecycle suites exercise no mutated source.
+  "mutation-run.test.ts",
+  "test-temp.test.ts",
 ]);
 
 const tapTestFiles = readdirSync(new URL("./tests", import.meta.url))
   .filter((name) => name.endsWith(".test.ts") && !tapExcludedSuites.has(name))
   .sort()
   .map((name) => `tests/${name}`);
+
+// Each run owns one unique parent for its sandbox and test data.
+// The run removes that parent, including data from children without hooks.
+// Cleanup never scans other runs. SIGKILL of this owner prevents cleanup.
+export const mutationTempBase = tmpdir();
+const mutationRunParent = mkdtempSync(
+  join(mutationTempBase, "velvarr-mutation-"),
+);
+process.on("exit", () =>
+  rmSync(mutationRunParent, {
+    recursive: true,
+    force: true,
+    maxRetries: 5,
+    retryDelay: 50,
+  }),
+);
+const mutationTestParent = join(mutationRunParent, "tests");
+mkdirSync(mutationTestParent);
+// os.tmpdir() reads TMPDIR on POSIX but TEMP/TMP on Windows.
+process.env.TMPDIR = process.env.TEMP = process.env.TMP = mutationTestParent;
+process.env.VELVARR_DATA_DIR = mutationTestParent;
 
 /**
  * Mutation testing over the pure decision logic: the src/lib modules plus the
@@ -98,7 +122,7 @@ const config = {
   // tsconfig has none, and nothing in the sandbox runs tsc. Revisit when
   // Stryker gains a TS7-compatible preprocessor.
   tsconfigFile: "tsconfig.sandbox-unused.json",
-  tempDirName: join(tmpdir(), "velvarr-stryker"),
+  tempDirName: join(mutationRunParent, "sandbox"),
   // No `incremental` here: a stale cache once replayed statuses from an
   // older run (one replay reported decisions.ts at 0% that the current
   // suites kill completely), and a full run keeps scores comparable across
@@ -113,10 +137,13 @@ const config = {
   // its kill rides a same-millisecond Date.now() tie in
   // tests/discovery.test.ts whose random-uuid row ids make the order a coin
   // flip, so either verdict is a fair sample.
-  reporters: ["clear-text", "progress"],
-  // stryker.log (cwd) captures the run including worker deaths, but its
-  // per-mutant detail covers killed mutants only — the survived diffs are
-  // console-only, so capture stdout when hunting survivors.
+  reporters: ["clear-text", "progress", "json"],
+  // Keep structured results outside both the checkout and the removed sandbox.
+  jsonReporter: {
+    fileName: join(mutationTempBase, `velvarr-mutation-${process.pid}.json`),
+  },
+  // stryker.log captures worker failures. The JSON report retains every
+  // mutant's location and status, including survivors and uncovered code.
   fileLogLevel: "trace",
   // break stays at the floor set when the score was measured at 88.23
   // (2026-10-15, when judgment.ts and discovery.ts joined the mutate set

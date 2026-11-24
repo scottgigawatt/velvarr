@@ -13,16 +13,18 @@ import { test, beforeEach, mock } from "node:test";
 import { createHash } from "node:crypto";
 import {
   existsSync,
-  mkdirSync,
+  mkdtempSync,
   readFileSync,
-  rmSync,
   statSync,
   utimesSync,
+  writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
 import sharp from "sharp";
 import {
   artworkStoreStateForTest,
+  artworkVariantFor,
+  rememberArtworkVariant,
   setArtworkStoreBudgetForTest,
 } from "../src/server/artwork-store.ts";
 
@@ -40,6 +42,7 @@ import {
   identityLinkKey,
 } from "../src/server/identity-links.ts";
 import {
+  ARTWORK_FETCH_CONCURRENCY,
   credentialFingerprint,
   expandCatalogTagTerm,
   fetchProviderArtwork,
@@ -72,6 +75,9 @@ import {
   isIsoDate,
   stashFuzzyDate,
   type ImageUrlCheck,
+  stashSceneDetail as mapStashSceneDetail,
+  stashPerformerDetail as mapStashPerformerDetail,
+  stashStudioDetail as mapStashStudioDetail,
 } from "../src/server/provider-rows.ts";
 import fc from "fast-check";
 
@@ -277,6 +283,313 @@ test("tpdb movie detail maps validated fields and canonical credit parents", asy
   }
 });
 
+// Canonical posters take precedence over alias posters, regardless of size.
+// An unusable canonical list permits the alias poster fallback.
+for (const parentPosters of [
+  undefined,
+  [
+    {
+      url: "https://images02-openlife.gammacdn.com/parent-huge.jpg",
+      size: 9_999_999,
+    },
+    { url: "https://cdn.theporndb.net/parent-zero.jpg", size: 0 },
+  ],
+] as const) {
+  test(`tpdb credits prefer the row's largest servable poster when parent posters are ${parentPosters === undefined ? "absent" : "unusable"}`, async () => {
+    const restore = setEnv({
+      TPDB_API_TOKEN: TPDB_TOKEN,
+      TPDB_BASE_URL: "",
+    });
+    const fixture = await startFixture((req, res) => {
+      assert.equal(req.method, "GET");
+      assert.equal(req.url, `/movies/${MOVIE_ID}`);
+      assert.equal(req.headers.authorization, `Bearer ${TPDB_TOKEN}`);
+      const row = tpdbMovieRow();
+      const performer = (row.performers as Record<string, unknown>[])[0];
+      assert.ok(performer !== undefined);
+      performer.image = "https://images02-openlife.gammacdn.com/credit-raw.jpg";
+      performer.parent = {
+        ...(performer.parent as Record<string, unknown>),
+        posters: parentPosters,
+      };
+      performer.posters = [
+        { url: "https://thumb.theporndb.net/credit-small.jpg", size: 1024 },
+        // Largest claimed size on a gate-rejected host must not win.
+        {
+          url: "https://images02-openlife.gammacdn.com/credit-huge.jpg",
+          size: 9_999_999,
+        },
+        { url: "https://thumb.theporndb.net/credit-big.jpg", size: 4_096_000 },
+      ];
+      row.performers = [
+        performer,
+        {
+          ...performer,
+          id: CANON_PERFORMER_ID,
+          name: "Duplicate Credit",
+          posters: [
+            {
+              url: "https://thumb.theporndb.net/duplicate.jpg",
+              size: 8_000_000,
+            },
+          ],
+        },
+      ];
+      sendJson(res, 200, { data: row });
+    });
+    try {
+      process.env.TPDB_BASE_URL = fixture.origin;
+      const detail = await getCatalogDetail({
+        provider: "tpdb",
+        kind: "movie",
+        id: MOVIE_ID,
+      });
+      assert.ok(detail !== null);
+      assert.equal(detail.credits.length, 1);
+      assert.equal(detail.credits[0]?.name, "Credited Name");
+      assert.deepEqual(detail.credits[0]?.reference, {
+        provider: "tpdb",
+        kind: "performer",
+        id: CANON_PERFORMER_ID,
+      });
+      assert.equal(
+        detail.credits[0]?.imageUrl,
+        "https://thumb.theporndb.net/credit-big.jpg",
+      );
+      assert.equal(JSON.stringify(detail).includes("gammacdn"), false);
+    } finally {
+      await fixture.close();
+      restore();
+    }
+  });
+}
+
+for (const aliasHasPosters of [true, false]) {
+  test(`tpdb credits and canonical performer detail share the largest canonical poster ${aliasHasPosters ? "despite larger alias posters" : "without alias posters"}`, async () => {
+    const restore = setEnv({ TPDB_API_TOKEN: TPDB_TOKEN });
+    const canonical = {
+      id: CANON_PERFORMER_ID,
+      name: "Canonical Name",
+      image: "https://cdn.theporndb.net/performer/canonical-fallback.jpg",
+      posters: [
+        { url: "https://thumb.theporndb.net/canonical-small.jpg", size: 1024 },
+        {
+          url: "https://cdn.theporndb.net/canonical-largest.jpg",
+          size: 4_096_000,
+          order: 99,
+        },
+        {
+          url: "https://images02-openlife.gammacdn.com/canonical-huge.jpg",
+          size: 99_999_999,
+          order: 0,
+        },
+        {
+          url: "https://cdn.theporndb.net/canonical-tied.jpg",
+          size: 4_096_000,
+          order: 0,
+        },
+        { url: "https://thumb.theporndb.net/canonical-last.jpg", size: 2048 },
+      ],
+    };
+    const fixture = await startFixture((req, res) => {
+      assert.equal(req.method, "GET");
+      assert.equal(req.headers.authorization, `Bearer ${TPDB_TOKEN}`);
+      if (req.url === `/performers/${CANON_PERFORMER_ID}`) {
+        sendJson(res, 200, { data: canonical });
+        return;
+      }
+      assert.equal(req.url, `/movies/${MOVIE_ID}`);
+      const row = tpdbMovieRow();
+      const performer = (row.performers as Record<string, unknown>[])[0];
+      assert.ok(performer !== undefined);
+      performer.parent = canonical;
+      if (aliasHasPosters) {
+        performer.posters = [
+          {
+            url: "https://thumb.theporndb.net/alias-larger.jpg",
+            size: 8_000_000,
+          },
+        ];
+      }
+      row.performers = [
+        performer,
+        { ...performer, id: CANON_PERFORMER_ID, name: "Duplicate Credit" },
+      ];
+      sendJson(res, 200, { data: row });
+    });
+    try {
+      process.env.TPDB_BASE_URL = fixture.origin;
+      const detail = await getCatalogDetail({
+        provider: "tpdb",
+        kind: "movie",
+        id: MOVIE_ID,
+      });
+      const performerDetail = await getCatalogDetail({
+        provider: "tpdb",
+        kind: "performer",
+        id: CANON_PERFORMER_ID,
+      });
+      assert.ok(detail !== null);
+      assert.ok(performerDetail !== null);
+      assert.equal(
+        performerDetail.imageUrl,
+        "https://cdn.theporndb.net/canonical-largest.jpg",
+      );
+      assert.deepEqual(detail.credits, [
+        {
+          reference: {
+            provider: "tpdb",
+            kind: "performer",
+            id: CANON_PERFORMER_ID,
+          },
+          name: "Credited Name",
+          imageUrl: "https://cdn.theporndb.net/canonical-largest.jpg",
+        },
+      ]);
+      assert.deepEqual(detail.credits[0]?.reference, performerDetail.reference);
+      assert.equal(detail.credits[0]?.imageUrl, performerDetail.imageUrl);
+      assert.equal(JSON.stringify(detail).includes("gammacdn"), false);
+      assert.equal(JSON.stringify(performerDetail).includes("gammacdn"), false);
+    } finally {
+      await fixture.close();
+      restore();
+    }
+  });
+}
+
+test("tpdb performer detail and search emit the largest eligible poster", async () => {
+  const restore = setEnv({ TPDB_API_TOKEN: TPDB_TOKEN });
+  const row = {
+    id: CANON_PERFORMER_ID,
+    name: "Fixture Performer",
+    image: "https://cdn.theporndb.net/performer/fallback.jpg",
+    posters: [
+      { url: "https://thumb.theporndb.net/performer-small.jpg", size: 1024 },
+      {
+        url: "https://cdn.theporndb.net/performer-largest.jpg",
+        size: 4_096_000,
+        order: 99,
+      },
+      {
+        url: "https://images02-openlife.gammacdn.com/performer-huge.jpg",
+        size: 9_999_999,
+        order: 0,
+      },
+      { url: "https://thumb.theporndb.net/performer-last.jpg", size: 2048 },
+    ],
+  };
+  const fixture = await startFixture((req, res) => {
+    assert.equal(req.method, "GET");
+    assert.equal(req.headers.authorization, `Bearer ${TPDB_TOKEN}`);
+    if (req.url === `/performers/${CANON_PERFORMER_ID}`) {
+      sendJson(res, 200, { data: row });
+      return;
+    }
+    assert.equal((req.url ?? "").split("?")[0], "/performers");
+    assert.equal(queryOf(req.url ?? "").get("q"), "fixture");
+    sendJson(res, 200, {
+      data: [row],
+      links: { next: null },
+      meta: { current_page: 1, per_page: 5, total: 1, last_page: 1 },
+    });
+  });
+  try {
+    process.env.TPDB_BASE_URL = fixture.origin;
+    const detail = await getCatalogDetail({
+      provider: "tpdb",
+      kind: "performer",
+      id: CANON_PERFORMER_ID,
+    });
+    assert.ok(detail !== null);
+    assert.equal(
+      detail.imageUrl,
+      "https://cdn.theporndb.net/performer-largest.jpg",
+    );
+    const page = await searchCatalog({
+      provider: "tpdb",
+      kind: "performer",
+      query: "fixture",
+      perPage: 5,
+    });
+    assert.equal(page.items.length, 1);
+    assert.equal(page.items[0]?.reference.id, CANON_PERFORMER_ID);
+    assert.equal(
+      page.items[0]?.imageUrl,
+      "https://cdn.theporndb.net/performer-largest.jpg",
+    );
+  } finally {
+    await fixture.close();
+    restore();
+  }
+});
+
+// A usable parent poster is not a row-image fallback case.
+for (const scenario of [
+  {
+    name: "use the parent poster when canonical image is rejected",
+    parentPosters: [
+      { url: "https://cdn.theporndb.net/parent-poster.jpg", size: 9_999_999 },
+    ],
+    expected: "https://cdn.theporndb.net/parent-poster.jpg",
+  },
+  {
+    name: "fall back to the row image when neither poster list nor canonical image is usable",
+    parentPosters: [
+      {
+        url: "https://images02-openlife.gammacdn.com/parent-rejected.jpg",
+        size: 9_999_999,
+      },
+      { url: "https://cdn.theporndb.net/parent-zero.jpg", size: 0 },
+    ],
+    expected: "https://cdn.theporndb.net/performer/row.jpg",
+  },
+] as const) {
+  test(`tpdb credits ${scenario.name}`, async () => {
+    const restore = setEnv({ TPDB_API_TOKEN: TPDB_TOKEN });
+    const fixture = await startFixture((req, res) => {
+      assert.equal(req.method, "GET");
+      assert.equal(req.url, `/movies/${MOVIE_ID}`);
+      const row = tpdbMovieRow();
+      const performer = (row.performers as Record<string, unknown>[])[0];
+      assert.ok(performer !== undefined);
+      performer.image = "https://cdn.theporndb.net/performer/row.jpg";
+      performer.posters = [
+        { url: "https://thumb.theporndb.net/credit-zero.jpg", size: 0 },
+      ];
+      performer.parent = {
+        ...(performer.parent as Record<string, unknown>),
+        image: "https://images02-openlife.gammacdn.com/canonical.jpg",
+        posters: scenario.parentPosters,
+      };
+      sendJson(res, 200, { data: row });
+    });
+    try {
+      process.env.TPDB_BASE_URL = fixture.origin;
+      const detail = await getCatalogDetail({
+        provider: "tpdb",
+        kind: "movie",
+        id: MOVIE_ID,
+      });
+      assert.ok(detail !== null);
+      assert.deepEqual(detail.credits, [
+        {
+          reference: {
+            provider: "tpdb",
+            kind: "performer",
+            id: CANON_PERFORMER_ID,
+          },
+          name: "Credited Name",
+          imageUrl: scenario.expected,
+        },
+      ]);
+      assert.equal(JSON.stringify(detail).includes("gammacdn"), false);
+    } finally {
+      await fixture.close();
+      restore();
+    }
+  });
+}
+
 // --- StashDB scene detail mapping ---
 
 test("stashdb scene detail maps performers, clamps duration, drops absurd values", async () => {
@@ -383,6 +696,401 @@ test("stashdb scene detail maps performers, clamps duration, drops absurd values
     restore();
   }
 });
+
+// --- StashDB artwork selection through public row mappers ---
+
+function mappedStashArtwork(
+  images: unknown,
+): Record<string, string | undefined> {
+  const scene = mapStashSceneDetail({
+    id: STASH_SCENE_ID,
+    title: "Artwork scene",
+    images,
+    performers: [
+      {
+        performer: {
+          id: STASH_PERFORMER_ID,
+          name: "Artwork credit",
+          images,
+        },
+      },
+    ],
+  });
+  const performer = mapStashPerformerDetail({
+    id: STASH_PERFORMER_ID,
+    name: "Artwork performer",
+    images,
+  });
+  const studio = mapStashStudioDetail({
+    id: STASH_STUDIO_ID,
+    name: "Artwork studio",
+    images,
+  });
+  assert.ok(scene !== undefined);
+  assert.ok(performer !== undefined);
+  assert.ok(studio !== undefined);
+  assert.equal(scene.credits.length, 1);
+  return {
+    scene: scene.imageUrl,
+    credit: scene.credits[0]?.imageUrl,
+    performer: performer.imageUrl,
+    studio: studio.imageUrl,
+    studioLogo: studio.logoUrl,
+  };
+}
+
+const STASH_SMALL_ART = "https://stashdb.org/images/artwork-small";
+const STASH_LARGE_ART = "https://stashdb.org/images/artwork-large";
+const STASH_TIE_ART = "https://stashdb.org/images/artwork-tie";
+
+const stashArtworkCases: {
+  name: string;
+  images: unknown;
+  expected: string | undefined;
+}[] = [
+  {
+    name: "largest area wins rather than largest width",
+    images: [
+      { url: STASH_SMALL_ART, width: 2000, height: 100 },
+      { url: STASH_LARGE_ART, width: 1000, height: 1000 },
+    ],
+    expected: STASH_LARGE_ART,
+  },
+  {
+    name: "largest image after position five wins",
+    images: [
+      { url: STASH_SMALL_ART, width: 100, height: 100 },
+      null,
+      { url: "https://forbidden.example/image.jpg", width: 5000, height: 5000 },
+      {},
+      { url: STASH_TIE_ART, width: 200, height: 100 },
+      { url: STASH_LARGE_ART, width: 1000, height: 1000 },
+    ],
+    expected: STASH_LARGE_ART,
+  },
+  {
+    name: "equal areas keep the first image",
+    images: [
+      { url: STASH_LARGE_ART, width: 800, height: 600 },
+      { url: STASH_TIE_ART, width: 1200, height: 400 },
+    ],
+    expected: STASH_LARGE_ART,
+  },
+  {
+    name: "missing dimensions keep the first servable image",
+    images: [{ url: STASH_SMALL_ART }, { url: STASH_LARGE_ART }],
+    expected: STASH_SMALL_ART,
+  },
+  {
+    name: "malformed dimensions keep the first servable image across the full list",
+    images: [
+      null,
+      17,
+      { url: "https://stashdb.org/graphql" },
+      { url: "http://stashdb.org/images/insecure" },
+      { url: `${STASH_LARGE_ART}?size=1280` },
+      { url: STASH_SMALL_ART, width: "1000", height: 1000 },
+      { url: STASH_LARGE_ART, width: 1000, height: null },
+    ],
+    expected: STASH_SMALL_ART,
+  },
+  {
+    name: "valid dimensions beat earlier dimensionless artwork",
+    images: [
+      { url: STASH_SMALL_ART },
+      { url: STASH_LARGE_ART, width: 1, height: 1 },
+    ],
+    expected: STASH_LARGE_ART,
+  },
+  {
+    name: "an unusable image list emits no artwork",
+    images: [null, {}, 17, { url: false }, { url: "not a URL" }],
+    expected: undefined,
+  },
+  ...[undefined, null, {}, "not an image list", []].map((images) => ({
+    name: `absent or malformed image list ${JSON.stringify(images)}`,
+    images,
+    expected: undefined,
+  })),
+];
+
+for (const { name, images, expected } of stashArtworkCases) {
+  test(`stashdb artwork: ${name}`, () => {
+    for (const [consumer, actual] of Object.entries(
+      mappedStashArtwork(images),
+    )) {
+      assert.equal(actual, expected, consumer);
+    }
+  });
+}
+
+for (const dimension of [
+  undefined,
+  null,
+  "10000",
+  true,
+  0,
+  -1,
+  1.5,
+  NaN,
+  Infinity,
+  Number.MAX_SAFE_INTEGER + 1,
+]) {
+  for (const axis of ["width", "height"] as const) {
+    test(`stashdb artwork rejects ${axis} ${String(dimension)} as a dimension`, () => {
+      const images = [
+        {
+          url: STASH_SMALL_ART,
+          width: 10000,
+          height: 10000,
+          [axis]: dimension,
+        },
+        { url: STASH_LARGE_ART, width: 100, height: 100 },
+      ];
+      for (const [consumer, actual] of Object.entries(
+        mappedStashArtwork(images),
+      )) {
+        assert.equal(actual, STASH_LARGE_ART, consumer);
+      }
+    });
+  }
+}
+
+test("stashdb artwork rejects unsafe areas even when both dimensions are safe integers", () => {
+  const images = [
+    { url: STASH_SMALL_ART, width: Number.MAX_SAFE_INTEGER, height: 2 },
+    { url: STASH_LARGE_ART, width: 100, height: 100 },
+  ];
+  for (const [consumer, actual] of Object.entries(mappedStashArtwork(images))) {
+    assert.equal(actual, STASH_LARGE_ART, consumer);
+  }
+});
+
+for (const url of [
+  `${STASH_LARGE_ART}?size=1280`,
+  "http://stashdb.org/images/insecure",
+  "https://forbidden.example/image.jpg",
+  "https://stashdb.org/graphql",
+  "https://stashdb.org/not-images/image.jpg",
+]) {
+  test(`stashdb artwork rejects a larger unservable candidate: ${url}`, () => {
+    const rejected = { url, width: 10000, height: 10000 };
+    for (const images of [
+      [rejected, { url: STASH_SMALL_ART, width: 10, height: 10 }],
+      [rejected],
+    ]) {
+      const expected = images.length === 1 ? undefined : STASH_SMALL_ART;
+      for (const [consumer, actual] of Object.entries(
+        mappedStashArtwork(images),
+      )) {
+        assert.equal(actual, expected, consumer);
+      }
+    }
+  });
+}
+
+test("property: stashdb artwork chooses the first servable image with maximal safe area", () => {
+  const urlKinds = [
+    { prefix: "https://stashdb.org/images/", suffix: "", servable: true },
+    { prefix: "https://cdn.theporndb.net/", suffix: "", servable: true },
+    {
+      prefix: "https://stashdb.org/images/",
+      suffix: "?size=1280",
+      servable: false,
+    },
+    { prefix: "http://stashdb.org/images/", suffix: "", servable: false },
+    { prefix: "https://forbidden.example/", suffix: "", servable: false },
+    { prefix: "https://stashdb.org/scenes/", suffix: "", servable: false },
+  ] as const;
+  const dimension = fc.oneof(
+    fc.integer({ min: 1, max: 20 }),
+    fc.constantFrom<unknown>(
+      undefined,
+      null,
+      "100",
+      true,
+      0,
+      -1,
+      1.5,
+      NaN,
+      Infinity,
+      Number.MAX_SAFE_INTEGER,
+      Number.MAX_SAFE_INTEGER + 1,
+    ),
+  );
+  // BigInt products and a ranked list form an oracle independent of the mapper.
+  const oracleArea = (width: unknown, height: unknown): bigint | undefined => {
+    if (
+      typeof width !== "number" ||
+      typeof height !== "number" ||
+      !Number.isSafeInteger(width) ||
+      !Number.isSafeInteger(height) ||
+      width <= 0 ||
+      height <= 0
+    )
+      return undefined;
+    const area = BigInt(width) * BigInt(height);
+    return area <= BigInt(Number.MAX_SAFE_INTEGER) ? area : undefined;
+  };
+  fc.assert(
+    fc.property(
+      fc.array(
+        fc.record({
+          kind: fc.integer({ min: 0, max: urlKinds.length - 1 }),
+          width: dimension,
+          height: dimension,
+        }),
+        { maxLength: 20 },
+      ),
+      (entries) => {
+        const candidates = entries.map(({ kind, width, height }, index) => {
+          const choice = urlKinds[kind]!;
+          return {
+            url: `${choice.prefix}candidate-${index}${choice.suffix}`,
+            width,
+            height,
+            servable: choice.servable,
+            area: oracleArea(width, height),
+            index,
+          };
+        });
+        const servable = candidates.filter((candidate) => candidate.servable);
+        const ranked = servable
+          .filter((candidate) => candidate.area !== undefined)
+          .sort((a, b) =>
+            a.area === b.area ? a.index - b.index : a.area! > b.area! ? -1 : 1,
+          );
+        const expected = (ranked[0] ?? servable[0])?.url;
+        const images = candidates.map(({ url, width, height }) => ({
+          url,
+          width,
+          height,
+        }));
+        for (const [consumer, actual] of Object.entries(
+          mappedStashArtwork(images),
+        )) {
+          assert.equal(actual, expected, consumer);
+          if (actual !== undefined) {
+            assert.ok(
+              servable.some((candidate) => candidate.url === actual),
+              consumer,
+            );
+          }
+        }
+      },
+    ),
+  );
+});
+
+for (const kind of ["scene", "performer", "studio"] as const) {
+  for (const mode of ["search", "detail"] as const) {
+    test(`stashdb ${kind} ${mode} requests image dimensions and returns the largest artwork`, async () => {
+      const restore = setEnv({ STASHDB_API_KEY: STASH_TOKEN });
+      const id =
+        kind === "scene"
+          ? STASH_SCENE_ID
+          : kind === "performer"
+            ? STASH_PERFORMER_ID
+            : STASH_STUDIO_ID;
+      const operation =
+        mode === "search"
+          ? {
+              scene: "queryScenes",
+              performer: "searchPerformers",
+              studio: "searchStudio",
+            }[kind]
+          : {
+              scene: "findScene",
+              performer: "findPerformer",
+              studio: "findStudio",
+            }[kind];
+      const images = [
+        { url: STASH_SMALL_ART, width: 2000, height: 100 },
+        { url: STASH_LARGE_ART, width: 1000, height: 1000 },
+      ];
+      const row = {
+        id,
+        title: "Artwork fixture",
+        name: "Artwork fixture",
+        deleted: false,
+        images,
+        performers: [
+          {
+            performer: {
+              id: STASH_PERFORMER_ID,
+              name: "Artwork credit",
+              deleted: false,
+              images: [
+                { url: STASH_SMALL_ART, width: 20, height: 10 },
+                { url: STASH_TIE_ART, width: 100, height: 100 },
+              ],
+            },
+          },
+        ],
+      };
+      const fixture = await startFixture((req, res, body) => {
+        assert.equal(req.method, "POST");
+        assert.equal(req.url, "/graphql");
+        assert.equal(req.headers.apikey, STASH_TOKEN);
+        const request = JSON.parse(body) as {
+          query: string;
+          variables: Record<string, unknown>;
+        };
+        assert.match(request.query, new RegExp(`\\b${operation}\\s*\\(`));
+        assert.deepEqual(
+          request.variables,
+          mode === "detail"
+            ? { id }
+            : kind === "scene"
+              ? { f: { page: 1, per_page: 1, text: "artwork" } }
+              : { t: "artwork" },
+        );
+        const selections = [
+          ...request.query.matchAll(/\bimages\s*\{([^{}]*)\}/g),
+        ];
+        assert.equal(selections.length, kind === "scene" ? 2 : 1);
+        for (const selection of selections) {
+          for (const field of ["url", "width", "height"]) {
+            assert.match(selection[1]!, new RegExp(`\\b${field}\\b`));
+          }
+        }
+        const result =
+          mode === "detail"
+            ? row
+            : kind === "scene"
+              ? { count: 1, scenes: [row] }
+              : kind === "performer"
+                ? { count: 1, performers: [row] }
+                : [row];
+        sendJson(res, 200, { data: { [operation]: result } });
+      });
+      try {
+        process.env.STASHDB_BASE_URL = fixture.origin;
+        const detail =
+          mode === "detail"
+            ? await getCatalogDetail({ provider: "stashdb", kind, id })
+            : (
+                await searchCatalog({
+                  provider: "stashdb",
+                  kind,
+                  query: "artwork",
+                  perPage: 1,
+                })
+              ).items[0];
+        assert.ok(detail !== null && detail !== undefined);
+        assert.equal(detail.imageUrl, STASH_LARGE_ART);
+        if (kind === "scene") {
+          assert.equal(detail.credits[0]?.imageUrl, STASH_TIE_ART);
+        }
+        if (kind === "studio") assert.equal(detail.logoUrl, STASH_LARGE_ART);
+        assert.equal(fixture.log.length, 1);
+      } finally {
+        await fixture.close();
+        restore();
+      }
+    });
+  }
+}
 
 // --- StashDB performer detail biography mapping ---
 
@@ -1488,6 +2196,24 @@ test("artwork URL gate: https + provider hosts only, derived from live records",
     false,
   );
   assert.equal(isProviderImageUrl("not a url").ok, false);
+  // An explicit port turns an allowlisted host into a different origin, and
+  // the artwork proxy would fetch whatever listens there (VELV-216). The
+  // default port normalizes away, so https on 443 keeps passing.
+  assert.deepEqual(isProviderImageUrl("https://cdn.theporndb.net:8443/x.jpg"), {
+    ok: false,
+    reason: "artwork URLs must not carry an explicit port",
+  });
+  assert.equal(
+    isProviderImageUrl(
+      "https://stashdb.org:8080/images/d695a097-3cf5-41c6-bf00-be5c7bc185b8",
+    ).ok,
+    false,
+  );
+  assert.equal(
+    isProviderImageUrl("https://thumb.theporndb.net:9000/abc=/500x500/smart")
+      .ok,
+    false,
+  );
   // stashdb.org is also the StashDB API host and /images/ its only artwork
   // path; a query string would multiply cache keys past the fetch (VELV-23).
   assert.deepEqual(isProviderImageUrl("https://stashdb.org/graphql"), {
@@ -1693,6 +2419,7 @@ test("property: isProviderImageUrl SSRF invariants over generated URL parts", ()
           assert.equal(parsed.password, "");
           assert.equal(parsed.hash, "");
           assert.equal(parsed.search, "", `accepted query string: ${u}`);
+          assert.equal(parsed.port, "", `accepted explicit port: ${u}`);
           assert.ok(
             ALLOWED_HOSTS.includes(parsed.hostname),
             `accepted off-allowlist host: ${u}`,
@@ -1808,6 +2535,64 @@ test("artwork fetch: same URL twice hits upstream once; resetMetaCache clears th
   }
 });
 
+test("artwork fetch: a global slot cap bounds upstream fetches in flight", async () => {
+  // VELV-215: one member can spend ARTWORK_BURST misses on distinct URLs at
+  // once, and each in-flight fetch buffers up to IMAGE_BYTE_CAP twice in
+  // readBounded. The semaphore keeps the resident worst case at
+  // ARTWORK_FETCH_CONCURRENCY × 2 × cap instead of miss burst × 2 × cap.
+  // Distinct held URLs prove both directions: batches run in parallel
+  // (maxActive > 1) and the cap holds (maxActive ≤ cap) while every fetch
+  // still answers with the right bytes and every distinct URL charges one
+  // miss.
+  let upstreamCount = 0;
+  let active = 0;
+  let maxActive = 0;
+  const fixture = await startFixture((req, res) => {
+    if (!req.url?.startsWith("/capped/")) {
+      sendBytes(res, 404, "nope", "text/plain");
+      return;
+    }
+    upstreamCount++;
+    active++;
+    maxActive = Math.max(maxActive, active);
+    // Real hold: responses must stay open over HTTP so the fetches are
+    // genuinely in flight, which no fake clock can drive over live sockets
+    // (same exception as the in-flight flood test near the api suite).
+    setTimeout(() => {
+      active--;
+      sendBytes(res, 200, PNG_BYTES, "image/png");
+    }, 60);
+  });
+  try {
+    const total = ARTWORK_FETCH_CONCURRENCY * 2 + 8;
+    const misses: number[] = [];
+    const contentTypes = await Promise.all(
+      Array.from({ length: total }, (_, i) =>
+        fetchProviderArtwork(`${fixture.origin}/capped/${i}`, {
+          onMiss: () => misses.push(i),
+        }).then(
+          (entry) => entry.contentType,
+          () => "error",
+        ),
+      ),
+    );
+    assert.equal(upstreamCount, total);
+    assert.equal(misses.length, total);
+    assert.equal(misses.length, new Set(misses).size, "one miss per URL");
+    assert.ok(
+      contentTypes.every((c) => c === "image/png"),
+      "every capped fetch must answer with the image",
+    );
+    assert.ok(maxActive > 1, "the cap must not serialize fetches");
+    assert.ok(
+      maxActive <= ARTWORK_FETCH_CONCURRENCY,
+      `fixture saw ${maxActive} concurrent artwork fetches, cap is ${ARTWORK_FETCH_CONCURRENCY}`,
+    );
+  } finally {
+    await fixture.close();
+  }
+});
+
 test("artwork fetch: an empty 200 image is refused and never cached", async () => {
   // The cache budget counts body bytes only, so a cached empty body would add
   // a row that costs nothing and member-chosen keys could grow the cache
@@ -1834,15 +2619,25 @@ test("artwork fetch: an empty 200 image is refused and never cached", async () =
 
 // --- artwork width ladder and on-disk variant store ---
 
-// Pinned store layout: <VELVARR_DATA_DIR>/artwork/<hash[0:2]>/<hash>-<w>.webp.
-// tests/setup.ts points VELVARR_DATA_DIR at a per-process throwaway dir, so
-// these assertions never touch real data.
+// Pinned store layout: <VELVARR_DATA_DIR>/artwork/<hash[0:2]>/<hash>-<w>c.webp
+// ("c": the variant covers a w × 1.5w frame; the suffix retired the old
+// width-only files). tests/setup.ts points VELVARR_DATA_DIR at a per-process
+// throwaway dir, so these assertions never touch real data.
 function artworkStorePath(hash: string, width: number): string {
   return join(
     process.env.VELVARR_DATA_DIR!,
     "artwork",
     hash.slice(0, 2),
-    `${hash}-${width}.webp`,
+    `${hash}-${width}c.webp`,
+  );
+}
+
+function artworkIndexPath(url: string): string {
+  return join(
+    process.env.VELVARR_DATA_DIR!,
+    "artwork",
+    "index",
+    createHash("sha256").update(url).digest("hex"),
   );
 }
 
@@ -1868,7 +2663,24 @@ const POSTER_185 = await sharp({
   .toBuffer();
 const NOT_AN_IMAGE = Buffer.from("definitely not an image");
 
-test("artwork width ladder: w=400 returns a 400px webp variant stored under the content-hash name", async () => {
+// A 1000×500 landscape JPEG carrying EXIF orientation 6: every orientation-
+// aware viewer displays it as a 500×1000 portrait. withMetadata writes the
+// tag without rotating the pixels, so the stored data stays landscape.
+const ORIENTED_6_JPEG = await sharp({
+  create: {
+    width: 1000,
+    height: 500,
+    channels: 3,
+    background: { r: 200, g: 90, b: 20 },
+  },
+})
+  .jpeg()
+  .toBuffer()
+  .then((landscape) =>
+    sharp(landscape).withMetadata({ orientation: 6 }).jpeg().toBuffer(),
+  );
+
+test("artwork width ladder: w=400 returns a webp variant covering 400x600, stored under the content-hash name", async () => {
   const sourceHash = createHash("sha256").update(POSTER_1000).digest("hex");
   let upstreamCount = 0;
   const fixture = await startFixture((req, res) => {
@@ -1884,8 +2696,10 @@ test("artwork width ladder: w=400 returns a 400px webp variant stored under the 
     const at400 = await fetchProviderArtwork(url, { width: 400 });
     assert.equal(at400.contentType, "image/webp");
     assert.equal(at400.hash, sourceHash);
+    // The 1000x1400 poster is a bit wider than 2:3, so the 600 px height
+    // binds: 429x600 covers a 400x600 frame.
     const meta = await sharp(Buffer.from(at400.bytes)).metadata();
-    assert.equal(meta.width, 400);
+    assert.deepEqual([meta.width, meta.height], [429, 600]);
     assert.equal(meta.format, "webp");
 
     // The stored file is the variant: same bytes, real content, pinned name.
@@ -1898,12 +2712,34 @@ test("artwork width ladder: w=400 returns a 400px webp variant stored under the 
     // source from the memory cache and stores its own variant.
     const at200 = await fetchProviderArtwork(url, { width: 200 });
     const meta200 = await sharp(Buffer.from(at200.bytes)).metadata();
-    assert.equal(meta200.width, 200);
+    assert.deepEqual([meta200.width, meta200.height], [214, 300]);
     assert.equal(meta200.format, "webp");
     assert.equal(upstreamCount, 1);
   } finally {
     await fixture.close();
   }
+});
+
+test("artwork variant: a landscape scene still covers a 2:3 card frame, not only its width", async () => {
+  // Cards crop with object-fit: cover into 2:3 frames. A width-only resize
+  // turned a 16:9 still at w=200 into 200x113, stretched to 300 px tall.
+  const still = await sharp({
+    create: {
+      width: 1600,
+      height: 900,
+      channels: 3,
+      background: { r: 90, g: 40, b: 120 },
+    },
+  })
+    .png()
+    .toBuffer();
+  const variant = await artworkVariantFor(
+    { bytes: new Uint8Array(still), contentType: "image/png" },
+    200,
+  );
+  assert.equal(variant.isVariant, true);
+  const meta = await sharp(Buffer.from(variant.bytes)).metadata();
+  assert.deepEqual([meta.width, meta.height], [533, 300]);
 });
 
 test("artwork no-upscale: a 185px source at w=400 returns the exact source bytes", async () => {
@@ -1933,42 +2769,320 @@ test("artwork no-upscale: a 185px source at w=400 returns the exact source bytes
   }
 });
 
-test("artwork store: eviction removes the least recently used file when the budget is exceeded", async () => {
-  // mtime is the store's LRU clock (writes and disk hits touch it), so the
-  // test ages files explicitly with utimesSync and never sleeps. Variant
-  // sizes are precomputed with the store's own encode pipeline — sharp is
-  // deterministic, so the precomputed lengths equal the on-disk sizes and
-  // the budget arithmetic below is exact.
-  const artworkDir = join(process.env.VELVARR_DATA_DIR!, "artwork");
-  rmSync(artworkDir, { recursive: true, force: true });
-  mkdirSync(artworkDir, { recursive: true });
-  assert.equal(artworkStoreStateForTest().files, 0);
+test("artwork variant: an EXIF-rotated source comes out upright, not sideways", async () => {
+  // WebP output drops the EXIF orientation tag, so the variant pixels must
+  // be pre-rotated: orientation 6 shows the 1000×500 landscape as a
+  // 500×1000 portrait, and the w=400 variant must be portrait too.
+  const variant = await artworkVariantFor(
+    { bytes: new Uint8Array(ORIENTED_6_JPEG), contentType: "image/jpeg" },
+    400,
+  );
+  assert.equal(variant.contentType, "image/webp");
+  assert.equal(variant.isVariant, true);
+  const meta = await sharp(Buffer.from(variant.bytes)).metadata();
+  assert.equal(meta.format, "webp");
+  assert.ok(
+    (meta.height ?? 0) > (meta.width ?? 0),
+    `expected an upright portrait variant, got ${meta.width}x${meta.height}`,
+  );
+  assert.equal(meta.orientation, undefined);
+});
 
-  const encodeSource = async (background: {
-    r: number;
-    g: number;
-    b: number;
-  }) => {
-    const png = await sharp({
+test("artwork no-upscale: a rotated source is compared on its oriented width", async () => {
+  // Stored 1000×500 with orientation 6 is 500 wide upright, so a w=600 rung
+  // must pass the source through instead of "upscaling" the upright image
+  // from the stored landscape axis.
+  const variant = await artworkVariantFor(
+    { bytes: new Uint8Array(ORIENTED_6_JPEG), contentType: "image/jpeg" },
+    600,
+  );
+  assert.equal(variant.isVariant, false);
+  assert.equal(variant.contentType, "image/jpeg");
+  assert.deepEqual([...variant.bytes], [...ORIENTED_6_JPEG]);
+  assert.equal(
+    existsSync(
+      artworkStorePath(
+        createHash("sha256").update(ORIENTED_6_JPEG).digest("hex"),
+        600,
+      ),
+    ),
+    false,
+    "a no-upscale pass-through must not write a variant file",
+  );
+});
+
+for (const [label, source] of [
+  ["small image", POSTER_185],
+  ["unreadable image", NOT_AN_IMAGE],
+] as const) {
+  test(`artwork store: cached ${label} passthrough preserves the fresh index without an expiry sweep`, async (t) => {
+    const savedDataDir = process.env.VELVARR_DATA_DIR!;
+    const savedOrigin = process.env.VELVARR_TEST_ARTWORK_ORIGIN;
+    const dataDir = mkdtempSync(join(savedDataDir, "artwork-cached-index-"));
+    const sourceHash = createHash("sha256").update(source).digest("hex");
+    let upstreamCount = 0;
+    let missCount = 0;
+    const fixture = await startFixture((_req, res) => {
+      upstreamCount++;
+      sendBytes(res, 200, source, "image/png");
+    });
+    const quiet =
+      source === NOT_AN_IMAGE
+        ? mock.method(console, "error", () => {})
+        : undefined;
+    try {
+      process.env.VELVARR_DATA_DIR = dataDir;
+      const url = `${fixture.origin}/scene/d1/0b/6b/poster.png`;
+      const options = {
+        width: 600 as const,
+        onMiss: () => {
+          missCount++;
+        },
+      };
+      const first = await fetchProviderArtwork(url, options);
+      assert.deepEqual([...first.bytes], [...source]);
+      assert.equal(first.contentType, "image/png");
+      assert.equal(first.hash, sourceHash);
+      assert.equal(first.isVariant, false);
+      const index = artworkIndexPath(url);
+      assert.equal(readFileSync(index, "utf8"), sourceHash);
+
+      const expiredUrl = `${fixture.origin}/scene/d1/0b/6b/expired.png`;
+      rememberArtworkVariant(expiredUrl, sourceHash);
+      const expiredIndex = artworkIndexPath(expiredUrl);
+      const expired = new Date(Date.now() - 25 * 60 * 60_000);
+      utimesSync(expiredIndex, expired, expired);
+      const aged = new Date(Date.now() - 60_000);
+      utimesSync(index, aged, aged);
+      const before = statSync(index);
+      const originalIndex = readFileSync(index, "utf8");
+
+      // No derivative exists, so each memory hit must derive the passthrough again.
+      for (let i = 0; i < 3; i++) {
+        const repeated = await fetchProviderArtwork(url, options);
+        assert.deepEqual([...repeated.bytes], [...source]);
+        assert.equal(repeated.contentType, "image/png");
+        assert.equal(repeated.hash, sourceHash);
+        assert.equal(repeated.isVariant, false);
+        assert.equal(existsSync(artworkStorePath(sourceHash, 600)), false);
+        assert.equal(readFileSync(index, "utf8"), originalIndex);
+        assert.equal(upstreamCount, 1);
+        assert.equal(missCount, 1);
+      }
+      await t.test("preserves the fresh index mtime", () => {
+        assert.equal(
+          statSync(index).mtimeMs,
+          before.mtimeMs,
+          "a cached passthrough must not rewrite or extend the index TTL",
+        );
+      });
+      await t.test("does not sweep unrelated expired entries", () => {
+        assert.equal(
+          existsSync(expiredIndex),
+          true,
+          "a cached passthrough must not sweep unrelated expired entries",
+        );
+      });
+    } finally {
+      quiet?.mock.restore();
+      process.env.VELVARR_DATA_DIR = savedDataDir;
+      if (savedOrigin === undefined)
+        delete process.env.VELVARR_TEST_ARTWORK_ORIGIN;
+      else process.env.VELVARR_TEST_ARTWORK_ORIGIN = savedOrigin;
+      await fixture.close();
+    }
+  });
+}
+
+for (const state of [
+  "missing",
+  "expired same-hash",
+  "fresh different-hash",
+  "malformed",
+  "empty",
+] as const) {
+  test(`artwork store: a cached passthrough repairs a ${state} index and sweeps expired entries`, async () => {
+    const savedDataDir = process.env.VELVARR_DATA_DIR!;
+    const savedOrigin = process.env.VELVARR_TEST_ARTWORK_ORIGIN;
+    const dataDir = mkdtempSync(join(savedDataDir, "artwork-index-repair-"));
+    const sourceHash = createHash("sha256").update(POSTER_185).digest("hex");
+    const otherHash = createHash("sha256").update(POSTER_1000).digest("hex");
+    let upstreamCount = 0;
+    let missCount = 0;
+    const fixture = await startFixture((_req, res) => {
+      upstreamCount++;
+      sendBytes(res, 200, POSTER_185, "image/png");
+    });
+    try {
+      process.env.VELVARR_DATA_DIR = dataDir;
+      const url = `${fixture.origin}/scene/d1/0b/6b/poster.png`;
+      const onMiss = () => {
+        missCount++;
+      };
+      // A source-only warm leaves the missing case without an index.
+      await fetchProviderArtwork(url, {
+        ...(state === "missing" ? {} : { width: 600 as const }),
+        onMiss,
+      });
+      const index = artworkIndexPath(url);
+      assert.equal(existsSync(index), state !== "missing");
+
+      const expiredUrl = `${fixture.origin}/scene/d1/0b/6b/expired.png`;
+      rememberArtworkVariant(expiredUrl, otherHash);
+      const expiredIndex = artworkIndexPath(expiredUrl);
+      const expired = new Date(Date.now() - 25 * 60 * 60_000);
+      utimesSync(expiredIndex, expired, expired);
+      let previousMtime: number | undefined;
+      if (state !== "missing") {
+        if (state === "fresh different-hash") writeFileSync(index, otherHash);
+        if (state === "malformed") writeFileSync(index, "not-a-sha256");
+        if (state === "empty") writeFileSync(index, "");
+        const aged =
+          state === "expired same-hash"
+            ? expired
+            : new Date(Date.now() - 60_000);
+        utimesSync(index, aged, aged);
+        previousMtime = statSync(index).mtimeMs;
+      }
+
+      const result = await fetchProviderArtwork(url, { width: 600, onMiss });
+      assert.deepEqual([...result.bytes], [...POSTER_185]);
+      assert.equal(result.contentType, "image/png");
+      assert.equal(result.hash, sourceHash);
+      assert.equal(result.isVariant, false);
+      assert.equal(existsSync(artworkStorePath(sourceHash, 600)), false);
+      assert.equal(readFileSync(index, "utf8"), sourceHash);
+      if (previousMtime !== undefined) {
+        assert.ok(
+          statSync(index).mtimeMs > previousMtime,
+          "an invalid or changed index must receive a fresh write",
+        );
+      }
+      assert.equal(
+        existsSync(expiredIndex),
+        false,
+        "an actual index write must still sweep expired entries",
+      );
+      assert.equal(upstreamCount, 1);
+      assert.equal(missCount, 1);
+    } finally {
+      process.env.VELVARR_DATA_DIR = savedDataDir;
+      if (savedOrigin === undefined)
+        delete process.env.VELVARR_TEST_ARTWORK_ORIGIN;
+      else process.env.VELVARR_TEST_ARTWORK_ORIGIN = savedOrigin;
+      await fixture.close();
+    }
+  });
+}
+
+for (const [label, source, isVariant] of [
+  ["passthrough", POSTER_185, false],
+  ["stored variant", POSTER_1000, true],
+] as const) {
+  test(`artwork store: index-only ${label} writes stay within the allocation budget`, async () => {
+    const savedDataDir = process.env.VELVARR_DATA_DIR!;
+    const dataDir = mkdtempSync(join(savedDataDir, "artwork-index-budget-"));
+    let upstreamCount = 0;
+    const fixture = await startFixture((_req, res) => {
+      upstreamCount++;
+      sendBytes(res, 200, source, "image/png");
+    });
+    try {
+      process.env.VELVARR_DATA_DIR = dataDir;
+      const firstUrl = `${fixture.origin}/index-0.png`;
+      const first = await fetchProviderArtwork(firstUrl, { width: 400 });
+      assert.equal(first.isVariant, isVariant);
+      const initial = artworkStoreStateForTest();
+      assert.equal(initial.files, isVariant ? 2 : 1);
+      const budget = initial.bytes * 3;
+      setArtworkStoreBudgetForTest(budget);
+      const hash = createHash("sha256").update(source).digest("hex");
+      for (let i = 0; i < 40; i++) {
+        const url = `${fixture.origin}/index-${i}.png`;
+        if (i > 0) {
+          const result = await fetchProviderArtwork(url, { width: 400 });
+          assert.equal(result.isVariant, isVariant);
+          assert.deepEqual(result.bytes, first.bytes);
+        }
+        const index = join(
+          dataDir,
+          "artwork",
+          "index",
+          createHash("sha256").update(url).digest("hex"),
+        );
+        assert.equal(statSync(index).size, 64);
+        // Keep indexes older than the shared variant, without clock ties.
+        const aged = new Date(Date.now() - 60_000 + i);
+        utimesSync(index, aged, aged);
+        const state = artworkStoreStateForTest();
+        assert.ok(state.bytes <= budget, `${label} write ${i} exceeds budget`);
+        assert.ok(state.files <= initial.files * 3);
+        assert.equal(existsSync(artworkStorePath(hash, 400)), isVariant);
+      }
+      assert.equal(upstreamCount, 40);
+      assert.ok(initial.bytes >= initial.files * 4096);
+    } finally {
+      setArtworkStoreBudgetForTest(null);
+      process.env.VELVARR_DATA_DIR = savedDataDir;
+      await fixture.close();
+    }
+  });
+
+  test(`artwork store: an index-only ${label} write removes expired index entries`, async () => {
+    const savedDataDir = process.env.VELVARR_DATA_DIR!;
+    const dataDir = mkdtempSync(join(savedDataDir, "artwork-index-expiry-"));
+    let upstreamCount = 0;
+    const fixture = await startFixture((_req, res) => {
+      upstreamCount++;
+      sendBytes(res, 200, source, "image/png");
+    });
+    try {
+      process.env.VELVARR_DATA_DIR = dataDir;
+      const oldUrl = `${fixture.origin}/expired.png`;
+      const first = await fetchProviderArtwork(oldUrl, { width: 400 });
+      assert.equal(first.isVariant, isVariant);
+      const oldIndex = join(
+        dataDir,
+        "artwork",
+        "index",
+        createHash("sha256").update(oldUrl).digest("hex"),
+      );
+      const expired = new Date(Date.now() - 25 * 60 * 60_000);
+      utimesSync(oldIndex, expired, expired);
+      const next = await fetchProviderArtwork(`${fixture.origin}/fresh.png`, {
+        width: 400,
+      });
+      assert.equal(next.isVariant, isVariant);
+      assert.deepEqual(next.bytes, first.bytes);
+      assert.equal(existsSync(oldIndex), false);
+      assert.equal(artworkStoreStateForTest().files, isVariant ? 2 : 1);
+      assert.equal(upstreamCount, 2);
+    } finally {
+      setArtworkStoreBudgetForTest(null);
+      process.env.VELVARR_DATA_DIR = savedDataDir;
+      await fixture.close();
+    }
+  });
+}
+
+test("artwork store: eviction removes the least recently used file when the budget is exceeded", async () => {
+  const savedDataDir = process.env.VELVARR_DATA_DIR!;
+  const dataDir = mkdtempSync(join(savedDataDir, "artwork-lru-"));
+  const encodeSource = (background: { r: number; g: number; b: number }) =>
+    sharp({
       create: { width: 500, height: 700, channels: 3, background },
     })
       .png()
       .toBuffer();
-    const variant = await sharp(png)
-      .resize({ width: 400, withoutEnlargement: true })
-      .webp({ quality: 80 })
-      .toBuffer();
-    return { png, variant };
-  };
   const sourceA = await encodeSource({ r: 120, g: 30, b: 60 });
   const sourceB = await encodeSource({ r: 30, g: 120, b: 60 });
   const sourceC = await encodeSource({ r: 10, g: 10, b: 200 });
   const sourceD = await encodeSource({ r: 200, g: 200, b: 10 });
   const byPath: Record<string, Buffer> = {
-    "/e1.png": sourceA.png,
-    "/e2.png": sourceB.png,
-    "/e3.png": sourceC.png,
-    "/e4.png": sourceD.png,
+    "/e1.png": sourceA,
+    "/e2.png": sourceB,
+    "/e3.png": sourceC,
+    "/e4.png": sourceD,
   };
   const counts = new Map<string, number>();
   const fixture = await startFixture((req, res) => {
@@ -1982,98 +3096,85 @@ test("artwork store: eviction removes the least recently used file when the budg
     sendBytes(res, 404, "nope", "text/plain");
   });
   try {
+    // Measure actual fixture allocation in a separate store.
+    process.env.VELVARR_DATA_DIR = join(dataDir, "measurements");
+    const measureVariant = async (bytes: Buffer) => {
+      const before = artworkStoreStateForTest().bytes;
+      await artworkVariantFor({ bytes, contentType: "image/png" }, 400);
+      return artworkStoreStateForTest().bytes - before;
+    };
+    const sizeA = await measureVariant(sourceA);
+    const sizeC = await measureVariant(sourceC);
+    const sizeD = await measureVariant(sourceD);
+    assert.ok(sizeA > 0 && sizeC > 0 && sizeD > 0);
+    process.env.VELVARR_DATA_DIR = join(dataDir, "store");
+
     const origin = fixture.origin;
     const hashOf = (bytes: Buffer) =>
       createHash("sha256").update(bytes).digest("hex");
-    const fileA = artworkStorePath(hashOf(sourceA.png), 400);
-    const fileB = artworkStorePath(hashOf(sourceB.png), 400);
-    const fileC = artworkStorePath(hashOf(sourceC.png), 400);
-    const fileD = artworkStorePath(hashOf(sourceD.png), 400);
-    const sizeB = sourceB.variant.length;
-    const sizeC = sourceC.variant.length;
-    const sizeD = sourceD.variant.length;
-
+    const fileA = artworkStorePath(hashOf(sourceA), 400);
+    const fileB = artworkStorePath(hashOf(sourceB), 400);
+    const fileC = artworkStorePath(hashOf(sourceC), 400);
+    const fileD = artworkStorePath(hashOf(sourceD), 400);
     await fetchProviderArtwork(`${origin}/e1.png`, { width: 400 });
-    await fetchProviderArtwork(`${origin}/e2.png`, { width: 400 });
-    // Index entries count toward the sweep budget, and every fetched URL
-    // owns one; B's entry measures the per-entry size (all entries store
-    // the same bare sha256 hex).
-    const indexEntryBytes = statSync(
-      join(
-        artworkDir,
-        "index",
-        createHash("sha256").update(`${origin}/e2.png`).digest("hex"),
-      ),
-    ).size;
+    const firstB = await fetchProviderArtwork(`${origin}/e2.png`, {
+      width: 400,
+    });
+
+    // Include only this round's index before the variant write.
+    rememberArtworkVariant(`${origin}/e3.png`, hashOf(sourceC));
+    const budgetForBC = artworkStoreStateForTest().bytes + sizeC - sizeA;
     const t = Date.now();
     utimesSync(fileA, new Date(t - 10_000), new Date(t - 10_000));
     utimesSync(fileB, new Date(t - 5_000), new Date(t - 5_000));
-
-    // The budget equals the expected post-write state: B and C's variants
-    // plus A, B and C's index entries. The sweep (which runs before C's
-    // index entry is written) sees one entry less, so its excess is exactly
-    // A's variant: one eviction, the oldest-use file. A's index entry
-    // survives as a dangling shortcut — the assert pins the variant file.
-    const budgetForBC = sizeB + sizeC + 3 * indexEntryBytes;
     setArtworkStoreBudgetForTest(budgetForBC);
-    try {
-      await fetchProviderArtwork(`${origin}/e3.png`, { width: 400 });
-      assert.equal(
-        existsSync(fileA),
-        false,
-        "eviction must remove the oldest-used file first",
-      );
-      assert.equal(existsSync(fileB), true);
-      assert.equal(existsSync(fileC), true);
-      assert.ok(
-        artworkStoreStateForTest().bytes <= budgetForBC,
-        "store must fit the budget after eviction",
-      );
+    await fetchProviderArtwork(`${origin}/e3.png`, { width: 400 });
+    assert.equal(
+      existsSync(fileA),
+      false,
+      "eviction must remove the oldest-used file first",
+    );
+    assert.equal(existsSync(fileB), true);
+    assert.equal(existsSync(fileC), true);
+    assert.ok(
+      artworkStoreStateForTest().bytes <= budgetForBC,
+      "store must fit the budget after eviction",
+    );
 
-      // Re-using B promotes it over C: the variant comes back byte-identical
-      // from the disk store through the URL index without touching upstream,
-      // and the hit touches the LRU clock.
-      resetMetaCache();
-      const bAgain = await fetchProviderArtwork(`${origin}/e2.png`, {
-        width: 400,
-      });
-      assert.equal(counts.get("/e2.png"), 1);
-      assert.deepEqual([...bAgain.bytes], [...sourceB.variant]);
-      assert.ok(
-        statSync(fileB).mtimeMs > t - 1_000,
-        "disk hit must touch the LRU clock",
-      );
+    // A disk hit must preserve B's bytes and promote its last-use time.
+    resetMetaCache();
+    const bAgain = await fetchProviderArtwork(`${origin}/e2.png`, {
+      width: 400,
+    });
+    assert.equal(counts.get("/e2.png"), 1);
+    assert.deepEqual([...bAgain.bytes], [...firstB.bytes]);
+    assert.ok(
+      statSync(fileB).mtimeMs > t - 1_000,
+      "disk hit must touch the LRU clock",
+    );
 
-      // Pin the use order before the second eviction: C's mtime goes back to
-      // t-5s while B was just touched to now, so same-millisecond ties
-      // cannot flip the victim.
-      utimesSync(fileC, new Date(t - 5_000), new Date(t - 5_000));
-      // Same post-write arithmetic with D in C's place: the sweep (D's own
-      // index entry lands after it) sees an excess of exactly C's variant —
-      // aged to t-5s, older than the just-touched B files — so it must evict
-      // C's variant and stop before re-used B.
-      const budgetForBD = sizeB + sizeD + 4 * indexEntryBytes;
-      setArtworkStoreBudgetForTest(budgetForBD);
-      await fetchProviderArtwork(`${origin}/e4.png`, { width: 400 });
-      // Eviction follows last use, not write order: C was written after B
-      // but never re-used, so D's write must evict C and keep B.
-      assert.equal(
-        existsSync(fileC),
-        false,
-        "eviction must follow last use, not write order",
-      );
-      assert.equal(existsSync(fileB), true);
-      assert.equal(existsSync(fileD), true);
-      assert.ok(artworkStoreStateForTest().bytes <= budgetForBD);
-      // Each distinct source went upstream exactly once; every re-read
-      // resolves through the memory cache, the URL index and the disk store.
-      assert.equal(counts.get("/e1.png"), 1);
-      assert.equal(counts.get("/e3.png"), 1);
-      assert.equal(counts.get("/e4.png"), 1);
-    } finally {
-      setArtworkStoreBudgetForTest(null);
-    }
+    setArtworkStoreBudgetForTest(null);
+    rememberArtworkVariant(`${origin}/e4.png`, hashOf(sourceD));
+    const budgetForBD = artworkStoreStateForTest().bytes + sizeD - sizeC;
+    // C is newer than B by creation, but older by last use.
+    utimesSync(fileC, new Date(t - 5_000), new Date(t - 5_000));
+    setArtworkStoreBudgetForTest(budgetForBD);
+    await fetchProviderArtwork(`${origin}/e4.png`, { width: 400 });
+    assert.equal(
+      existsSync(fileC),
+      false,
+      "eviction must follow last use, not write order",
+    );
+    assert.equal(existsSync(fileB), true);
+    assert.equal(existsSync(fileD), true);
+    assert.ok(artworkStoreStateForTest().bytes <= budgetForBD);
+    assert.equal(counts.get("/e1.png"), 1);
+    assert.equal(counts.get("/e2.png"), 1);
+    assert.equal(counts.get("/e3.png"), 1);
+    assert.equal(counts.get("/e4.png"), 1);
   } finally {
+    setArtworkStoreBudgetForTest(null);
+    process.env.VELVARR_DATA_DIR = savedDataDir;
     await fixture.close();
   }
 });

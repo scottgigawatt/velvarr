@@ -83,13 +83,11 @@ function nullableSchema(schema: Schema): Schema {
   return { anyOf: [{ type: "null" }, schema] };
 }
 
+// No maxItems, minimum or maximum: Anthropic's structured outputs reject them
+// (HTTP 400). parseProseDraft enforces PROSE_LIST_CAP and the mapper the year
+// range, so the server still holds every limit. minItems 1 is accepted.
 function listSchema(items: Schema, minItems = 0): Schema {
-  return {
-    type: "array",
-    items,
-    ...(minItems > 0 ? { minItems } : {}),
-    maxItems: PROSE_LIST_CAP,
-  };
+  return { type: "array", items, ...(minItems > 0 ? { minItems } : {}) };
 }
 
 function citedSchema(value: Schema = stringSchema()): Schema {
@@ -98,11 +96,7 @@ function citedSchema(value: Schema = stringSchema()): Schema {
 
 const sourceSchema = (): Schema => objectSchema({ source: stringSchema() });
 
-const yearSchema = (): Schema => ({
-  type: "integer",
-  minimum: 1900,
-  maximum: 2100,
-});
+const yearSchema = (): Schema => ({ type: "integer" });
 
 /** The strict json_schema the chat request sends; its shape is ProseDraft. */
 export const PROSE_DRAFT_SCHEMA: Record<string, unknown> = objectSchema({
@@ -163,6 +157,7 @@ export function proseSystemMessage(today: string): string {
     '- type: "movie" when the request asks only for movies, "scene" when it asks only for scenes, "all" when it asks for both movies and scenes. null when it names neither.',
     '- titleWords: words that the request wants to find in titles, for example the words after "titled" or "called".',
     '- include: short tag words that every result must have, such as looks, acts, settings or themes (for example "blonde", "lesbian", "outdoors"). Each item is one term, and every term must match. When the request joins words with "or", put them into one term as its alternatives.',
+    '- Write each include and exclude value the way an adult catalog names its tags, not in the words of the request: a short, usual tag form (for example "old men" is "older man", "assfucked" is "anal", "young guy" is "twink"). When one concept has several usual tag names, give up to 3 of them as alternatives of one term. The source still copies the words of the request.',
     '- exclude: content words that no result may have, for example the words after "without", "no" or "not".',
     '- performers.names: performer names. performers.mode: "all" when the names are joined with "and" (every result has all of them), "any" when they are joined with "or" (a result has at least one).',
     "- studios.names: studio, site or network names. studios.withChildren: set when the request asks to include the child studios or sub-sites of the named studios.",

@@ -19,13 +19,11 @@
 
 /* --- Detail page --- */
 
-.cat-detail {
-  max-width: 88rem;
-  margin: 0 auto;
-}
+/* The back row is its own group (ui-ux-check rule 26): the hero sits one
+   page edge below it, the same space as above it. */
 .cat-topline {
   display: flex;
-  margin-bottom: 0.9rem;
+  margin-bottom: var(--page-gutter);
 }
 
 /* Artwork-derived backdrop with dark scrim; the poster itself stays a real
@@ -117,6 +115,11 @@
 .cat-hero-actions {
   margin-top: 1.1rem;
 }
+/* The action column (button, note, error) keeps each control at its own
+   width; only the phone rule below stretches them for thumb reach. */
+.cat-hero-actions > * {
+  align-items: flex-start;
+}
 .cat-badge {
   display: inline-flex;
   align-items: center;
@@ -130,10 +133,20 @@
   font-size: 0.75rem;
   font-weight: 600;
 }
+/* "In your library": the hero's first fact, so it is larger than a plain
+   badge and carries a check (never color alone). */
 .cat-badge-available {
+  gap: 0.4rem;
+  padding: 0.3rem 0.8rem;
   border-color: color-mix(in srgb, var(--color-ok) 55%, transparent);
   background: color-mix(in srgb, var(--color-ok) 22%, transparent);
   color: var(--color-ok);
+  font-size: 0.85rem;
+  font-weight: 650;
+}
+.cat-badge-available .icon {
+  width: 1rem;
+  height: 1rem;
 }
 .cat-hero-title {
   margin: 0.5rem 0 0;
@@ -241,14 +254,6 @@
 .cat-section:first-child {
   margin-top: 0;
 }
-/* On a detail page the cast sits in the narrower main column and similar
-   titles may not, so fr tracks would size their tiles differently. One fixed
-   track keeps cast and title tiles identical wherever they sit. */
-.cat-section .performer-grid,
-.cat-section .poster-grid {
-  grid-template-columns: repeat(auto-fill, 150px);
-}
-
 /* Clickable performer portraits in .performer-grid (the poster grid's
    columns), with the poster card's exact anatomy so cast tiles look and
    behave like title tiles: the outer tile only scales (no clip, no paint);
@@ -430,6 +435,35 @@
   border-top: 1px solid var(--color-edge);
 }
 
+/* Why a library item has no catalog details: one panel with a headline.
+   Setup and review cases stay neutral (DESIGN.md: no second accent hue, and
+   the palette has no warning tone); only a failed lookup takes danger. */
+.catalog-note {
+  margin-top: 1.5rem;
+  max-width: 75ch;
+  padding: 12px 14px;
+  border: 1px solid var(--color-edge);
+  border-radius: 10px;
+  background: var(--color-panel);
+}
+.catalog-note strong {
+  display: block;
+  font-size: 0.9rem;
+  font-weight: 650;
+  color: var(--color-ink);
+}
+.catalog-note p {
+  margin: 2px 0 0;
+  font-size: 0.85rem;
+  color: var(--color-muted);
+}
+.catalog-note.is-failed {
+  border-color: color-mix(in oklab, var(--color-danger) 45%, var(--color-edge));
+}
+.catalog-note.is-failed strong {
+  color: var(--color-danger);
+}
+
 /* Honest small print inside the drawer: caps, exclusivity, failures. */
 .cat-note {
   margin: 0.4rem 0 0;
@@ -542,6 +576,41 @@
 .toolbar-group .prose-field > .input {
   width: 100%;
   padding-left: 2rem;
+  padding-right: 2rem;
+}
+/* The describe field's clear button: a quiet × inside the field's right
+   edge, a 24px target (44px on touch), ink on hover or focus. */
+.prose-clear {
+  position: absolute;
+  top: 50%;
+  right: 0.25rem;
+  display: grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: 0;
+  border-radius: 5px;
+  background: none;
+  color: var(--color-muted);
+  transform: translateY(-50%);
+  cursor: pointer;
+  transition: color var(--dur-fast) var(--ease-out);
+}
+.prose-clear:hover,
+.prose-clear:focus-visible {
+  color: var(--color-ink);
+}
+.prose-clear .icon {
+  width: 0.9rem;
+  height: 0.9rem;
+}
+@media (pointer: coarse) {
+  .prose-clear {
+    width: 44px;
+    height: 44px;
+    right: 0;
+  }
 }
 .prose-search-status {
   flex-basis: 100%;
@@ -556,83 +625,29 @@
   padding: 0;
   list-style: none;
 }
-
-/* Browse toolbar: each control (Type, Sort) in its own small panel with
-   its name inside, the same look as an active-filter group. 5px inner
-   radius + 5px padding = the panel's 10px (nested radii). 44px tall, so
-   the plain buttons beside the groups match it. */
-.toolbar-group {
-  display: inline-flex;
-  align-items: center;
-  gap: 0.5rem;
-  max-width: 100%;
-  min-width: 0;
-  padding: 5px 5px 5px 12px;
-  border: 1px solid var(--color-edge);
-  border-radius: 10px;
-  background: var(--color-panel);
+/* The describe search's readings in one wrapping line: a small caption, the
+   member's words muted, what they became in ink (full opacity so that
+   contrast holds), dots between phrases. The caption starts where the
+   toolbar captions do: their 12px padding plus the 1px edge (rule 48). */
+.prose-read-as {
+  opacity: 1;
+  line-height: 1.7;
+  padding-left: 13px;
 }
-.toolbar-group > .filter-group-name {
-  margin: 0;
-  white-space: nowrap;
+.prose-read-as b {
+  color: var(--color-ink);
+  font-weight: 600;
 }
-.toolbar-group .segmented button,
-.toolbar-group .btn,
-.toolbar-group .input {
-  min-height: 32px;
-  border-radius: 5px;
+.prose-read-as-cap {
+  margin-right: 0.4rem;
+  font-size: 0.72rem;
+  font-weight: 650;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
 }
-/* One line per group: the panel draws the edge, the controls inside are
-   told apart by their raised fill and the 4px gaps, not by a second
-   hairline 5px inside the first. The selected segment keeps its accent
-   edge (it is the selection cue), and a focused select its accent ring. */
-.toolbar-group .segmented button:not([aria-pressed="true"]),
-.toolbar-group .btn,
-.toolbar-group .input:not(:focus) {
-  border-color: transparent;
-}
-.toolbar-group .input {
-  background: var(--color-raised);
-}
-/* Block padding 0: min-height alone sets 32px, so a group is exactly
-   32 + 2 x 5 + 2 x 1 = 44px, the height of the buttons beside it. */
-.toolbar-group .segmented button {
-  padding: 0 0.8rem;
-}
-.toolbar-group .btn {
-  padding: 0 0.6rem;
-}
-.toolbar-group .input {
-  width: auto;
-  padding-block: 0;
-}
-/* One width for every type's sort list, so switching All / Movies /
-   Scenes never moves the row. The group is at least 375px; the select
-   takes the room the caption and direction button leave. */
-.toolbar-group .sort-select {
-  flex: 1;
-  min-width: 0;
-}
-@media (min-width: 1024px) {
-  .toolbar-group.sort-group {
-    min-width: 375px;
-  }
-  .toolbar-group .sort-select {
-    min-width: 15.5rem;
-  }
-}
-.page-toolbar:has(> .toolbar-group) > .btn {
-  min-height: 44px;
-}
-@media (pointer: coarse) {
-  .toolbar-group .segmented button,
-  .toolbar-group .btn,
-  .toolbar-group .input {
-    min-height: 44px;
-  }
-  .page-toolbar:has(> .toolbar-group) > .btn {
-    min-height: 56px;
-  }
+.prose-read-as-sep {
+  margin: 0 0.4rem;
+  opacity: 0.5;
 }
 
 /* Active filters above the results: one box per kind with its name shown
@@ -650,18 +665,11 @@
   flex-wrap: wrap;
   align-items: center;
   gap: 0.375rem;
-  padding: 0.25rem 0.375rem 0.25rem 0.625rem;
+  /* 12px left, like .toolbar-group, so every caption starts on one edge. */
+  padding: 0.25rem 0.375rem 0.25rem 12px;
   border: 1px solid var(--color-edge);
   border-radius: 10px;
   background: var(--color-panel);
-}
-.filter-group-name {
-  margin-right: 0.125rem;
-  font-size: 0.72rem;
-  font-weight: 650;
-  letter-spacing: 0.05em;
-  text-transform: uppercase;
-  color: var(--color-muted);
 }
 .filter-chip {
   display: inline-flex;

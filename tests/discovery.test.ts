@@ -10,6 +10,9 @@ import { createHash } from "node:crypto";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
+// Pins the throwaway VELVARR_DATA_DIR so a single-file run (no --import
+// preload) never falls back to the persistent repo ./data database.
+import "./setup.ts";
 
 import {
   MORE_PREVIEWS,
@@ -187,7 +190,13 @@ test("the read-through cache serves fresh entries and rebuilds stale ones", asyn
   await withEnv({ ...NO_PROVIDERS }, async () =>
     assert.equal(await cachedFollowed("acct-ttl", []), null),
   );
-  const key = followedKey("acct-ttl", fingerprint([], {}));
+  // The mirror key is computed under the same provider env as the build:
+  // an ambient TPDB or StashDB token otherwise fingerprints the mirror
+  // differently from the real cachedFollowed call inside withEnv.
+  const key = (await withEnv({ ...NO_PROVIDERS }, async () => {
+    assert.equal(await cachedFollowed("acct-ttl", []), null);
+    return followedKey("acct-ttl", fingerprint([], {}));
+  })) as string;
   assert.ok(getDiscoverCache(key), "the cold build wrote the documented key");
 
   // A fresh entry is served without a rebuild: poison the payload and the
@@ -708,7 +717,40 @@ test("the followed cache key stays fixed-size with 10 000 follows", async () => 
         follow(0);
         assert.equal(await cachedFollowed("acct-many", []), null);
         const [one] = storedKeys();
-        for (let i = 1; i < 10_000; i++) follow(i);
+        // The per-account follow cap (VELV-246) refuses the remaining
+        // 9 999 through the storage API, so they are seeded raw: the pin
+        // here is the key's fixed size over follow count, a property of
+        // the fingerprint that must hold even if an account somehow
+        // holds more rows than the cap allows.
+        const raw = new DatabaseSync(
+          join(process.env.VELVARR_DATA_DIR!, "velvarr.sqlite"),
+        );
+        try {
+          // One durable commit covers the fixture, not one per inserted row.
+          raw.exec("BEGIN");
+          const insertMany = raw.prepare(
+            "INSERT INTO performer_follows (id, account_id, provider, external_id, name, image_url, created_at, linked_provider, linked_external_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+          );
+          for (let i = 1; i < 10_000; i++) {
+            insertMany.run(
+              `00000000-0000-4000-8000-${String(i).padStart(12, "0")}`,
+              "acct-many",
+              "tpdb",
+              `${i.toString(16).padStart(8, "0")}-0000-4000-8000-000000000000`,
+              `Performer ${i}`,
+              null,
+              Date.now(),
+              null,
+              null,
+            );
+          }
+          raw.exec("COMMIT");
+        } catch (error) {
+          if (raw.isTransaction) raw.exec("ROLLBACK");
+          throw error;
+        } finally {
+          raw.close();
+        }
         assert.equal(listFollows("acct-many").length, 10_000);
         assert.equal(await cachedFollowed("acct-many", []), null);
         const many = storedKeys().find((key) => key !== one);
